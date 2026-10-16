@@ -104,6 +104,7 @@ export const AUDIO_CODECS = [
  */
 export const SUBTITLE_CODECS = [
 	'webvtt',
+	'ass',
 ] as const; // TODO add the rest
 
 /**
