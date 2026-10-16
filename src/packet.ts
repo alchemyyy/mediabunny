@@ -47,6 +47,24 @@ export type EncodedPacketSideData = {
 	 * `alpha` field contains no bytes.
 	 */
 	alphaByteLength?: number;
+	/**
+	 * The BlockAdditional elements of the Matroska block the packet came from, other than BlockAddID 1 (which is
+	 * exposed as `alpha` for tracks with an alpha channel), in the order of the block's BlockMore elements. These
+	 * carry side data such as ITU-T T.35 metadata (BlockAddID 4), which HDR10+ for VP9 uses.
+	 */
+	matroskaBlockAdditions?: MatroskaBlockAddition[];
+};
+
+/**
+ * A BlockAdditional element of a Matroska block, together with its BlockAddID.
+ * @group Packets
+ * @public
+ */
+export type MatroskaBlockAddition = {
+	/** The BlockAddID, which identifies the kind of data. */
+	addId: number;
+	/** The BlockAdditional data. */
+	data: Uint8Array;
 };
 
 /**
@@ -144,6 +162,23 @@ export class EncodedPacket {
 			&& (!Number.isInteger(sideData.alphaByteLength) || sideData.alphaByteLength < 0)
 		) {
 			throw new TypeError('sideData.alphaByteLength, when provided, must be a non-negative integer.');
+		}
+		if (
+			sideData?.matroskaBlockAdditions !== undefined
+			&& (
+				!Array.isArray(sideData.matroskaBlockAdditions)
+				|| sideData.matroskaBlockAdditions.some(addition => !addition
+					|| typeof addition !== 'object'
+					|| !Number.isInteger(addition.addId)
+					|| addition.addId < 0
+					|| !(addition.data instanceof Uint8Array),
+				)
+			)
+		) {
+			throw new TypeError(
+				'sideData.matroskaBlockAdditions, when provided, must be an array of objects with a non-negative'
+				+ ' integer addId and Uint8Array data.',
+			);
 		}
 
 		this.byteLength = byteLength;
