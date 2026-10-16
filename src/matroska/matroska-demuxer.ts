@@ -66,6 +66,7 @@ import {
 import {
 	EncodedPacket,
 	EncodedPacketSideData,
+	MatroskaBlockAddition,
 	PacketRetrievalOptions,
 	PacketRetrievalResult,
 	PLACEHOLDER_DATA,
@@ -163,6 +164,8 @@ type ClusterBlock = {
 	decoded: boolean;
 	postProcessed: boolean; // For codec-specific processing
 	mainAdditional: Uint8Array | null;
+	/** The block's BlockAdditionals other than BlockAddID 1, in BlockMore order. */
+	otherAdditionals: MatroskaBlockAddition[];
 };
 
 type CuePoint = {
@@ -930,6 +933,7 @@ export class MatroskaDemuxer extends Demuxer {
 					decoded: true,
 					postProcessed: false,
 					mainAdditional: originalBlock.mainAdditional,
+					otherAdditionals: originalBlock.otherAdditionals,
 				});
 			}
 
@@ -1610,6 +1614,7 @@ export class MatroskaDemuxer extends Demuxer {
 					decoded: !hasDecodingInstructions,
 					postProcessed: false,
 					mainAdditional: null,
+					otherAdditionals: [],
 				});
 			}; break;
 
@@ -1647,6 +1652,7 @@ export class MatroskaDemuxer extends Demuxer {
 					decoded: !hasDecodingInstructions,
 					postProcessed: false,
 					mainAdditional: null,
+					otherAdditionals: [],
 				};
 				trackData.blocks.push(this.currentBlock);
 			}; break;
@@ -1667,6 +1673,11 @@ export class MatroskaDemuxer extends Demuxer {
 
 				if (this.currentBlockAdditional.data && this.currentBlockAdditional.addId === 1) {
 					this.currentBlock.mainAdditional = this.currentBlockAdditional.data;
+				} else if (this.currentBlockAdditional.data) {
+					this.currentBlock.otherAdditionals.push({
+						addId: this.currentBlockAdditional.addId,
+						data: this.currentBlockAdditional.data,
+					});
 				}
 				this.currentBlockAdditional = null;
 			}; break;
@@ -2371,6 +2382,9 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		if (block.mainAdditional && this.internalTrack.info?.type === 'video' && this.internalTrack.info.alphaMode) {
 			sideData.alpha = options.metadataOnly ? PLACEHOLDER_DATA : block.mainAdditional;
 			sideData.alphaByteLength = block.mainAdditional.byteLength;
+		}
+		if (block.otherAdditionals.length > 0) {
+			sideData.matroskaBlockAdditions = block.otherAdditionals;
 		}
 
 		const packet = new EncodedPacket(

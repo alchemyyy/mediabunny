@@ -264,6 +264,7 @@ export {
 export {
 	EncodedPacket,
 	type EncodedPacketSideData,
+	type MatroskaBlockAddition,
 	type PacketType,
 	PacketCache,
 	type PacketCacheOptions,

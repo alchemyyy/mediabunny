@@ -352,3 +352,38 @@ test('FLAC sync reading', async () => {
 	const count = testSyncPacketReading(audioTrack);
 	expect(count).toBe(213);
 });
+
+test('Matroska BlockAdditions other than alpha are exposed as packet side data', async () => {
+	using input = new Input({
+		source: new BufferSource(fs.readFileSync(path.join(__dirname, '../public/vp9-hdr10plus.webm'))),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	// The file leaves the HDR10+ message out of its third and fifth blocks
+	const packetsWithoutAdditions = [2, 4];
+
+	const reader = new PacketReader(videoTrack);
+	let packet = await reader.getFirst();
+	let packetCount = 0;
+	while (packet) {
+		const additions = packet.sideData.matroskaBlockAdditions;
+		expect(packet.sideData.alpha).toBeUndefined();
+
+		if (packetsWithoutAdditions.includes(packetCount)) {
+			expect(additions).toBeUndefined();
+		} else {
+			// One ITU-T T.35 message for HDR10+: the United States country code, then Samsung's provider code
+			assert(additions);
+			expect(additions.map(addition => addition.addId)).toEqual([4]);
+			expect([...additions[0]!.data.subarray(0, 3)]).toEqual([0xb5, 0x00, 0x3c]);
+		}
+
+		packetCount++;
+		packet = await reader.getNext(packet);
+	}
+
+	expect(packetCount).toBe(8);
+});
