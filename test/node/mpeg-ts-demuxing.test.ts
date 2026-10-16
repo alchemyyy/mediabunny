@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
 import { Input } from '../../src/input.js';
-import { FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
+import { BufferSource, FilePathSource, ReadableStreamSource, CustomSource } from '../../src/source.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
@@ -10,6 +10,8 @@ import { assert } from '../../src/misc.js';
 import { PacketCursor } from '../../src/cursors.js';
 import { PacketReader } from '../../src/packet.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { InputVideoTrack } from '../../src/input-track.js';
+import { parseVc1SequenceHeader } from '../../src/codec-data.js';
 import { MpegTsDemuxer } from '../../src/mpeg-ts/mpeg-ts-demuxer.js';
 import { MpegTsStreamType } from '../../src/mpeg-ts/mpeg-ts-misc.js';
 
@@ -900,4 +902,160 @@ test('MPEG-TS with AUD-less video packets', async () => {
 	expect(firstPacket.data.byteLength).toBe(331774);
 	expect(secondPacket.data.byteLength).toBe(1749);
 	expect(thirdPacket.data.byteLength).toBe(4273);
+});
+
+const readVideoPackets = async (videoTrack: InputVideoTrack) => {
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new PacketCursor(videoTrack)) {
+		packets.push(packet);
+	}
+
+	return packets;
+};
+
+test('MPEG-TS with MPEG-1 video', async () => {
+	// FFmpeg's muxer declares MPEG-1 video with the MPEG-2 stream type, which a stream without a sequence extension
+	// refines; a copy whose PMT declares stream type 0x01 covers the MPEG-1 stream type
+	const bytes = fs.readFileSync(path.join(__dirname, '../public/mpeg1-video.ts'));
+	const mpeg1Bytes = Uint8Array.from(bytes);
+	// stream_type, elementary_PID 0x100, ES_info_length 0
+	const pmtEntry = [MpegTsStreamType.MPEG2_VIDEO, 0xe1, 0x00, 0xf0, 0x00];
+	let patchedEntries = 0;
+	for (let i = 0; i + pmtEntry.length <= mpeg1Bytes.length; i++) {
+		if (pmtEntry.every((byte, j) => mpeg1Bytes[i + j] === byte)) {
+			mpeg1Bytes[i] = MpegTsStreamType.MPEG1_VIDEO;
+			patchedEntries++;
+		}
+	}
+	expect(patchedEntries).toBeGreaterThan(0);
+
+	for (const [fileBytes, streamType] of [
+		[bytes, MpegTsStreamType.MPEG2_VIDEO],
+		[mpeg1Bytes, MpegTsStreamType.MPEG1_VIDEO],
+	] as const) {
+		using input = new Input({
+			source: new BufferSource(fileBytes),
+			formats: ALL_FORMATS,
+		});
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+
+		expect(await videoTrack.getCodec()).toBe('mpeg1');
+		expect(await videoTrack.getInternalCodecId()).toBe(streamType);
+	}
+
+	using input = new Input({
+		source: new BufferSource(mpeg1Bytes),
+		formats: ALL_FORMATS,
+	});
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	expect(await videoTrack.getDisplayWidth()).toBe(192);
+	expect(await videoTrack.getDisplayHeight()).toBe(192);
+
+	const videoDecoderConfig = await videoTrack.getDecoderConfig();
+	expect(videoDecoderConfig?.codec).toBe('mp4v.6a');
+	expect(videoDecoderConfig?.codedWidth).toBe(192);
+	expect(videoDecoderConfig?.codedHeight).toBe(192);
+
+	const packets = await readVideoPackets(videoTrack);
+
+	// The packets FFmpeg's MPEG video parser splits, byte for byte
+	expect(packets.map(packet => packet.byteLength)).toEqual([
+		5520, 3081, 3685, 2872, 2969, 3586, 6322, 3636, 3997, 3046, 2996, 3753,
+	]);
+	expect(packets[0]!.data.slice(0, 4)).toEqual(new Uint8Array([0, 0, 1, 0xb3])); // Sequence header
+	expect(packets.map(packet => packet.type)).toEqual(
+		packets.map((packet, i) => i % 6 === 0 ? 'key' : 'delta'),
+	);
+	for (const packet of packets) {
+		expect(packet.duration).toBeCloseTo(1 / 24);
+	}
+});
+
+test('MPEG-TS and M2TS with MPEG-2 video and B-frames', async () => {
+	for (const fileName of ['mpeg2-video.ts', 'mpeg2-video.m2ts']) {
+		using input = new Input({
+			source: new FilePathSource(path.join(__dirname, '../public', fileName)),
+			formats: ALL_FORMATS,
+		});
+
+		expect(await input.getFormat()).toBe(MPEG_TS);
+
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+
+		expect(await videoTrack.getCodec()).toBe('mpeg2');
+		expect(await videoTrack.getInternalCodecId()).toBe(MpegTsStreamType.MPEG2_VIDEO);
+
+		const videoDecoderConfig = await videoTrack.getDecoderConfig();
+		expect(videoDecoderConfig?.codec).toBe('mp4v.61');
+		expect(videoDecoderConfig?.codedWidth).toBe(192);
+		expect(videoDecoderConfig?.codedHeight).toBe(192);
+
+		const packets = await readVideoPackets(videoTrack);
+
+		expect(packets.map(packet => packet.byteLength)).toEqual([
+			5624, 4755, 2775, 2797, 6461, 2641, 2921, 4519, 3257, 2791, 6550, 2802,
+		]);
+		const keyPacketIndices = packets.flatMap((packet, i) => packet.type === 'key' ? [i] : []);
+		expect(keyPacketIndices).toEqual([0, 4, 10]);
+
+		// Decode order, presentation timestamps
+		const timestamps = packets.map(packet => Math.round((packet.timestamp - packets[0]!.timestamp) * 24));
+		expect(timestamps).toEqual([0, 3, 1, 2, 6, 4, 5, 9, 7, 8, 11, 10]);
+	}
+});
+
+test('VC-1 sequence header and entry point sizes', () => {
+	// A sequence header of maximum coded size 640x480, then entry points of coded size 640x480 and 352x288
+	const sequenceHeader = [0x00, 0x00, 0x01, 0x0f, 0xca, 0x86, 0x13, 0xf0, 0xef, 0x88, 0x80];
+	const firstEntryPoint = [0x00, 0x00, 0x01, 0x0e, 0x48, 0x84, 0x4f, 0xc3, 0xbc, 0x80];
+	const secondEntryPoint = [0x00, 0x00, 0x01, 0x0e, 0x48, 0x84, 0x2b, 0xc2, 0x3c, 0x80];
+	const frame = [0x00, 0x00, 0x01, 0x0d, 0xc2, 0x0f, 0xe0];
+
+	expect(parseVc1SequenceHeader(new Uint8Array(sequenceHeader))).toMatchObject({ width: 640, height: 480 });
+	expect(parseVc1SequenceHeader(new Uint8Array([...sequenceHeader, ...firstEntryPoint, ...frame])))
+		.toMatchObject({ width: 640, height: 480 });
+	// Of several entry points before the frame, the last sets the frame's size
+	const bothEntryPoints = [...sequenceHeader, ...firstEntryPoint, ...secondEntryPoint, ...frame];
+	expect(parseVc1SequenceHeader(new Uint8Array(bothEntryPoints))).toMatchObject({ width: 352, height: 288 });
+	// An entry point after the frame belongs to a later frame
+	const laterEntryPoint = [...sequenceHeader, ...firstEntryPoint, ...frame, ...secondEntryPoint];
+	expect(parseVc1SequenceHeader(new Uint8Array(laterEntryPoint))).toMatchObject({ width: 640, height: 480 });
+});
+
+test('M2TS with VC-1 video', async () => {
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/vc1.m2ts')),
+		formats: ALL_FORMATS,
+	});
+
+	expect(await input.getFormat()).toBe(MPEG_TS);
+
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	expect(await videoTrack.getCodec()).toBe('vc1');
+	expect(await videoTrack.getInternalCodecId()).toBe(MpegTsStreamType.VC1);
+	expect(await videoTrack.getDisplayWidth()).toBe(1920);
+	expect(await videoTrack.getDisplayHeight()).toBe(1080);
+
+	const videoDecoderConfig = await videoTrack.getDecoderConfig();
+	expect(videoDecoderConfig?.codec).toBe('vc-1');
+	expect(videoDecoderConfig?.codedWidth).toBe(1920);
+	expect(videoDecoderConfig?.codedHeight).toBe(1080);
+
+	const packets = await readVideoPackets(videoTrack);
+
+	// The packets FFmpeg's VC-1 parser splits, byte for byte
+	expect(packets.map(packet => packet.byteLength)).toEqual([
+		85851, 11273, 34767, 95732, 55400, 47038, 54170, 43348, 56541, 42586, 48118, 44590,
+	]);
+	expect(packets[0]!.data.slice(0, 4)).toEqual(new Uint8Array([0, 0, 1, 0x0f])); // Sequence header
+	expect(packets[1]!.data.slice(0, 4)).toEqual(new Uint8Array([0, 0, 1, 0x0d])); // Frame
+	expect(packets.map(packet => packet.type)).toEqual(packets.map((packet, i) => i === 0 ? 'key' : 'delta'));
 });

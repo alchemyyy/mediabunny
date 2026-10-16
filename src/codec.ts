@@ -51,7 +51,18 @@ export const VIDEO_CODECS = [
 	'vp8',
 	'prores',
 	'mpeg4',
+	'mpeg1',
+	'mpeg2',
+	'vc1',
 ] as const;
+// RFC 6381 codec strings: the MPEG-4 systems object type indications of MPEG-1 and MPEG-2 (Main profile) Visual, and
+// the VC-1 sample entry type
+const MPEG1_VIDEO_CODEC_STRING = 'mp4v.6a';
+const MPEG2_VIDEO_CODEC_STRING = 'mp4v.61';
+const VC1_CODEC_STRING = 'vc-1';
+// The MPEG-2 Visual object type indications, one per profile: Simple, Main, SNR, Spatial, High, and 4:2:2
+const MPEG2_VIDEO_CODEC_STRING_REGEX = /^mp4v\.6[0-5]$/i;
+
 /**
  * List of known PCM (uncompressed) audio codecs, ordered by encoding preference.
  * @group Codecs
@@ -342,6 +353,12 @@ export const buildVideoCodecString = (
 		return bestFourCc;
 	} else if (codec === 'mpeg4') {
 		return 'mp4v.20.9';
+	} else if (codec === 'mpeg1') {
+		return MPEG1_VIDEO_CODEC_STRING;
+	} else if (codec === 'mpeg2') {
+		return MPEG2_VIDEO_CODEC_STRING;
+	} else if (codec === 'vc1') {
+		return VC1_CODEC_STRING;
 	} else {
 		assertNever(codec);
 	}
@@ -598,6 +615,12 @@ export const extractVideoCodecString = (trackInfo: {
 		return proresFormat ?? 'apch';
 	} else if (codec === 'mpeg4') {
 		return 'mp4v';
+	} else if (codec === 'mpeg1') {
+		return MPEG1_VIDEO_CODEC_STRING;
+	} else if (codec === 'mpeg2') {
+		return MPEG2_VIDEO_CODEC_STRING;
+	} else if (codec === 'vc1') {
+		return VC1_CODEC_STRING;
 	} else if (codec !== null) {
 		assertNever(codec);
 	}
@@ -900,8 +923,14 @@ export const inferCodecFromCodecString = (codecString: string): MediaCodec | nul
 		return 'av1';
 	} else if ((PRORES_FOURCCS as readonly string[]).includes(codecString)) {
 		return 'prores';
+	} else if (codecString.toLowerCase() === MPEG1_VIDEO_CODEC_STRING) {
+		return 'mpeg1';
+	} else if (MPEG2_VIDEO_CODEC_STRING_REGEX.test(codecString)) {
+		return 'mpeg2';
 	} else if (codecString === 'mp4v' || codecString.startsWith('mp4v.')) {
 		return 'mpeg4';
+	} else if (codecString === VC1_CODEC_STRING) {
+		return 'vc1';
 	}
 
 	// Audio codecs
@@ -980,7 +1009,7 @@ export const getAudioEncoderConfigExtension = (codec: AudioCodec) => {
 };
 
 const VALID_VIDEO_CODEC_STRING_PREFIXES = [
-	'avc1', 'avc3', 'hev1', 'hvc1', 'vp8', 'vp09', 'av01', 'mp4v', ...PRORES_FOURCCS,
+	'avc1', 'avc3', 'hev1', 'hvc1', 'vp8', 'vp09', 'av01', 'mp4v', VC1_CODEC_STRING, ...PRORES_FOURCCS,
 ];
 const AVC_CODEC_STRING_REGEX = /^(avc1|avc3)\.[0-9a-fA-F]{6}$/;
 const HEVC_CODEC_STRING_REGEX = /^(hev1|hvc1)\.(?:[ABC]?\d+)\.[0-9a-fA-F]{1,8}\.[LH]\d+(?:\.[0-9a-fA-F]{1,2}){0,6}$/;
@@ -1161,8 +1190,10 @@ export const validateVideoChunkMetadata = (
 			);
 		}
 	} else if (metadata.decoderConfig.codec === 'mp4v' || metadata.decoderConfig.codec.startsWith('mp4v.')) {
-		// MPEG-4 Part 2 validation
-		if (metadata.decoderConfig.codec !== 'mp4v') {
+		// MPEG-4 Part 2 validation; MPEG-1 and MPEG-2 Visual take their object type indications
+		const isMpeg1Or2 = metadata.decoderConfig.codec.toLowerCase() === MPEG1_VIDEO_CODEC_STRING
+			|| MPEG2_VIDEO_CODEC_STRING_REGEX.test(metadata.decoderConfig.codec);
+		if (metadata.decoderConfig.codec !== 'mp4v' && !isMpeg1Or2) {
 			throw new TypeError('Video chunk metadata decoder configuration codec string for MPEG-4 must be "mp4v".');
 		}
 	}

@@ -2067,6 +2067,9 @@ const videoCodecToBoxName = (codec: VideoCodec, fullCodecString: string) => {
 		case 'av1': return 'av01';
 		case 'prores': return fullCodecString;
 		case 'mpeg4': return 'mp4v';
+		case 'mpeg1': return 'mp4v';
+		case 'mpeg2': return 'mp4v';
+		case 'vc1': return 'vc-1';
 	}
 };
 
@@ -2081,6 +2084,9 @@ const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<
 	av1: av1C,
 	prores: null,
 	mpeg4: null,
+	mpeg1: null,
+	mpeg2: null,
+	vc1: null,
 };
 
 const audioCodecToBoxName = (codec: AudioCodec, fullCodecString: string, isQuickTime: boolean): string => {

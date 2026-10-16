@@ -11,6 +11,8 @@ export const TIMESTAMP_MODULUS = 2 ** 33;
 export const TS_PACKET_SIZE = 188;
 
 export const enum MpegTsStreamType {
+	MPEG1_VIDEO = 0x01,
+	MPEG2_VIDEO = 0x02,
 	MP3_MPEG1 = 0x03,
 	MP3_MPEG2 = 0x04,
 	AAC = 0x0f,
@@ -24,6 +26,8 @@ export const enum MpegTsStreamType {
 	PRIVATE_DATA = 0x06,
 	AVC = 0x1b,
 	HEVC = 0x24,
+	// SMPTE RP 227: VC-1, marked by a 'VC-1' registration descriptor, or within a Blu-ray program
+	VC1 = 0xea,
 }
 
 export const buildMpegTsMimeType = (codecStrings: (string | null)[]) => {
