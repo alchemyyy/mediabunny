@@ -58,6 +58,7 @@ import {
 	InputAudioTrackBacking,
 	InputTrackBacking,
 	InputVideoTrackBacking,
+	UnsupportedTrackFeature,
 } from '../input-track';
 import {
 	assert,
@@ -120,6 +121,7 @@ import { Aes128CbcContext } from '../aes';
 import { Logging } from '../logging';
 
 type InternalTrack = {
+	unsupportedFeatures: UnsupportedTrackFeature[];
 	id: number;
 	demuxer: IsobmffDemuxer;
 	trackBacking: InputTrackBacking | null;
@@ -509,6 +511,7 @@ export class IsobmffDemuxer extends Demuxer {
 				durationInMediaTimescale: foreignTrack.durationInMediaTimescale,
 				durationInMovieTimescale: foreignTrack.durationInMovieTimescale,
 				matrix: foreignTrack.matrix,
+				unsupportedFeatures: [...foreignTrack.unsupportedFeatures],
 				internalCodecId: foreignTrack.internalCodecId,
 				name: foreignTrack.name,
 				languageCode: foreignTrack.languageCode,
@@ -866,6 +869,7 @@ export class IsobmffDemuxer extends Demuxer {
 					durationInMovieTimescale: -1,
 					durationInMediaTimescale: -1,
 					matrix: IDENTITY_MATRIX,
+					unsupportedFeatures: [],
 					internalCodecId: null,
 					name: null,
 					languageCode: UNDETERMINED_LANGUAGE,
@@ -960,6 +964,7 @@ export class IsobmffDemuxer extends Demuxer {
 					const mediaRate = readFixed_16_16(slice);
 
 					if (relevantEntryFound) {
+						track.unsupportedFeatures.push('multiple_edits');
 						Logging._warn(
 							'Unsupported edit list: multiple edits are not currently supported. Only using first edit.',
 						);
@@ -972,6 +977,7 @@ export class IsobmffDemuxer extends Demuxer {
 					}
 
 					if (mediaRate !== 1) {
+						track.unsupportedFeatures.push('non_unit_playback_rate');
 						Logging._warn('Unsupported edit list entry: media rate must be 1.');
 						break;
 					}
@@ -2924,6 +2930,10 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 	getAverageBitrate() {
 		return this.internalTrack.avgBitrate;
+	}
+
+	getUnsupportedFeatures() {
+		return this.internalTrack.unsupportedFeatures;
 	}
 
 	async getDurationFromMetadata() {
