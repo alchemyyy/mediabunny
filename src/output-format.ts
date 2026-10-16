@@ -942,12 +942,16 @@ export class AiffOutputFormat extends OutputFormat {
 		];
 	}
 
-	get supportsVideoRotationMetadata() {
+	get supportsVideoTransformationMetadata() {
 		return false;
 	}
 
 	get supportsTimestampedMediaData() {
 		return false;
+	}
+
+	get negativeTimestampSupport() {
+		return null;
 	}
 }
 

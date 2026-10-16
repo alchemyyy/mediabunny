@@ -87,7 +87,7 @@ export class AiffMuxer extends Muxer {
 
 		try {
 			if (!this.headerWritten) {
-				validateAudioChunkMetadata(meta);
+				validateAudioChunkMetadata(meta, track.source._codec);
 
 				assert(meta);
 				assert(meta.decoderConfig);
@@ -247,6 +247,7 @@ export class AiffMuxer extends Muxer {
 				case 'genre':
 				case 'date':
 				case 'lyrics':
+				case 'beatsPerMinute':
 				case 'images': {
 					// Not representable as a native AIFF text chunk; use the 'id3' metadata format for these.
 				}; break;
