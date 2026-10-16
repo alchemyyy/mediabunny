@@ -1008,7 +1008,8 @@ class VideoEncoderWrapper {
 
 			if (!forceClose) {
 				if (this.customEncoder) {
-					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush());
+					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush())
+						.catch((error: unknown) => this.setError(error));
 				} else if (this.encoder && !this.encodersReclaimed) {
 					// These are wired in series, therefore they must also be flushed in series
 					await this.encoder.flush();
@@ -1028,7 +1029,8 @@ class VideoEncoderWrapper {
 			this.frameRateLastSample = null;
 
 			if (this.customEncoder) {
-				await this.customEncoderCallSerializer.call(() => this.customEncoder!.close())
+				// The encoder must be closed even if one of its earlier calls failed
+				await this.customEncoderCallSerializer.callAfterSettled(() => this.customEncoder!.close())
 					.catch((error: unknown) => this.setError(error));
 			} else if (this.encoder) {
 				if (this.encoder.state !== 'closed') {
@@ -2488,7 +2490,8 @@ class AudioEncoderWrapper {
 
 			if (!forceClose) {
 				if (this.customEncoder) {
-					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush());
+					void this.customEncoderCallSerializer.call(() => this.customEncoder!.flush())
+						.catch((error: unknown) => this.setError(error));
 				} else if (this.encoder) {
 					await this.encoder.flush();
 				}
@@ -2500,7 +2503,8 @@ class AudioEncoderWrapper {
 			this.resampler = null;
 
 			if (this.customEncoder) {
-				await this.customEncoderCallSerializer.call(() => this.customEncoder!.close())
+				// The encoder must be closed even if one of its earlier calls failed
+				await this.customEncoderCallSerializer.callAfterSettled(() => this.customEncoder!.close())
 					.catch((error: unknown) => this.setError(error));
 			} else if (this.encoder && this.encoder.state !== 'closed') {
 				this.encoder.close();
