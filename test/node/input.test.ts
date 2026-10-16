@@ -7,8 +7,7 @@ import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedVideoPacketSource } from '../../src/media-source.js';
-import { EncodedPacketSink } from '../../src/media-sink.js';
-import { EncodedPacket } from '../../src/packet.js';
+import { EncodedPacket, PacketReader } from '../../src/packet.js';
 import { assert } from '../../src/misc.js';
 import { Logging, LogLevel } from '../../src/logging.js';
 
@@ -75,7 +74,7 @@ const createEditFixture = async (trackEdits: Edit[][], version = 0) => {
 	});
 	const track = await source.getPrimaryVideoTrack();
 	assert(track);
-	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	const packet = await new PacketReader(track).getFirst();
 	assert(packet);
 	const config = await track.getDecoderConfig();
 	assert(config);
@@ -134,7 +133,7 @@ test.each([0, 1])('Edit-list diagnostics are local to each track (version %i)', 
 	expect(await tracks[0]!.getUnsupportedFeatures()).toEqual(['multiple_edits']);
 	// Warnings still allow the original packet to be read with the existing timestamp and duration.
 	for (const track of tracks.slice(0, 2)) {
-		const packet = await new EncodedPacketSink(track).getFirstPacket();
+		const packet = await new PacketReader(track).getFirst();
 		expect(packet?.timestamp).toBe(0);
 		expect(packet?.duration).toBe(1);
 		expect(packet?.data.length).toBeGreaterThan(0);
