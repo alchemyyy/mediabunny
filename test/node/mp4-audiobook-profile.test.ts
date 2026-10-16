@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { buildAacAudioSpecificConfig } from '../../src/codec.js';
+import { buildAacAudioSpecificConfig } from '../../shared/aac-misc.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
@@ -96,7 +96,7 @@ type FtypSnapshot = {
 
 const parseFtypSnapshot = (mp4: Uint8Array): FtypSnapshot => {
 	const topLevel = parseBoxes(mp4, 0, mp4.byteLength);
-	const ftyp = topLevel.find((box) => box.type === 'ftyp');
+	const ftyp = topLevel.find(box => box.type === 'ftyp');
 	expect(ftyp).toBeTruthy();
 
 	const majorBrand = boxTypeFrom(mp4, ftyp!.contentStart);
@@ -117,23 +117,23 @@ type DataEntry = {
 
 const parseMetadataDataEntry = (mp4: Uint8Array, key: string): DataEntry | null => {
 	const topLevel = parseBoxes(mp4, 0, mp4.byteLength);
-	const moov = topLevel.find((box) => box.type === 'moov');
+	const moov = topLevel.find(box => box.type === 'moov');
 	if (!moov) return null;
 
-	const udta = moov.children.find((box) => box.type === 'udta');
+	const udta = moov.children.find(box => box.type === 'udta');
 	if (!udta) return null;
 
-	const meta = udta.children.find((box) => box.type === 'meta');
+	const meta = udta.children.find(box => box.type === 'meta');
 	if (!meta) return null;
 
-	const ilst = meta.children.find((box) => box.type === 'ilst');
+	const ilst = meta.children.find(box => box.type === 'ilst');
 	if (!ilst) return null;
 
-	const entry = ilst.children.find((box) => box.type === key);
+	const entry = ilst.children.find(box => box.type === key);
 	if (!entry) return null;
 
 	const data = parseBoxes(mp4, entry.contentStart, entry.contentEnd)
-		.find((box) => box.type === 'data');
+		.find(box => box.type === 'data');
 	if (!data || data.contentStart + 8 > data.contentEnd) return null;
 
 	const typeIndicator = readU32(mp4, data.contentStart);
@@ -160,8 +160,8 @@ const writeSinglePacketMp4 = async (format: Mp4OutputFormat) => {
 			numberOfChannels: 1,
 			description: buildAacAudioSpecificConfig({
 				objectType: 2,
-				sampleRate: 24000,
-				numberOfChannels: 1,
+				outputSampleRate: 24000,
+				outputNumberOfChannels: 1,
 			}),
 		},
 	});

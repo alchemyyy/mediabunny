@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { buildAacAudioSpecificConfig } from '../../src/codec.js';
+import { buildAacAudioSpecificConfig } from '../../shared/aac-misc.js';
 import { EncodedAudioPacketSource, TextSubtitleSource } from '../../src/media-source.js';
 import { Output } from '../../src/output.js';
 import { Mp4OutputFormat } from '../../src/output-format.js';
@@ -92,26 +92,26 @@ type TrackSnapshot = {
 
 const parseTrackSnapshots = (mp4: Uint8Array): TrackSnapshot[] => {
 	const topLevel = parseBoxes(mp4, 0, mp4.byteLength);
-	const moov = topLevel.find((box) => box.type === 'moov');
+	const moov = topLevel.find(box => box.type === 'moov');
 	expect(moov).toBeTruthy();
 
-	const tracks = moov!.children.filter((box) => box.type === 'trak');
+	const tracks = moov!.children.filter(box => box.type === 'trak');
 	return tracks.map((trak): TrackSnapshot => {
-		const tkhd = trak.children.find((box) => box.type === 'tkhd');
+		const tkhd = trak.children.find(box => box.type === 'tkhd');
 		expect(tkhd).toBeTruthy();
 
 		const version = mp4[tkhd!.contentStart]!;
 		const trackIdOffset = tkhd!.contentStart + (version === 1 ? 20 : 12);
 		const trackId = readU32(mp4, trackIdOffset);
 
-		const mdia = trak.children.find((box) => box.type === 'mdia');
-		const hdlr = mdia?.children.find((box) => box.type === 'hdlr') ?? null;
+		const mdia = trak.children.find(box => box.type === 'mdia');
+		const hdlr = mdia?.children.find(box => box.type === 'hdlr') ?? null;
 		const handlerType = hdlr
 			? boxTypeFrom(mp4, hdlr.contentStart + 8)
 			: null;
 
-		const tref = trak.children.find((box) => box.type === 'tref');
-		const chap = tref?.children.find((box) => box.type === 'chap') ?? null;
+		const tref = trak.children.find(box => box.type === 'tref');
+		const chap = tref?.children.find(box => box.type === 'chap') ?? null;
 		const chapterTrackIds: number[] = [];
 		if (chap) {
 			for (let offset = chap.contentStart; offset + 4 <= chap.contentEnd; offset += 4) {
@@ -119,9 +119,9 @@ const parseTrackSnapshots = (mp4: Uint8Array): TrackSnapshot[] => {
 			}
 		}
 
-		const minf = mdia?.children.find((box) => box.type === 'minf') ?? null;
-		const stbl = minf?.children.find((box) => box.type === 'stbl') ?? null;
-		const stsd = stbl?.children.find((box) => box.type === 'stsd') ?? null;
+		const minf = mdia?.children.find(box => box.type === 'minf') ?? null;
+		const stbl = minf?.children.find(box => box.type === 'stbl') ?? null;
+		const stsd = stbl?.children.find(box => box.type === 'stsd') ?? null;
 		const sampleEntryType = stsd && stsd.contentStart + 16 <= stsd.contentEnd
 			? boxTypeFrom(mp4, stsd.contentStart + 12)
 			: null;
@@ -143,18 +143,17 @@ type ChplSnapshot = {
 
 const parseChplSnapshot = (mp4: Uint8Array): ChplSnapshot | null => {
 	const topLevel = parseBoxes(mp4, 0, mp4.byteLength);
-	const moov = topLevel.find((box) => box.type === 'moov');
+	const moov = topLevel.find(box => box.type === 'moov');
 	expect(moov).toBeTruthy();
 
-	const udta = moov!.children.find((box) => box.type === 'udta');
+	const udta = moov!.children.find(box => box.type === 'udta');
 	if (!udta) return null;
 
-	const chpl = udta.children.find((box) => box.type === 'chpl');
+	const chpl = udta.children.find(box => box.type === 'chpl');
 	if (!chpl) return null;
 
 	const version = mp4[chpl.contentStart] ?? 0;
-	const flags
-		= ((mp4[chpl.contentStart + 1] ?? 0) << 16)
+	const flags = ((mp4[chpl.contentStart + 1] ?? 0) << 16)
 		| ((mp4[chpl.contentStart + 2] ?? 0) << 8)
 		| (mp4[chpl.contentStart + 3] ?? 0);
 
@@ -212,8 +211,8 @@ test('MP4 chapter track references are written as tref/chap', async () => {
 			numberOfChannels: 1,
 			description: buildAacAudioSpecificConfig({
 				objectType: 2,
-				sampleRate: 24000,
-				numberOfChannels: 1,
+				outputSampleRate: 24000,
+				outputNumberOfChannels: 1,
 			}),
 		},
 	});
@@ -226,8 +225,8 @@ test('MP4 chapter track references are written as tref/chap', async () => {
 	const fileBytes = new Uint8Array(output.target.buffer!);
 	const tracks = parseTrackSnapshots(fileBytes);
 
-	const audioTrack = tracks.find((track) => track.handlerType === 'soun');
-	const chapterTrack = tracks.find((track) => track.handlerType === 'text');
+	const audioTrack = tracks.find(track => track.handlerType === 'soun');
+	const chapterTrack = tracks.find(track => track.handlerType === 'text');
 	expect(audioTrack).toBeTruthy();
 	expect(chapterTrack).toBeTruthy();
 	expect(audioTrack!.chapterTrackIds).toEqual([chapterTrack!.trackId]);
@@ -275,8 +274,8 @@ test('MP4 can optionally write a udta/chpl chapter list for compatibility', asyn
 			numberOfChannels: 1,
 			description: buildAacAudioSpecificConfig({
 				objectType: 2,
-				sampleRate: 24000,
-				numberOfChannels: 1,
+				outputSampleRate: 24000,
+				outputNumberOfChannels: 1,
 			}),
 		},
 	});
@@ -303,7 +302,7 @@ test('MP4 can optionally write a udta/chpl chapter list for compatibility', asyn
 	]);
 
 	const tracks = parseTrackSnapshots(fileBytes);
-	const chapterTrack = tracks.find((track) => track.handlerType === 'text');
+	const chapterTrack = tracks.find(track => track.handlerType === 'text');
 	expect(chapterTrack).toBeTruthy();
 	expect(chapterTrack!.sampleEntryType).toBe('text');
 });
@@ -332,8 +331,8 @@ test('MP4 chapter format defaults to tref-only (no udta/chpl)', async () => {
 			numberOfChannels: 1,
 			description: buildAacAudioSpecificConfig({
 				objectType: 2,
-				sampleRate: 24000,
-				numberOfChannels: 1,
+				outputSampleRate: 24000,
+				outputNumberOfChannels: 1,
 			}),
 		},
 	});
@@ -371,8 +370,8 @@ test('non-chapter WebVTT subtitle tracks stay as wvtt', async () => {
 			numberOfChannels: 1,
 			description: buildAacAudioSpecificConfig({
 				objectType: 2,
-				sampleRate: 24000,
-				numberOfChannels: 1,
+				outputSampleRate: 24000,
+				outputNumberOfChannels: 1,
 			}),
 		},
 	});
@@ -384,7 +383,7 @@ test('non-chapter WebVTT subtitle tracks stay as wvtt', async () => {
 
 	const fileBytes = new Uint8Array(output.target.buffer!);
 	const tracks = parseTrackSnapshots(fileBytes);
-	const subtitleTrack = tracks.find((track) => track.handlerType === 'text');
+	const subtitleTrack = tracks.find(track => track.handlerType === 'text');
 	expect(subtitleTrack).toBeTruthy();
 	expect(subtitleTrack!.sampleEntryType).toBe('wvtt');
 });
