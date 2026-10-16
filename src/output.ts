@@ -468,6 +468,8 @@ export class Output<
 	/** @internal */
 	_metadataTags: MetadataTags = {};
 	/** @internal */
+	_isobmffChapterTrackReferences = new Map<number, number[]>();
+	/** @internal */
 	_rootTarget: T | null = null;
 	/** @internal */
 	_rootTargetPromise: Promise<T> | null = null;
@@ -762,6 +764,42 @@ export class Output<
 		return this._addTrack(new OutputSubtitleTrack(
 			this.tracks.length + 1, this, source, metadataCopy,
 		));
+	}
+
+	/**
+	 * Adds an ISOBMFF chapter track reference (`tref/chap`) from one track to a subtitle track.
+	 *
+	 * The referenced chapter track must be a subtitle track in this output. This method can only be called while the
+	 * output is still pending.
+	 */
+	setChapterTrackReference(trackId: number, chapterTrackId: number) {
+		if (!Number.isInteger(trackId) || trackId < 1) {
+			throw new TypeError('trackId must be a positive integer.');
+		}
+		if (!Number.isInteger(chapterTrackId) || chapterTrackId < 1) {
+			throw new TypeError('chapterTrackId must be a positive integer.');
+		}
+		if (this.state !== 'pending') {
+			throw new Error('Cannot set chapter track references after output has been started or canceled.');
+		}
+
+		const track = this.tracks.find(x => x.id === trackId);
+		if (!track) {
+			throw new Error(`Cannot set chapter track reference: track id ${trackId} does not exist.`);
+		}
+		const chapterTrack = this.tracks.find(x => x.id === chapterTrackId);
+		if (!chapterTrack) {
+			throw new Error(`Cannot set chapter track reference: track id ${chapterTrackId} does not exist.`);
+		}
+
+		if (track.type !== 'audio') {
+			throw new Error('Chapter track references are only supported for audio tracks.');
+		}
+		if (chapterTrack.type !== 'subtitle') {
+			throw new Error('A chapter track reference must point to a subtitle track.');
+		}
+
+		this._isobmffChapterTrackReferences.set(trackId, [chapterTrackId]);
 	}
 
 	/**
