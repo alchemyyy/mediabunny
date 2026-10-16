@@ -6,7 +6,7 @@ import {
 	AiffOutputFormat,
 	ALL_FORMATS,
 	AudioSample,
-	AudioSampleSink,
+	AudioSampleCursor,
 	AudioSampleSource,
 	BufferSource,
 	BufferTarget,
@@ -50,17 +50,16 @@ for (const { file, codec, compression } of cases) {
 		expect(await input.computeDuration()).toBeCloseTo(NUM_FRAMES / SAMPLE_RATE, 3);
 
 		// Decode every sample and confirm the full frame count and non-silent audio.
-		const sink = new AudioSampleSink(track);
+		await using cursor = new AudioSampleCursor(track);
 		let frames = 0;
 		let peak = 0;
-		for await (const sample of sink.samples()) {
+		for await (const sample of cursor) {
 			const data = new Float32Array(sample.allocationSize({ planeIndex: 0, format: 'f32-planar' }) / 4);
 			sample.copyTo(data, { planeIndex: 0, format: 'f32-planar' });
 			for (const v of data) {
 				peak = Math.max(peak, Math.abs(v));
 			}
 			frames += sample.numberOfFrames;
-			sample.close();
 		}
 
 		expect(frames).toBe(NUM_FRAMES);
@@ -147,13 +146,12 @@ for (const { codec, formType, compression, tolerance } of writeCases) {
 		// Decode and compare against the original waveform.
 		const decoded = new Float32Array(WRITE_FRAMES);
 		let frames = 0;
-		const sink = new AudioSampleSink(track);
-		for await (const sample of sink.samples()) {
+		await using cursor = new AudioSampleCursor(track);
+		for await (const sample of cursor) {
 			const chunk = new Float32Array(sample.allocationSize({ planeIndex: 0, format: 'f32-planar' }) / 4);
 			sample.copyTo(chunk, { planeIndex: 0, format: 'f32-planar' });
 			decoded.set(chunk, frames);
 			frames += sample.numberOfFrames;
-			sample.close();
 		}
 
 		expect(frames).toBe(WRITE_FRAMES);

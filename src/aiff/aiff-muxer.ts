@@ -60,14 +60,13 @@ export class AiffMuxer extends Muxer {
 	}
 
 	async start() {
-		const release = await this.mutex.acquire();
+		using lock = this.mutex.lock();
+		if (lock.pending) await lock.ready;
 
 		this.writer = await this.output._getRootWriter(false);
 		this.aiffWriter = new AiffWriter(this.writer);
 
 		// The header is written together with the first sample, once the decoder config is known.
-
-		release();
 	}
 
 	async getMimeType() {
@@ -83,32 +82,29 @@ export class AiffMuxer extends Muxer {
 		packet: EncodedPacket,
 		meta?: EncodedAudioChunkMetadata,
 	) {
-		const release = await this.mutex.acquire();
+		using lock = this.mutex.lock();
+		if (lock.pending) await lock.ready;
 
-		try {
-			if (!this.headerWritten) {
-				validateAudioChunkMetadata(meta, track.source._codec);
+		if (!this.headerWritten) {
+			validateAudioChunkMetadata(meta, track.source._codec);
 
-				assert(meta);
-				assert(meta.decoderConfig);
+			assert(meta);
+			assert(meta.decoderConfig);
 
-				this.writeHeader(track, meta.decoderConfig);
-				this.headerWritten = true;
-			}
-
-			this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
-
-			if (this.writer.getPos() + packet.data.byteLength >= 2 ** 32) {
-				throw new Error('Adding more audio data would exceed the maximum AIFF size of 4 GiB.');
-			}
-
-			this.writer.write(packet.data);
-			this.dataSize += packet.data.byteLength;
-
-			await this.writer.flush();
-		} finally {
-			release();
+			this.writeHeader(track, meta.decoderConfig);
+			this.headerWritten = true;
 		}
+
+		this.validateTimestamp(track, packet.timestamp, packet.type === 'key');
+
+		if (this.writer.getPos() + packet.data.byteLength >= 2 ** 32) {
+			throw new Error('Adding more audio data would exceed the maximum AIFF size of 4 GiB.');
+		}
+
+		this.writer.write(packet.data);
+		this.dataSize += packet.data.byteLength;
+
+		await this.writer.flush();
 	}
 
 	async addSubtitleCue() {
@@ -296,7 +292,8 @@ export class AiffMuxer extends Muxer {
 	}
 
 	async finalize() {
-		const release = await this.mutex.acquire();
+		using lock = this.mutex.lock();
+		if (lock.pending) await lock.ready;
 
 		const endPos = this.writer.getPos();
 
@@ -316,7 +313,5 @@ export class AiffMuxer extends Muxer {
 		this.aiffWriter.writeU32(Math.floor(this.dataSize / this.blockAlign));
 
 		this.writer.seek(endPos);
-
-		release();
 	}
 }
