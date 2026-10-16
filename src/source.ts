@@ -48,6 +48,19 @@ export const DEFAULT_MIN_READ_POSITION = 0;
 export const DEFAULT_MAX_READ_POSITION = Infinity;
 
 /**
+ * Thrown by a read that was canceled while it waited for data, such as by {@link UrlSource.cancelReads}.
+ * @group Input sources
+ * @public
+ */
+export class ReadCanceledError extends Error {
+	/** Creates a new {@link ReadCanceledError}. */
+	constructor(message = 'Read was canceled.') {
+		super(message);
+		this.name = 'ReadCanceledError';
+	}
+}
+
+/**
  * The events emitted by a {@link Source}, with each key being an event name and its value being the event data.
  * @group Input sources
  * @public
@@ -662,6 +675,11 @@ export class BlobSource extends Source {
 }
 
 const URL_SOURCE_MIN_LOAD_AMOUNT = 0.5 * 2 ** 20; // 0.5 MiB
+const DEFAULT_READ_AHEAD = 8 * 2 ** 20; // 8 MiB
+// How long a response that reached its worker's target stays open for the reader to extend the target. A sequential
+// reader keeps extending it as it reads, and every response it spares saves a new request and, with it, often a new
+// connection and a slow start. It's kept below the five-second grace common server stall timeouts give a client.
+const URL_SOURCE_RESPONSE_HOLD_TIME = 4000;
 const DEFAULT_RETRY_DELAY
 	= ((previousAttempts, error, src) => {
 		// Check if this could be a CORS error. If so, we cannot recover from it and
@@ -729,8 +747,19 @@ export type UrlSourceOptions = {
 	 */
 	getRetryDelay?: (previousAttempts: number, error: unknown, url: string | URL | Request) => number | null;
 
-	/** The maximum number of bytes the cache is allowed to hold in memory. Defaults to 64 MiB. */
+	/**
+	 * The maximum number of bytes the cache is allowed to hold in memory. Defaults to 64 MiB. Can be changed later
+	 * using {@link UrlSource.setMaxCacheSize}.
+	 */
 	maxCacheSize?: number;
+
+	/**
+	 * How far, in bytes, prefetching reaches past the latest read of a sequentially read region. Prefetching first
+	 * grows a region step by step as reads keep coming to it, so a one-off read loads little; once the region is read
+	 * sequentially, it keeps this many bytes loaded ahead of the reader. Defaults to 8 MiB. Can be changed later using
+	 * {@link UrlSource.setReadAhead}.
+	 */
+	readAhead?: number;
 
 	/** The maximum number of parallel requests to use for fetching. Defaults to 2. */
 	parallelism?: number;
@@ -783,6 +812,8 @@ export class UrlSource extends PathedSource {
 	_abortControllers = new Map<ReadWorker, AbortController>();
 	/** @internal */
 	_sequentialAbortController: AbortController | null = null;
+	/** @internal */
+	_readAhead: number;
 
 	/**
 	 * Creates a new {@link UrlSource} backed by the resource at the specified URL.
@@ -816,6 +847,9 @@ export class UrlSource extends PathedSource {
 		) {
 			throw new TypeError('options.maxCacheSize, when provided, must be a non-negative number.');
 		}
+		if (options.readAhead !== undefined && (!isNumber(options.readAhead) || options.readAhead <= 0)) {
+			throw new TypeError('options.readAhead, when provided, must be a positive number.');
+		}
 		if (options.parallelism !== undefined && (!Number.isInteger(options.parallelism) || options.parallelism < 1)) {
 			throw new TypeError('options.parallelism, when provided, must be a positive number.');
 		}
@@ -841,6 +875,7 @@ export class UrlSource extends PathedSource {
 		this._url = url;
 		this._options = options;
 		this._getRetryDelay = options.getRetryDelay ?? DEFAULT_RETRY_DELAY;
+		this._readAhead = options.readAhead ?? DEFAULT_READ_AHEAD;
 
 		// A user-supplied Range header is interpreted as a byte offset (and optional length) into the resource. We
 		// pull it out of the request and remember it for subsequent requests.
@@ -887,9 +922,54 @@ export class UrlSource extends PathedSource {
 			maxWorkerCount: options.parallelism ?? DEFAULT_PARALLELISM,
 			runWorker: this._runWorker.bind(this),
 			onIdleWorkerRemoved: worker => this._abortControllers.delete(worker),
-			prefetchProfile: PREFETCH_PROFILES.network,
+			prefetchProfile: (start, end, workers) => getNetworkPrefetchRange(start, end, workers, this._readAhead),
+			// A held response must not keep a read that needs a worker waiting
+			yieldPrefetchingWorkers: true,
 			handleUnhandledError: options.handleUnhandledError,
 		});
+	}
+
+	/**
+	 * Sets how far, in bytes, prefetching reaches past the latest read of a sequentially read region; see
+	 * {@link UrlSourceOptions.readAhead}.
+	 */
+	setReadAhead(readAhead: number) {
+		if (!isNumber(readAhead) || readAhead <= 0) {
+			throw new TypeError('readAhead must be a positive number.');
+		}
+
+		this._readAhead = readAhead;
+	}
+
+	/**
+	 * Sets the maximum number of bytes the cache is allowed to hold in memory. A lower maximum takes effect as new data
+	 * arrives.
+	 */
+	setMaxCacheSize(maxCacheSize: number) {
+		if (!isNumber(maxCacheSize) || maxCacheSize < 0) {
+			throw new TypeError('maxCacheSize must be a non-negative number.');
+		}
+
+		this._orchestrator.options.maxCacheSize = maxCacheSize;
+	}
+
+	/**
+	 * Keeps everything cached so far in the cache for the lifetime of this source, while later data is evicted as
+	 * usual. Useful for data that every reader of the source reads again, such as a container's header and index when
+	 * multiple inputs read the same source one after another.
+	 */
+	pinCache() {
+		this._orchestrator.pinCache();
+	}
+
+	/**
+	 * Cancels every read still waiting for data, which rejects with a {@link ReadCanceledError}, and stops prefetching.
+	 * The cache, the file size, and responses already open stay, so a later read near where reading stopped continues
+	 * on the same response. Useful for moving an input's reading elsewhere, such as when an input over a shared source
+	 * is replaced by a new one reading from another position.
+	 */
+	cancelReads() {
+		this._orchestrator.cancelReads();
 	}
 
 	/** @internal */
@@ -1064,11 +1144,30 @@ export class UrlSource extends PathedSource {
 			const reader = response.body.getReader();
 
 			while (true) {
-				if (worker.currentPos >= worker.targetPos || worker.aborted) {
+				if (worker.aborted) {
 					abortController.abort();
+					// An aborted worker may have left the orchestrator while running, which then never removes it
+					this._abortControllers.delete(worker);
 					this._orchestrator.signalWorkerStoppedRunning(worker);
 
 					return;
+				}
+
+				if (worker.currentPos >= worker.targetPos) {
+					// The response stays open for a while, since a sequential reader moves the target along as it
+					// reads, and the next read would otherwise need a new request
+					if (await this._orchestrator.waitForWorkerTarget(worker, URL_SOURCE_RESPONSE_HOLD_TIME)) {
+						continue;
+					}
+
+					if (!worker.aborted) {
+						abortController.abort();
+						this._orchestrator.signalWorkerStoppedRunning(worker);
+
+						return;
+					}
+
+					continue; // Cleanup happens in the next iteration
 				}
 
 				let readResult: ReadableStreamReadResult<Uint8Array>;
@@ -1936,6 +2035,7 @@ export class ReadableStreamSource extends Source {
 				bytes: value,
 				view: toDataView(value),
 				age: 0, // Unused
+				pinned: false, // Unused
 			});
 
 			// Do cache eviction, based on the distance from the last-requested index. It's important that we do it like
@@ -1975,6 +2075,47 @@ type PrefetchProfile = (start: number, end: number, workers: ReadWorker[]) => {
 	end: number;
 };
 
+/**
+ * Network-optimized prefetching. Remote resources have extreme latency (relatively speaking), so the benefit from
+ * intelligent prefetching is great. The strategy is as follows: When we notice successive reads to a worker's read
+ * region, we prefetch more data at the end of that region. While the region is small, it grows exponentially, so a
+ * small part of the file that's read once and never again loads little. Once the region is read sequentially (common
+ * in media files), it reaches `readAhead` bytes past the latest read and moves along with the reader.
+ */
+const getNetworkPrefetchRange = (start: number, end: number, workers: ReadWorker[], readAhead: number) => {
+	// Add a slight bit of start padding because backwards reading is painful
+	const paddingStart = 2 ** 16;
+	start = Math.max(0, Math.floor((start - paddingStart) / paddingStart) * paddingStart);
+
+	const readEnd = end;
+	for (const worker of workers) {
+		// When the read crosses the threshold point, we trigger a prefetch. This point is the middle of the worker's
+		// read region, or readAhead bytes before its end once the region has grown large.
+		const thresholdPoint = Math.max(
+			(worker.startPos + worker.targetPos) / 2,
+			worker.targetPos - readAhead,
+		);
+
+		if (closedIntervalsOverlap(
+			start, readEnd,
+			thresholdPoint, worker.targetPos,
+		)) {
+			const size = worker.targetPos - worker.startPos;
+
+			// The region doubles, but never reaches further than readAhead past the read
+			const doubledEnd = worker.startPos + 2 ** Math.ceil(Math.log2(size + 1));
+			end = Math.max(end, Math.min(doubledEnd, readEnd + readAhead));
+		}
+	}
+
+	end = Math.max(end, start + URL_SOURCE_MIN_LOAD_AMOUNT);
+
+	return {
+		start,
+		end,
+	};
+};
+
 const PREFETCH_PROFILES = {
 	none: (start, end) => ({ start, end }),
 	fileSystem: (start, end) => {
@@ -1985,52 +2126,7 @@ const PREFETCH_PROFILES = {
 
 		return { start, end };
 	},
-	network: (start, end, workers) => {
-		// Add a slight bit of start padding because backwards reading is painful
-		const paddingStart = 2 ** 16;
-		start = Math.max(0, Math.floor((start - paddingStart) / paddingStart) * paddingStart);
-
-		// Remote resources have extreme latency (relatively speaking), so the benefit from intelligent
-		// prefetching is great. The network prefetch strategy is as follows: When we notice
-		// successive reads to a worker's read region, we prefetch more data at the end of that region,
-		// growing exponentially (up to a cap). This performs well for real-world use cases: Either we read a
-		// small part of the file once and then never need it again, in which case the requested about of data
-		// is small. Or, we're repeatedly doing a sequential access pattern (common in media files), in which
-		// case we can become more and more confident to prefetch more and more data.
-		for (const worker of workers) {
-			const maxExtensionAmount = 8 * 2 ** 20; // 8 MiB
-
-			// When the read region cross the threshold point, we trigger a prefetch. This point is typically
-			// in the middle of the worker's read region, or a fixed offset from the end if the region has grown
-			// really large.
-			const thresholdPoint = Math.max(
-				(worker.startPos + worker.targetPos) / 2,
-				worker.targetPos - maxExtensionAmount,
-			);
-
-			if (closedIntervalsOverlap(
-				start, end,
-				thresholdPoint, worker.targetPos,
-			)) {
-				const size = worker.targetPos - worker.startPos;
-
-				// If we extend by maxExtensionAmount
-				const a = Math.ceil((size + 1) / maxExtensionAmount) * maxExtensionAmount;
-				// If we extend to the next power of 2
-				const b = 2 ** Math.ceil(Math.log2(size + 1));
-
-				const extent = Math.min(b, a);
-				end = Math.max(end, worker.startPos + extent);
-			}
-		}
-
-		end = Math.max(end, start + URL_SOURCE_MIN_LOAD_AMOUNT);
-
-		return {
-			start,
-			end,
-		};
-	},
+	network: (start, end, workers) => getNetworkPrefetchRange(start, end, workers, DEFAULT_READ_AHEAD),
 } satisfies Record<string, PrefetchProfile>;
 
 type PendingSlice = {
@@ -2052,6 +2148,8 @@ type CacheEntry = {
 	bytes: Uint8Array;
 	view: DataView;
 	age: number;
+	/** Pinned entries are never evicted. */
+	pinned: boolean;
 };
 
 type ReadWorker = {
@@ -2064,6 +2162,8 @@ type ReadWorker = {
 	aborted: boolean;
 	pendingSlices: PendingSlice[];
 	age: number;
+	/** Set while a running worker that reached its target waits for the target to move. */
+	wakeTargetWaiter: (() => void) | null;
 };
 
 /**
@@ -2094,6 +2194,11 @@ class ReadOrchestrator {
 		prefetchProfile: PrefetchProfile;
 		maxWorkerCount: number;
 		onIdleWorkerRemoved?: (worker: ReadWorker) => void;
+		/**
+		 * Lets a read that needs a worker abort a running worker that serves no pending read, when every worker is
+		 * busy. The source's runWorker must then stop a worker once it notices it was aborted.
+		 */
+		yieldPrefetchingWorkers?: boolean;
 		handleUnhandledError?: (error: unknown) => unknown;
 	}) {}
 
@@ -2304,7 +2409,7 @@ class ReadOrchestrator {
 		} else {
 			// The requested region was satisfied by the cache, but the entire prefetch region was not
 			promise.catch((error) => {
-				if (this.disposed) {
+				if (this.disposed || error instanceof ReadCanceledError) {
 					return; // Swallow the error
 				}
 
@@ -2343,12 +2448,31 @@ class ReadOrchestrator {
 			if (!worker.running) {
 				// Kick it off if it's idle
 				this.runWorker(worker);
+			} else {
+				// A running worker may be waiting at its old target
+				worker.wakeTargetWaiter?.();
 			}
 
 			return true;
 		}
 
 		return false;
+	}
+
+	/**
+	 * Waits for a running worker that reached its target to have its target moved further, which resolves with true,
+	 * or for the timeout to pass or the worker to be aborted, which resolve with false.
+	 */
+	waitForWorkerTarget(worker: ReadWorker, timeout: number) {
+		return new Promise<boolean>((resolve) => {
+			const finish = () => {
+				clearTimeout(timer);
+				worker.wakeTargetWaiter = null;
+				resolve(!worker.aborted && worker.currentPos < worker.targetPos);
+			};
+			const timer = setTimeout(finish, timeout);
+			worker.wakeTargetWaiter = finish;
+		});
 	}
 
 	checkQueuedReadsAgainstWorker(worker: ReadWorker) {
@@ -2393,7 +2517,7 @@ class ReadOrchestrator {
 				assert(oldestWorker.pendingSlices.length === 0);
 				this.workers.splice(oldestIndex, 1);
 				this.options.onIdleWorkerRemoved?.(oldestWorker);
-			} else {
+			} else if (!this.evictPrefetchingWorker()) {
 				return null; // All workers are still running, we can't create a new one
 			}
 		}
@@ -2410,10 +2534,44 @@ class ReadOrchestrator {
 			aborted: this.disposed,
 			pendingSlices: [],
 			age: this.nextAge++,
+			wakeTargetWaiter: null,
 		};
 		this.workers.push(worker);
 
 		return worker;
+	}
+
+	/**
+	 * Aborts the least recently started running worker that serves no pending read, if the options allow it, so that a
+	 * read that needs a worker gets one. Returns whether it aborted one.
+	 */
+	evictPrefetchingWorker() {
+		if (!this.options.yieldPrefetchingWorkers) {
+			return false;
+		}
+
+		let oldestIndex = -1;
+		for (let i = 0; i < this.workers.length; i++) {
+			const worker = this.workers[i]!;
+			if (
+				worker.running
+				&& worker.pendingSlices.length === 0
+				&& (oldestIndex === -1 || worker.age < this.workers[oldestIndex]!.age)
+			) {
+				oldestIndex = i;
+			}
+		}
+
+		if (oldestIndex === -1) {
+			return false;
+		}
+
+		const worker = this.workers[oldestIndex]!;
+		this.workers.splice(oldestIndex, 1);
+		worker.aborted = true;
+		worker.wakeTargetWaiter?.();
+
+		return true;
 	}
 
 	runWorker(worker: ReadWorker) {
@@ -2486,6 +2644,7 @@ class ReadOrchestrator {
 			bytes,
 			view: toDataView(bytes),
 			age: this.nextAge++,
+			pinned: false,
 		});
 		worker.currentPos += bytes.length;
 
@@ -2679,7 +2838,8 @@ class ReadOrchestrator {
 			}
 
 			if (entry.end >= next.end) {
-				// The inserted entry completely swallows the next entry
+				// The inserted entry completely swallows the next entry, keeping it pinned if it was
+				entry.pinned ||= next.pinned;
 				this.cache.splice(i, 1);
 				this.currentCacheSize -= next.bytes.length;
 				i--;
@@ -2696,25 +2856,28 @@ class ReadOrchestrator {
 			entry.bytes = joined;
 			entry.view = toDataView(joined);
 			entry.end = next.end;
+			entry.pinned ||= next.pinned;
 			this.cache.splice(i, 1);
 
 			break; // After the join case, we're done: the next entry cannot possibly overlap with the inserted one.
 		}
 
-		// LRU eviction of cache entries
+		// LRU eviction of cache entries, which never takes pinned ones
 		while (this.currentCacheSize > this.options.maxCacheSize) {
-			let oldestIndex = 0;
-			let oldestEntry = this.cache[0]!;
-
-			for (let i = 1; i < this.cache.length; i++) {
+			let oldestIndex = -1;
+			for (let i = 0; i < this.cache.length; i++) {
 				const entry = this.cache[i]!;
 
-				if (entry.age < oldestEntry.age) {
+				if (!entry.pinned && (oldestIndex === -1 || entry.age < this.cache[oldestIndex]!.age)) {
 					oldestIndex = i;
-					oldestEntry = entry;
 				}
 			}
 
+			if (oldestIndex === -1) {
+				break;
+			}
+
+			const oldestEntry = this.cache[oldestIndex]!;
 			if (this.currentCacheSize - oldestEntry.bytes.length <= this.options.maxCacheSize) {
 				// Don't evict if it would shrink the cache below the max size
 				break;
@@ -2725,6 +2888,38 @@ class ReadOrchestrator {
 		}
 	}
 
+	/** Pins every cache entry, so that it's never evicted. */
+	pinCache() {
+		for (const entry of this.cache) {
+			entry.pinned = true;
+		}
+	}
+
+	/**
+	 * Rejects every read still waiting for data and stops prefetching: each worker's target is pulled back to what it
+	 * has read. The cache and the workers stay, so a worker whose region is read again can carry on.
+	 */
+	cancelReads() {
+		const error = new ReadCanceledError();
+
+		for (const worker of this.workers) {
+			for (const slice of worker.pendingSlices) {
+				slice.reject(error);
+			}
+
+			worker.pendingSlices.length = 0;
+			worker.targetPos = worker.currentPos;
+		}
+
+		for (const queuedRead of this.queuedReads) {
+			for (const slice of queuedRead.pendingSlices) {
+				slice.reject(error);
+			}
+		}
+
+		this.queuedReads.length = 0;
+	}
+
 	dispose() {
 		for (const worker of this.workers) {
 			for (const slice of worker.pendingSlices) {
@@ -2733,6 +2928,7 @@ class ReadOrchestrator {
 
 			worker.pendingSlices.length = 0;
 			worker.aborted = true;
+			worker.wakeTargetWaiter?.();
 
 			if (!worker.running) {
 				// Running workers clean up after themselves when they notice the abort

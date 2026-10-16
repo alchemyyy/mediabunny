@@ -208,6 +208,7 @@ export {
 	type StreamSourceOptions,
 	RangedSource,
 	ReadableStreamSource,
+	ReadCanceledError,
 	type ReadableStreamSourceOptions,
 	UrlSource,
 	type UrlSourceOptions,
