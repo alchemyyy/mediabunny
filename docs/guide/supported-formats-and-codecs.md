@@ -44,6 +44,9 @@ Mediabunny ships with built-in decoders and encoders for all audio PCM codecs, m
 - `'av1'` - AOMedia Video 1 (AV1)
 - `'prores'` - Apple ProRes [^prores]
 - `'mpeg4'` - MPEG-4 Part 2 (requires [@mediabunny/mpeg4](https://www.npmjs.com/package/@mediabunny/mpeg4) extension)
+- `'mpeg1'` - MPEG-1 Video [^mpegts-video]
+- `'mpeg2'` - MPEG-2 Video (H.262) [^mpegts-video]
+- `'vc1'` - VC-1 (SMPTE 421M) Advanced profile [^mpegts-video]
 
 ### Audio codecs
 
@@ -87,6 +90,9 @@ Not all codecs can be used with all containers. The following table specifies th
 | `'av1'`        |    ✓     |   ✓   |   ✓   |     ✓     |   ✓   |       |       |       |       |       |       |
 | `'prores'`     |    ✓     |   ✓   |   ✓   |           |       |       |       |       |       |       |       |
 | `'mpeg4'`      |    ✓     |   ✓   |   ✓   |           |   ✓   |       |       |       |       |       |       |
+| `'mpeg1'`      |          |       |       |           |       |       |       |       |       |       |   ✓   |
+| `'mpeg2'`      |          |       |       |           |       |       |       |       |       |       |   ✓   |
+| `'vc1'`        |          |       |       |           |       |       |       |       |       |       |   ✓   |
 | `'aac'`        |    ✓     |   ✓   |   ✓   |           |   ✓   |       |       |       |   ✓   |       |   ✓   |
 | `'opus'`       |    ✓     |   ✓   |   ✓   |     ✓     |       |   ✓   |       |       |       |       |       |
 | `'mp3'`        |    ✓     |   ✓   |   ✓   |           |   ✓   |       |   ✓   |       |       |       |   ✓   |
@@ -121,6 +127,7 @@ For HLS, the supported codecs depend on the segment format chosen.
 [^dts]: DTS is not natively supported by WebCodecs. To encode or decode it, you can use the [`@mediabunny/dts`](./extensions/dts) extension package.
 [^webm]: WebM only supports a small subset of the codecs supported by Matroska. However, this library can technically read all codecs from a WebM that are supported by Matroska.
 [^webvtt]: WebVTT can only be written, not read.
+[^mpegts-video]: MPEG-1 Video, MPEG-2 Video, and VC-1 can only be read, from MPEG-TS and M2TS files (VC-1 under its registration descriptor). WebCodecs decodes none of them, so they can be demuxed but not decoded.
 
 ## Querying codec encodability
 

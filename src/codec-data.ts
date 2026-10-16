@@ -2468,6 +2468,187 @@ export const parseModesFromVorbisSetupPacket = (setupHeader: Uint8Array) => {
 	return { modeBlockflags };
 };
 
+// MPEG-1 and MPEG-2 Visual start codes, which follow a 0x000001 prefix
+export const MPEG_VIDEO_PICTURE_START_CODE = 0x00;
+export const MPEG_VIDEO_SLICE_MINIMUM_START_CODE = 0x01;
+export const MPEG_VIDEO_SLICE_MAXIMUM_START_CODE = 0xaf;
+export const MPEG_VIDEO_SEQUENCE_HEADER_START_CODE = 0xb3;
+export const MPEG_VIDEO_EXTENSION_START_CODE = 0xb5;
+export const MPEG_VIDEO_SEQUENCE_END_START_CODE = 0xb7;
+const MPEG_VIDEO_SEQUENCE_EXTENSION_ID = 0x1;
+const MPEG_VIDEO_I_PICTURE = 1;
+// MPEG-2 aspect_ratio_information codes 2 to 4 give the display aspect ratio
+const MPEG2_DISPLAY_ASPECT_RATIOS: Record<number, number> = { 2: 4 / 3, 3: 16 / 9, 4: 2.21 };
+
+// VC-1 Advanced profile start codes, which follow a 0x000001 prefix
+export const VC1_END_OF_SEQUENCE_START_CODE = 0x0a;
+export const VC1_SLICE_START_CODE = 0x0b;
+export const VC1_FIELD_START_CODE = 0x0c;
+export const VC1_FRAME_START_CODE = 0x0d;
+export const VC1_ENTRY_POINT_START_CODE = 0x0e;
+export const VC1_SEQUENCE_HEADER_START_CODE = 0x0f;
+const VC1_ADVANCED_PROFILE = 3;
+// The sample aspect ratios of VC-1's ASPECT_RATIO codes 1 to 13, SMPTE 421M table 7
+const VC1_SAMPLE_ASPECT_RATIOS: [number, number][] = [
+	[1, 1], [12, 11], [10, 11], [16, 11], [40, 33], [24, 11], [20, 11], [32, 11], [80, 33], [18, 11], [15, 11],
+	[64, 33], [160, 99],
+];
+const VC1_EXPLICIT_ASPECT_RATIO = 15;
+// ASPECT_RATIO codes 14 and up name no table entry; only 15 carries an explicit ratio
+const VC1_FIRST_UNTABLED_ASPECT_RATIO = 14;
+
+export type MpegVideoSequenceInfo = {
+	/** 'mpeg2' when a sequence extension follows the sequence header, as FFmpeg tells the two apart. */
+	codec: 'mpeg1' | 'mpeg2';
+	width: number;
+	height: number;
+	squarePixelWidth: number;
+	squarePixelHeight: number;
+};
+
+export type Vc1SequenceInfo = {
+	width: number;
+	height: number;
+	squarePixelWidth: number;
+	squarePixelHeight: number;
+};
+
+/** Returns the offset of the first 0x000001 start code prefix whose code passes the filter, or -1. */
+const findStartCode = (data: Uint8Array, startOffset: number, isMatch: (code: number) => boolean) => {
+	for (let i = startOffset; i + 3 < data.length; i++) {
+		if (data[i] === 0x00 && data[i + 1] === 0x00 && data[i + 2] === 0x01 && isMatch(data[i + 3]!)) {
+			return i;
+		}
+	}
+
+	return -1;
+};
+
+/** Widens one dimension of a picture so its pixels become square, for a display aspect ratio. */
+const getSquarePixelSize = (width: number, height: number, displayAspectRatio: number) => {
+	if (displayAspectRatio > width / height) {
+		return { squarePixelWidth: Math.round(height * displayAspectRatio), squarePixelHeight: height };
+	}
+
+	return { squarePixelWidth: width, squarePixelHeight: Math.round(width / displayAspectRatio) };
+};
+
+/**
+ * Reads an MPEG-1 or MPEG-2 Visual sequence header from Annex-style data, with the sequence extension that marks
+ * MPEG-2 and widens its picture size. Returns null when the data holds no sequence header.
+ */
+export const parseMpegVideoSequence = (data: Uint8Array): MpegVideoSequenceInfo | null => {
+	const sequenceHeaderOffset = findStartCode(data, 0, code => code === MPEG_VIDEO_SEQUENCE_HEADER_START_CODE);
+	if (sequenceHeaderOffset === -1 || sequenceHeaderOffset + 12 > data.length) {
+		return null;
+	}
+
+	const header = new Bitstream(data.subarray(sequenceHeaderOffset + 4));
+	let width = header.readBits(12);
+	let height = header.readBits(12);
+	const aspectRatioCode = header.readBits(4);
+
+	// A sequence extension, if any, follows before the first picture
+	let codec: MpegVideoSequenceInfo['codec'] = 'mpeg1';
+	const nextOffset = findStartCode(data, sequenceHeaderOffset + 4, code => (
+		code === MPEG_VIDEO_EXTENSION_START_CODE || code === MPEG_VIDEO_PICTURE_START_CODE
+	));
+	if (
+		nextOffset !== -1
+		&& data[nextOffset + 3] === MPEG_VIDEO_EXTENSION_START_CODE
+		&& nextOffset + 7 < data.length
+		&& (data[nextOffset + 4]! >> 4) === MPEG_VIDEO_SEQUENCE_EXTENSION_ID
+	) {
+		codec = 'mpeg2';
+		const extension = new Bitstream(data.subarray(nextOffset + 4));
+		extension.skipBits(4 + 8 + 1 + 2); // Identifier, profile and level, progressive_sequence, chroma_format
+		width |= extension.readBits(2) << 12;
+		height |= extension.readBits(2) << 12;
+	}
+
+	const displayAspectRatio = codec === 'mpeg2' ? MPEG2_DISPLAY_ASPECT_RATIOS[aspectRatioCode] : undefined;
+	const squarePixelSize = displayAspectRatio !== undefined
+		? getSquarePixelSize(width, height, displayAspectRatio)
+		: { squarePixelWidth: width, squarePixelHeight: height };
+
+	return { codec, width, height, ...squarePixelSize };
+};
+
+/**
+ * Reads a VC-1 Advanced profile sequence header from start-code-delimited data: its maximum coded size and, from its
+ * display extension, its sample aspect ratio. Returns null when the data holds no Advanced profile sequence header.
+ */
+export const parseVc1SequenceHeader = (data: Uint8Array): Vc1SequenceInfo | null => {
+	const sequenceHeaderOffset = findStartCode(data, 0, code => code === VC1_SEQUENCE_HEADER_START_CODE);
+	if (sequenceHeaderOffset === -1) {
+		return null;
+	}
+
+	const headerStart = sequenceHeaderOffset + 4;
+	const headerEnd = findStartCode(data, headerStart, () => true);
+	const header = new Bitstream(removeEmulationPreventionBytes(
+		data.subarray(headerStart, headerEnd === -1 ? data.length : headerEnd),
+	));
+	if (header.readBits(2) !== VC1_ADVANCED_PROFILE) {
+		return null;
+	}
+	header.skipBits(3 + 2 + 3 + 5 + 1); // Level, COLORDIFF_FORMAT, FRMRTQ_POSTPROC, BITRTQ_POSTPROC, POSTPROCFLAG
+	let width = (header.readBits(12) + 1) * 2;
+	let height = (header.readBits(12) + 1) * 2;
+	header.skipBits(6); // PULLDOWN, INTERLACE, TFCNTRFLAG, FINTERPFLAG, reserved, PSF
+
+	let sampleAspectRatio: [number, number] = [1, 1];
+	if (header.readBits(1) === 1) {
+		const displayWidth = header.readBits(14) + 1;
+		const displayHeight = header.readBits(14) + 1;
+		const aspectRatioCode = header.readBits(1) === 1 ? header.readBits(4) : 0;
+		if (aspectRatioCode === VC1_EXPLICIT_ASPECT_RATIO) {
+			sampleAspectRatio = [header.readBits(8) + 1, header.readBits(8) + 1];
+		} else if (aspectRatioCode > 0 && aspectRatioCode < VC1_FIRST_UNTABLED_ASPECT_RATIO) {
+			sampleAspectRatio = VC1_SAMPLE_ASPECT_RATIOS[aspectRatioCode - 1]!;
+		} else {
+			// Without an aspect ratio, the display size against the coded size gives it, as FFmpeg derives it
+			sampleAspectRatio = [height * displayWidth, width * displayHeight];
+		}
+		if (header.readBits(1) === 1) {
+			header.skipBits(header.readBits(1) === 1 ? 16 : 8 + 4); // FRAMERATEEXP, or FRAMERATENR and FRAMERATEDR
+		}
+		if (header.readBits(1) === 1) {
+			header.skipBits(8 + 8 + 8); // COLOR_PRIM, TRANSFER_CHAR, MATRIX_COEF
+		}
+	}
+
+	let leakyBucketCount = 0;
+	if (header.readBits(1) === 1) {
+		leakyBucketCount = header.readBits(5);
+		header.skipBits(4 + 4 + leakyBucketCount * (16 + 16)); // BIT_RATE_EXPONENT, BUFFER_SIZE_EXPONENT, the buckets
+	}
+
+	// An entry point's CODED_WIDTH and CODED_HEIGHT replace the sequence's maximum, as FFmpeg's decoder takes them; of
+	// several before the first frame, the last applies to it
+	const frameOffset = findStartCode(data, headerStart, code => code === VC1_FRAME_START_CODE);
+	const entryPointsEnd = frameOffset === -1 ? data.length : frameOffset;
+	let entryPointOffset = findStartCode(data, headerStart, code => code === VC1_ENTRY_POINT_START_CODE);
+	while (entryPointOffset !== -1 && entryPointOffset < entryPointsEnd) {
+		const entryPointStart = entryPointOffset + 4;
+		const entryPointEnd = findStartCode(data, entryPointStart, () => true);
+		const entryPoint = new Bitstream(removeEmulationPreventionBytes(
+			data.subarray(entryPointStart, entryPointEnd === -1 ? data.length : entryPointEnd),
+		));
+		// BROKEN_LINK, CLOSED_ENTRY, PANSCAN_FLAG, REFDIST_FLAG, LOOPFILTER, FASTUVMC, EXTENDED_MV, DQUANT,
+		// VSTRANSFORM, OVERLAP, QUANTIZER, and HRD_FULLNESS per leaky bucket
+		entryPoint.skipBits(1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1 + 2 + leakyBucketCount * 8);
+		if (entryPoint.readBits(1) === 1) {
+			width = (entryPoint.readBits(12) + 1) * 2;
+			height = (entryPoint.readBits(12) + 1) * 2;
+		}
+		entryPointOffset = findStartCode(data, entryPointStart, code => code === VC1_ENTRY_POINT_START_CODE);
+	}
+
+	const displayAspectRatio = width * sampleAspectRatio[0] / (height * sampleAspectRatio[1]);
+	return { width, height, ...getSquarePixelSize(width, height, displayAspectRatio) };
+};
+
 /** Determines a packet's type (key or delta) by digging into the packet bitstream. */
 export const determineVideoPacketType = (
 	codec: VideoCodec,
@@ -2640,6 +2821,38 @@ export const determineVideoPacketType = (
 				}
 			}
 			return null;
+		};
+
+		case 'mpeg1':
+		case 'mpeg2': {
+			// The first picture header's picture_coding_type, after its 10-bit temporal_reference; 1 is an I picture
+			for (let i = 0; i + 5 < packetData.length; i++) {
+				if (
+					packetData[i] === 0x00
+					&& packetData[i + 1] === 0x00
+					&& packetData[i + 2] === 0x01
+					&& packetData[i + 3] === MPEG_VIDEO_PICTURE_START_CODE
+				) {
+					const pictureCodingType = (packetData[i + 5]! >> 3) & 0x7;
+					return pictureCodingType === MPEG_VIDEO_I_PICTURE ? 'key' : 'delta';
+				}
+			}
+			return null;
+		};
+
+		case 'vc1': {
+			// An Advanced profile entry point header marks a random access point, and precedes its I picture
+			for (let i = 0; i + 3 < packetData.length; i++) {
+				if (
+					packetData[i] === 0x00
+					&& packetData[i + 1] === 0x00
+					&& packetData[i + 2] === 0x01
+					&& packetData[i + 3] === VC1_ENTRY_POINT_START_CODE
+				) {
+					return 'key';
+				}
+			}
+			return 'delta';
 		};
 
 		default: {

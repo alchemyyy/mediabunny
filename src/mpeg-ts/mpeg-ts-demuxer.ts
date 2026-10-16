@@ -32,10 +32,23 @@ import {
 	getEac3SampleRate,
 	HevcDecoderConfigurationRecord,
 	HevcNalUnitType,
+	MPEG_VIDEO_EXTENSION_START_CODE,
+	MPEG_VIDEO_PICTURE_START_CODE,
+	MPEG_VIDEO_SEQUENCE_END_START_CODE,
+	MPEG_VIDEO_SEQUENCE_HEADER_START_CODE,
+	MPEG_VIDEO_SLICE_MAXIMUM_START_CODE,
+	MPEG_VIDEO_SLICE_MINIMUM_START_CODE,
 	parseAc3SyncFrame,
 	parseAvcSps,
 	parseEac3SyncFrame,
 	parseHevcSps,
+	parseMpegVideoSequence,
+	parseVc1SequenceHeader,
+	Vc1SequenceInfo,
+	VC1_END_OF_SEQUENCE_START_CODE,
+	VC1_FIELD_START_CODE,
+	VC1_FRAME_START_CODE,
+	VC1_SLICE_START_CODE,
 	AC3_FRAME_SIZES,
 	extractNalUnitTypeForAvc,
 	extractNalUnitTypeForHevc,
@@ -105,6 +118,11 @@ const HDPR_FORMAT_IDENTIFIER = 0x48445052;
 
 // 'DTS1', 'DTS2' and 'DTS3' all share this prefix
 const DTS_FORMAT_IDENTIFIER_PREFIX = 0x44545300;
+
+// The 'VC-1' format identifier, which SMPTE RP 227 requires of a VC-1 elementary stream
+const VC1_FORMAT_IDENTIFIER = 0x56432d31;
+
+const MPEG_VIDEO_AND_VC1_REORDER_SIZE = 1;
 
 // Stream types that only mean DTS within a Blu-ray-derived program
 const BLU_RAY_DTS_STREAM_TYPES = new Set<number>([
@@ -365,6 +383,7 @@ export class MpegTsDemuxer extends Demuxer {
 						let hasAc3Descriptor = false;
 						let hasEac3Descriptor = false;
 						let hasDtsDescriptor = false;
+						let hasVc1Registration = false;
 						while (bitstream.pos < esInfoEndPos) {
 							const descriptorTag = bitstream.readBits(8);
 							const descriptorLength = bitstream.readBits(8);
@@ -381,6 +400,7 @@ export class MpegTsDemuxer extends Demuxer {
 								// which we work out from the bitstream anyway
 								const formatIdentifier = bitstream.readBits(32);
 								hasDtsDescriptor ||= (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
+								hasVc1Registration ||= formatIdentifier === VC1_FORMAT_IDENTIFIER;
 							}
 
 							bitstream.pos = descriptorEndPos;
@@ -393,10 +413,31 @@ export class MpegTsDemuxer extends Demuxer {
 							? MpegTsStreamType.DTS
 							: streamType;
 
-						switch (effectiveStreamType) {
+						// 0xea is VC-1 only with the elementary stream's 'VC-1' registration descriptor, or in a
+						// Blu-ray program, which omits it
+						const isUnregisteredVc1 = effectiveStreamType === MpegTsStreamType.VC1
+							&& !hasVc1Registration
+							&& !isBluRayProgram;
+
+						switch (isUnregisteredVc1 ? null : effectiveStreamType) {
 							case MpegTsStreamType.AVC:
-							case MpegTsStreamType.HEVC: {
-								const codec = streamType === MpegTsStreamType.AVC ? 'avc' : 'hevc';
+							case MpegTsStreamType.HEVC:
+							case MpegTsStreamType.MPEG1_VIDEO:
+							case MpegTsStreamType.MPEG2_VIDEO:
+							case MpegTsStreamType.VC1: {
+								let codec: VideoCodec;
+								if (streamType === MpegTsStreamType.AVC) {
+									codec = 'avc';
+								} else if (streamType === MpegTsStreamType.HEVC) {
+									codec = 'hevc';
+								} else if (streamType === MpegTsStreamType.MPEG1_VIDEO) {
+									codec = 'mpeg1';
+								} else if (streamType === MpegTsStreamType.MPEG2_VIDEO) {
+									// MPEG-1 streams may use the MPEG-2 stream type, which the sequence header settles
+									codec = 'mpeg2';
+								} else {
+									codec = 'vc1';
+								}
 
 								info = {
 									type: 'video',
@@ -663,6 +704,41 @@ export class MpegTsDemuxer extends Demuxer {
 										fullRange: !!spsInfo.fullRangeFlag,
 									};
 									elementaryStream.info.reorderSize = spsInfo.maxDecFrameBuffering;
+
+									break;
+								} else if (
+									elementaryStream.info.codec === 'mpeg1'
+									|| elementaryStream.info.codec === 'mpeg2'
+									|| elementaryStream.info.codec === 'vc1'
+								) {
+									if (!context.suppliedPacket) {
+										throw new Error(
+											'Invalid MPEG-1, MPEG-2, or VC-1 video stream; could not find a sequence'
+											+ ' header in any packet.',
+										);
+									}
+
+									const packetData = context.suppliedPacket.data;
+									let sequenceInfo: Vc1SequenceInfo | null;
+									if (elementaryStream.info.codec === 'vc1') {
+										sequenceInfo = parseVc1SequenceHeader(packetData);
+									} else {
+										const mpegSequenceInfo = parseMpegVideoSequence(packetData);
+										if (mpegSequenceInfo) {
+											elementaryStream.info.codec = mpegSequenceInfo.codec;
+										}
+										sequenceInfo = mpegSequenceInfo;
+									}
+									if (!sequenceInfo) {
+										continue; // Search the next packet for it
+									}
+
+									elementaryStream.info.width = sequenceInfo.width;
+									elementaryStream.info.height = sequenceInfo.height;
+									elementaryStream.info.squarePixelWidth = sequenceInfo.squarePixelWidth;
+									elementaryStream.info.squarePixelHeight = sequenceInfo.squarePixelHeight;
+									// B pictures reorder by one picture: an anchor waits for the next one
+									elementaryStream.info.reorderSize = MPEG_VIDEO_AND_VC1_REORDER_SIZE;
 
 									break;
 								} else {
@@ -2147,6 +2223,10 @@ class PacketReadingContext {
 			const codec = elementaryStream.info.codec;
 			const CHUNK_SIZE = 1024;
 
+			if (codec === 'mpeg1' || codec === 'mpeg2' || codec === 'vc1') {
+				return this.markNextStartCodeDelimitedPacket(codec);
+			}
+
 			if (codec !== 'avc' && codec !== 'hevc') {
 				throw new Error('Unhandled.');
 			}
@@ -2565,6 +2645,133 @@ class PacketReadingContext {
 				}
 			}
 		}
+	}
+
+	/**
+	 * Separates an MPEG-1, MPEG-2, or VC-1 elementary stream into frames at their start codes, as FFmpeg's parsers do.
+	 * MPEG video follows mpeg1_find_frame_end, which keeps the two field pictures of a frame together and ends a frame
+	 * after a sequence end code; VC-1 follows vc1_parse, where a frame runs on through its fields, slices, and an end
+	 * of sequence until any other start code.
+	 */
+	async markNextStartCodeDelimitedPacket(codec: 'mpeg1' | 'mpeg2' | 'vc1') {
+		const CHUNK_SIZE = 1024;
+		// The start code prefix and code in the last four bytes, as FFmpeg's start code search keeps them
+		const START_CODE_MASK = 0xffffff00;
+		const START_CODE_PREFIX = 0x00000100;
+		const NO_START_CODE_STATE = 0xffffffff;
+		const EXTENSION_STATE = START_CODE_PREFIX | MPEG_VIDEO_EXTENSION_START_CODE;
+		// A picture coding extension's identifier, and its frame picture_structure
+		const PICTURE_CODING_EXTENSION_ID = 0x80;
+		const FRAME_PICTURE_STRUCTURE = 3;
+		// mpeg1_find_frame_end's frame_start_found: 0 frame start, 1 first extension, 2 first field start, 3 second
+		// extension, 4 searching for the end
+		const SEARCHING_FRAME_END = 4;
+
+		const isMpegSlice = (code: number) => code >= MPEG_VIDEO_SLICE_MINIMUM_START_CODE
+			&& code <= MPEG_VIDEO_SLICE_MAXIMUM_START_CODE;
+
+		let packetStartPos: number | null = null;
+		let pictureStartPos: number | null = null;
+		let state = NO_START_CODE_STATE;
+		let frameStartFound = 0;
+		let vc1PictureFound = false;
+		let packetEndPos: number | null = null;
+
+		outer:
+		while (true) {
+			let remaining = this.ensureBuffered(CHUNK_SIZE);
+			if (isThenable(remaining)) remaining = await remaining;
+
+			if (remaining === 0) {
+				break;
+			}
+
+			const chunkStartPos = this.currentPos;
+			const chunk = this.readBytes(remaining);
+
+			for (let i = 0; i < chunk.byteLength; i++) {
+				const byte = chunk[i]!;
+
+				if (codec !== 'vc1' && (frameStartFound & 1)) {
+					// Within an extension after a frame start or a first field: a picture coding extension's
+					// picture_structure tells a frame picture from a field, whose frame goes on with a second field
+					if (state === EXTENSION_STATE && (byte & 0xf0) !== PICTURE_CODING_EXTENSION_ID) {
+						frameStartFound--;
+					} else if (state === EXTENSION_STATE + 2) {
+						frameStartFound = (byte & 3) === FRAME_PICTURE_STRUCTURE ? 0 : (frameStartFound + 1) & 3;
+					}
+					state = (state + 1) >>> 0;
+					continue;
+				}
+
+				state = ((state << 8) | byte) >>> 0;
+				if ((state & START_CODE_MASK) !== START_CODE_PREFIX) {
+					continue;
+				}
+
+				const startCodePos = chunkStartPos + i - 3;
+				packetStartPos ??= startCodePos;
+
+				if (codec === 'vc1') {
+					if (!vc1PictureFound) {
+						if (byte === VC1_FRAME_START_CODE || byte === VC1_FIELD_START_CODE) {
+							vc1PictureFound = true;
+						}
+					} else if (
+						byte !== VC1_FIELD_START_CODE
+						&& byte !== VC1_SLICE_START_CODE
+						&& byte !== VC1_END_OF_SEQUENCE_START_CODE
+					) {
+						packetEndPos = startCodePos;
+						break outer;
+					}
+
+					continue;
+				}
+
+				if (frameStartFound === 0 && isMpegSlice(byte)) {
+					frameStartFound = SEARCHING_FRAME_END;
+				}
+				if (byte === MPEG_VIDEO_SEQUENCE_END_START_CODE) {
+					// The sequence end code closes the frame
+					packetEndPos = startCodePos + 4;
+					break outer;
+				}
+				if (frameStartFound === 2 && byte === MPEG_VIDEO_SEQUENCE_HEADER_START_CODE) {
+					frameStartFound = 0;
+				}
+				if (frameStartFound < SEARCHING_FRAME_END && byte === MPEG_VIDEO_EXTENSION_START_CODE) {
+					frameStartFound++;
+				}
+				if (frameStartFound === SEARCHING_FRAME_END && !isMpegSlice(byte)) {
+					packetEndPos = startCodePos;
+					break outer;
+				}
+				if (frameStartFound === 0 && byte === MPEG_VIDEO_PICTURE_START_CODE) {
+					// FFmpeg takes the frame's timestamp from where its first picture starts
+					pictureStartPos ??= startCodePos;
+				}
+			}
+
+			if (remaining < CHUNK_SIZE) {
+				// End of stream
+				break;
+			}
+		}
+
+		if (packetStartPos === null) {
+			return;
+		}
+
+		// The end of the stream ends the last frame
+		packetEndPos ??= this.endPos;
+		if (packetEndPos <= packetStartPos) {
+			return;
+		}
+
+		const pts = this.getPesPacketAt(pictureStartPos ?? packetStartPos).pts;
+		this.seekTo(packetStartPos);
+		return this.supplyPacket(packetEndPos - packetStartPos, 0, pts);
 	}
 
 	/** Supplies the context with a new encoded packet, beginning at the current position. */
