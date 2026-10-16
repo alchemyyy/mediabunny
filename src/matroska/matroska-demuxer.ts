@@ -820,12 +820,9 @@ export class MatroskaDemuxer extends Demuxer {
 				continue;
 			}
 
-			// Decode the block data if it hasn't been decoded yet (needed for lacing expansion)
-			if (!originalBlock.decoded) {
-				originalBlock.data = this.decodeBlockData(track, originalBlock.data);
-				originalBlock.decoded = true;
-			}
-
+			// The lacing data itself is never content-encoded; content encoding applies to each laced frame
+			// individually, so the frames are split from the stored data and decoded lazily one by one.
+			// https://www.matroska.org/technical/notes.html#contentcompression
 			const slice = FileSlice.tempFromBytes(originalBlock.data);
 
 			const frameSizes: number[] = [];
@@ -920,7 +917,7 @@ export class MatroskaDemuxer extends Demuxer {
 					isKeyFrame: originalBlock.isKeyFrame,
 					data: frameData,
 					lacing: BlockLacing.None,
-					decoded: true,
+					decoded: originalBlock.decoded,
 					postProcessed: false,
 					mainAdditional: originalBlock.mainAdditional,
 				});
