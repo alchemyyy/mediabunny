@@ -17,6 +17,7 @@ Mediabunny supports many commonly used media container formats, all of which are
 - Ogg (.ogg)
 - MP3 (.mp3)
 - WAVE (.wav)
+- AIFF / AIFF-C (.aiff, .aifc)
 - ADTS (.aac)
 - FLAC (.flac)
 - MPEG Transport Stream (.ts)
