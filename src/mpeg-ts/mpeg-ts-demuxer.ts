@@ -599,14 +599,15 @@ export class MpegTsDemuxer extends Demuxer {
 									const num = spsInfo.pixelAspectRatio.num;
 									const den = spsInfo.pixelAspectRatio.den;
 
+									elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
+									elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
+
 									if (num > 0 && den > 0) {
 										if (num > den) {
 											elementaryStream.info.squarePixelWidth = Math.round(
 												elementaryStream.info.width * num / den,
 											);
-											elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
 										} else {
-											elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
 											elementaryStream.info.squarePixelHeight = Math.round(
 												elementaryStream.info.height * den / num,
 											);
@@ -652,18 +653,23 @@ export class MpegTsDemuxer extends Demuxer {
 
 									elementaryStream.info.width = spsInfo.displayWidth;
 									elementaryStream.info.height = spsInfo.displayHeight;
-									if (spsInfo.pixelAspectRatio.num > spsInfo.pixelAspectRatio.den) {
-										elementaryStream.info.squarePixelWidth = Math.round(
-											elementaryStream.info.width
-											* spsInfo.pixelAspectRatio.num / spsInfo.pixelAspectRatio.den,
-										);
-										elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
-									} else {
-										elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
-										elementaryStream.info.squarePixelHeight = Math.round(
-											elementaryStream.info.height
-											* spsInfo.pixelAspectRatio.den / spsInfo.pixelAspectRatio.num,
-										);
+
+									const num = spsInfo.pixelAspectRatio.num;
+									const den = spsInfo.pixelAspectRatio.den;
+
+									elementaryStream.info.squarePixelWidth = elementaryStream.info.width;
+									elementaryStream.info.squarePixelHeight = elementaryStream.info.height;
+
+									if (num > 0 && den > 0) {
+										if (num > den) {
+											elementaryStream.info.squarePixelWidth = Math.round(
+												elementaryStream.info.width * num / den,
+											);
+										} else {
+											elementaryStream.info.squarePixelHeight = Math.round(
+												elementaryStream.info.height * den / num,
+											);
+										}
 									}
 
 									elementaryStream.info.colorSpace = {
@@ -2281,6 +2287,19 @@ class PacketReadingContext {
 		this.currentPesPacketIndex++;
 	}
 
+	getPesPacketAt(pos: number) {
+		assert(pos <= this.currentPos);
+
+		let pesPacketIndex = this.currentPesPacketIndex;
+		let pesPacketPos = this.currentPesPacketPos;
+		while (pos < pesPacketPos) {
+			pesPacketIndex--;
+			pesPacketPos -= this.pesPackets[pesPacketIndex]!.data.byteLength;
+		}
+
+		return this.pesPackets[pesPacketIndex]!;
+	}
+
 	async markNextPacket(res: ResultValue<void>): MaybeRelevantPromise {
 		assert(!this.suppliedPacket);
 
@@ -2301,6 +2320,7 @@ class PacketReadingContext {
 			const nalHeaderSize = codec === 'avc' ? 1 : 2;
 			let packetStartPos: number | null = null;
 			let frameStartFound = false;
+			let slicePts: number | null = null;
 			let lastFirstMacroblockInSlice = 0;
 
 			while (true) {
@@ -2428,6 +2448,11 @@ class PacketReadingContext {
 								isFrameBoundary = true;
 							} else {
 								frameStartFound = true;
+
+								// When we find a slice, we prefer the timestamp of the PES packet containing that slice
+								// instead of the one at the start of the access unit. This is almost almost the same
+								// PES packet anyways, but some malformed streams can have weird packetization
+								slicePts = this.getPesPacketAt(chunkStartPos + nalHeaderStart).pts;
 							}
 						}
 					} else if (isAccessUnitStart && frameStartFound) {
@@ -2438,7 +2463,7 @@ class PacketReadingContext {
 						// End the packet at this start code (the next frame begins here)
 						const packetLength = startCodePos - packetStartPos;
 						this.seekTo(packetStartPos);
-						this.supplyPacket(packetLength, 0);
+						this.supplyPacket(packetLength, 0, slicePts);
 						return res.set();
 					}
 
@@ -2455,7 +2480,7 @@ class PacketReadingContext {
 			if (packetStartPos !== null && this.endPos > packetStartPos) {
 				const packetLength = this.endPos - packetStartPos;
 				this.seekTo(packetStartPos);
-				this.supplyPacket(packetLength, 0);
+				this.supplyPacket(packetLength, 0, slicePts);
 			}
 
 			return res.set();
@@ -2737,11 +2762,13 @@ class PacketReadingContext {
 	}
 
 	/** Supplies the context with a new encoded packet, beginning at the current position. */
-	supplyPacket(packetLength: number, intrinsicDuration: number) {
+	supplyPacket(packetLength: number, intrinsicDuration: number, timestampOverride: number | null = null) {
 		const currentPesPacket = this.getCurrentPesPacket();
 
 		let pts: number;
-		if (this.lastSuppliedPesPacket === currentPesPacket) {
+		if (timestampOverride !== null) {
+			pts = timestampOverride;
+		} else if (this.lastSuppliedPesPacket === currentPesPacket) {
 			assert(this.nextPts !== null);
 			pts = this.nextPts;
 		} else {

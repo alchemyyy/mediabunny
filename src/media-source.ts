@@ -10,6 +10,7 @@ import { buildAacAudioSpecificConfig, parseAacAudioSpecificConfig } from '../sha
 import {
 	AUDIO_CODECS,
 	AudioCodec,
+	extractVideoCodecString,
 	MediaCodec,
 	parsePcmCodec,
 	PCM_AUDIO_CODECS,
@@ -29,6 +30,7 @@ import {
 	clearIntervalUnthrottled,
 	floorToDivisor,
 	isCodecReclaimedError,
+	isFirefox,
 	isThenable,
 	last,
 	missingWebCodecsClassMessage,
@@ -70,8 +72,18 @@ import {
 	VideoEncodingConfig,
 } from './encode';
 import { AudioResampler } from './resample';
-import { determineVideoPacketType } from './codec-data';
+import {
+	deserializeAvcDecoderConfigurationRecord,
+	determineVideoPacketType,
+	extractAv1CodecInfoFromPacket,
+	extractAvcDecoderConfigurationRecord,
+	extractHevcDecoderConfigurationRecord,
+	extractVp9CodecInfoFromPacket,
+	serializeAvcDecoderConfigurationRecord,
+} from './codec-data';
 import { Logging } from './logging';
+import { readEsDescriptor } from './isobmff/isobmff-reader';
+import { FileSlice } from './reader';
 
 /**
  * Base class for media sources. Media sources are used to add media samples to an output file.
@@ -242,6 +254,7 @@ class VideoEncoderWrapper {
 	private muxer: Muxer | null = null;
 	private lastMultipleOfKeyFrameInterval = -1;
 	private emittedEncoderPackets = 0;
+	private chunkTimestampsAreShiftedByDuration = false; // See detectAvcChunkTimestampShift
 
 	// Tracks the input dimensions of the first frame
 	private codedWidth: number | null = null;
@@ -799,6 +812,11 @@ class VideoEncoderWrapper {
 				await this.customEncoder.init();
 			} else {
 				this.encoderConfig = encoderConfig;
+
+				if (this.encodingConfig.codec === 'avc' && isFirefox()) {
+					this.chunkTimestampsAreShiftedByDuration = await detectAvcChunkTimestampShift();
+				}
+
 				this.createWebCodecsEncoders();
 			}
 
@@ -926,10 +944,76 @@ class VideoEncoderWrapper {
 
 		let packet = EncodedPacket.fromEncodedChunk(colorChunk, sideData);
 
+		const encoderConfig = this.encoderConfig;
+		assert(encoderConfig);
+
+		if (meta?.decoderConfig) {
+			// Let's correct the codec string based on the actual bitstream data, rather than leaving it on the default
+			// value (which is just what was in the encoder config). This provides better consistency.
+			meta.decoderConfig.codec = extractVideoCodecString({
+				width: encoderConfig.width,
+				height: encoderConfig.height,
+				codec: this.encodingConfig.codec,
+				codecDescription: meta.decoderConfig.description
+					? toUint8Array(meta.decoderConfig.description)
+					: null,
+				colorSpace: meta.decoderConfig.colorSpace ?? null,
+				avcType: encoderConfig.codec.includes('avc1.')
+					? 1
+					: encoderConfig.codec.includes('avc3.')
+						? 3
+						: null,
+				avcCodecInfo: this.encodingConfig.codec === 'avc' && !meta.decoderConfig.description
+					? extractAvcDecoderConfigurationRecord(packet.data)
+					: null,
+				hevcCodecInfo: this.encodingConfig.codec === 'hevc' && !meta.decoderConfig.description
+					? extractHevcDecoderConfigurationRecord(packet.data)
+					: null,
+				vp9CodecInfo: this.encodingConfig.codec === 'vp9'
+					? extractVp9CodecInfoFromPacket(packet.data)
+					: null,
+				av1CodecInfo: this.encodingConfig.codec === 'av1'
+					? extractAv1CodecInfoFromPacket(packet.data)
+					: null,
+				proresFormat: null, // Can't be encoded by WebCodecs
+			});
+
+			if (this.encodingConfig.codec === 'avc' && meta.decoderConfig.description && isFirefox()) {
+				// This works around https://bugzilla.mozilla.org/show_bug.cgi?id=2082867
+				// Also see https://github.com/Vanilagy/mediabunny/issues/559
+				const parsed = deserializeAvcDecoderConfigurationRecord(toUint8Array(meta.decoderConfig.description));
+				let sps = parsed?.sequenceParameterSets[0];
+
+				if (sps && sps[0] === sps[1]) { // The first two bytes of the SPS being the same is a reliable signal
+					assert(parsed);
+					sps = sps.subarray(1);
+
+					let pps = parsed.pictureParameterSets[0];
+					if (pps) {
+						pps = pps.subarray(1);
+					}
+
+					const record = serializeAvcDecoderConfigurationRecord({
+						...parsed,
+						sequenceParameterSets: [sps],
+						pictureParameterSets: pps ? [pps] : [],
+					});
+					meta.decoderConfig.description = record;
+				}
+			}
+		}
+
+		let microsecondTimestamp = colorChunk.timestamp;
+		if (this.chunkTimestampsAreShiftedByDuration) {
+			// The encoder added the frame's duration to its timestamp, so undo that
+			microsecondTimestamp -= colorChunk.duration ?? 0;
+			packet = packet.clone({ timestamp: microsecondTimestamp / 1e6 });
+		}
+
 		// See if there's a relevant timing entry to refine the packet's timing data
 		const preciseTimingIndex = binarySearchLessOrEqual(
 			this.preciseTimings,
-			colorChunk.timestamp,
+			microsecondTimestamp,
 			x => x.microsecondTimestamp,
 		);
 		const entry = preciseTimingIndex !== -1
@@ -949,7 +1033,7 @@ class VideoEncoderWrapper {
 		}
 
 		// Define the packet
-		if ((entry && entry.microsecondTimestamp === colorChunk.timestamp) || actualType !== null) {
+		if ((entry && entry.microsecondTimestamp === microsecondTimestamp) || actualType !== null) {
 			packet = packet.clone({
 				timestamp: entry?.timestampIsValid ? entry.timestamp : undefined,
 				duration: entry?.durationIsValid ? entry.duration : undefined,
@@ -1066,6 +1150,49 @@ class VideoEncoderWrapper {
 		}
 	}
 }
+
+let avcChunkTimestampShiftPromise: Promise<boolean> | null = null;
+
+// Detects https://bugzilla.mozilla.org/show_bug.cgi?id=2082890 so we can work around it
+const detectAvcChunkTimestampShift = () => {
+	return avcChunkTimestampShiftPromise ??= (async () => {
+		let chunkTimestamp: number | null = null;
+		const encoder = new VideoEncoder({
+			output: (chunk) => {
+				chunkTimestamp ??= chunk.timestamp;
+			},
+			error: () => {},
+		});
+
+		try {
+			encoder.configure({
+				codec: 'avc1.64001f',
+				width: 1280,
+				height: 720,
+			});
+
+			const frame = new VideoFrame(new Uint8Array(1280 * 720 * 1.5), {
+				format: 'I420',
+				codedWidth: 1280,
+				codedHeight: 720,
+				timestamp: 0,
+				duration: 500,
+			});
+			encoder.encode(frame, { keyFrame: true });
+			frame.close();
+
+			await encoder.flush();
+		} catch {
+			return false;
+		} finally {
+			if (encoder.state !== 'closed') {
+				encoder.close();
+			}
+		}
+
+		return chunkTimestamp === 500;
+	})();
+};
 
 let splitterWorkerUrl: string | null = null;
 
@@ -2316,6 +2443,18 @@ class AudioEncoderWrapper {
 						// which we try to detect here. If detected, we'll provide our own description instead, derived
 						// from the codec string and audio parameters.
 						if (this.encodingConfig.codec === 'aac' && meta?.decoderConfig) {
+							if (
+								meta.decoderConfig.description
+								&& meta.decoderConfig.description.byteLength > 0
+								&& toUint8Array(meta.decoderConfig.description)[0] === 0x03
+							) {
+								// We were handed an ES descriptor instead of an AudioSpecificConfig
+								const { decoderSpecificInfo } = readEsDescriptor(
+									FileSlice.tempFromBytes(toUint8Array(meta.decoderConfig.description)),
+								);
+								meta.decoderConfig.description = decoderSpecificInfo ?? undefined;
+							}
+
 							let needsDescriptionOverwrite = false;
 							if (!meta.decoderConfig.description || meta.decoderConfig.description.byteLength < 2) {
 								needsDescriptionOverwrite = true;
