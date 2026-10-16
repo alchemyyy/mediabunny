@@ -71,8 +71,8 @@ type AVIVideoTrackData = AVITrackData & { type: 'video' };
 type AVIAudioTrackData = AVITrackData & { type: 'audio' };
 
 export class AVIMuxer extends Muxer {
-	private writer: Writer;
-	private riffWriter: RIFFWriter;
+	private writer!: Writer;
+	private riffWriter!: RIFFWriter;
 	private format: AviOutputFormat;
 
 	private trackDatas: AVITrackData[] = [];
@@ -95,9 +95,7 @@ export class AVIMuxer extends Muxer {
 	constructor(output: Output, format: AviOutputFormat) {
 		super(output);
 
-		this.writer = output._writer;
 		this.format = format;
-		this.riffWriter = new RIFFWriter(this.writer);
 
 		if (this.format._options.large) {
 			// RF64 support could be added here
@@ -106,6 +104,10 @@ export class AVIMuxer extends Muxer {
 
 	async start() {
 		const release = await this.mutex.acquire();
+
+		// The header and index sizes are patched in place once known
+		this.writer = await this.output._getRootWriter(false);
+		this.riffWriter = new RIFFWriter(this.writer);
 
 		this.fileStartPos = this.writer.getPos();
 
@@ -288,7 +290,7 @@ export class AVIMuxer extends Muxer {
 				throw new Error(`Unsupported video codec for AVI: ${track.source._codec}`);
 			}
 
-			validateVideoChunkMetadata(meta);
+			validateVideoChunkMetadata(meta, track.source._codec);
 
 			trackData = {
 				track,
@@ -358,7 +360,7 @@ export class AVIMuxer extends Muxer {
 				throw new Error(`Unsupported audio codec for AVI: ${track.source._codec}`);
 			}
 
-			validateAudioChunkMetadata(meta);
+			validateAudioChunkMetadata(meta, track.source._codec);
 
 			trackData = {
 				track,

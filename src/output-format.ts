@@ -1151,14 +1151,22 @@ export class AviOutputFormat extends OutputFormat {
 	getSupportedCodecs(): MediaCodec[] {
 		return [
 			...VIDEO_CODECS.filter(codec => ['avc', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg4'].includes(codec)),
-			...AUDIO_CODECS.filter(codec =>
-				['mp3', 'aac', 'vorbis', 'flac', 'ac3', 'pcm-s16', 'pcm-s24', 'pcm-s32', 'pcm-f32', 'pcm-u8', 'ulaw', 'alaw'].includes(codec),
-			),
+			...AUDIO_CODECS.filter(codec => [
+				'mp3', 'aac', 'vorbis', 'flac', 'ac3', 'pcm-s16', 'pcm-s24', 'pcm-s32', 'pcm-f32', 'pcm-u8', 'ulaw', 'alaw',
+			].includes(codec)),
 		];
 	}
 
-	get supportsVideoRotationMetadata() {
+	get supportsVideoTransformationMetadata() {
 		return false;
+	}
+
+	get supportsTimestampedMediaData() {
+		return false;
+	}
+
+	get negativeTimestampSupport() {
+		return null;
 	}
 }
 
