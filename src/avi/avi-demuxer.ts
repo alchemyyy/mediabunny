@@ -7,63 +7,102 @@
  */
 
 import { Demuxer } from '../demuxer';
-import { EncodedPacket } from '../packet';
+import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
 import { Input } from '../input';
 import {
-	InputAudioTrack,
-	InputVideoTrack,
-	InputTrack,
 	InputVideoTrackBacking,
 	InputAudioTrackBacking,
 	InputTrackBacking,
 } from '../input-track';
-import { MetadataTags } from '../tags';
+import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import { PacketRetrievalOptions } from '../media-sink';
-import { VideoCodec, AudioCodec, MediaCodec } from '../codec';
+import {
+	VideoCodec,
+	AudioCodec,
+	MediaCodec,
+	extractAudioCodecString,
+	extractColorSpace,
+	extractVideoCodecString,
+} from '../codec';
+import {
+	extractAv1CodecInfoFromPacket,
+	extractAvcDecoderConfigurationRecord,
+	extractHevcDecoderConfigurationRecord,
+	extractVp9CodecInfoFromPacket,
+} from '../codec-data';
 import { Reader, readBytes, readU32Le } from '../reader';
-import { textDecoder, Rotation, binarySearchLessOrEqual, binarySearchExact } from '../misc';
+import { TrackType } from '../output';
+import {
+	textDecoder,
+	binarySearchLessOrEqual,
+	IDENTITY_MATRIX,
+	TransformationMatrix,
+	UNDETERMINED_LANGUAGE,
+} from '../misc';
 import {
 	AVIMainHeader, AVIStreamHeader, AVIBitmapInfoHeader, AVIWaveFormatEx, AVIIndexEntry,
 	parseMainHeader, parseStreamHeader, parseBitmapInfoHeader, parseWaveFormatEx, parseIndexEntry,
 	aviVideoFourccToCodec, aviAudioFormatTagToCodec, parseStreamChunkId, AVIIF_KEYFRAME,
 } from './avi-misc';
 
-interface StreamInfo {
+type StreamInfo = {
 	header: AVIStreamHeader;
 	format: AVIBitmapInfoHeader | AVIWaveFormatEx;
-	track?: AviVideoTrackBacking | AviAudioTrackBacking;
+	backing?: AviVideoTrackBacking | AviAudioTrackBacking;
+	/** The stream's non-empty chunks, in file order, which is decode order. */
 	packets: PacketInfo[];
-	presentationTimestamps: {
-		timestamp: number;
-		packetIndex: number;
-	}[];
 	keyPacketIndices: number[];
+	/** The stream's number, which its chunk IDs carry. */
 	index: number;
-}
+	/** Chunks seen so far, empty ones included, for streams that time chunks by count. */
+	chunkCount: number;
+	/** Bytes seen so far, for streams that time chunks by size. */
+	byteCount: number;
+};
 
-interface PacketInfo {
+type PacketInfo = {
 	entry: AVIIndexEntry;
 	timestamp: number;
 	duration: number;
-}
+	isKey: boolean;
+};
 
-interface ChunkInfo {
+type ChunkInfo = {
 	fourcc: string;
 	size: number;
 	position: number;
-}
+};
 
-// Base class following Matroska pattern
+const VIDEO_CHUNK_TYPES = ['db', 'dc'];
+const AUDIO_CHUNK_TYPES = ['wb'];
+
 abstract class AviTrackBacking implements InputTrackBacking {
 	packetToIndex = new WeakMap<EncodedPacket, number>();
 
 	constructor(
-		protected demuxer: AVIDemuxer,
-		protected streamInfo: StreamInfo,
+		public demuxer: AVIDemuxer,
+		public streamInfo: StreamInfo,
 	) {}
 
+	abstract getType(): TrackType;
+	abstract getDecoderConfig(): Promise<VideoDecoderConfig | AudioDecoderConfig | null>;
+
 	getId(): number {
-		return this.streamInfo.index;
+		return this.streamInfo.index + 1;
+	}
+
+	getNumber(): number {
+		let number = 0;
+		for (const backing of this.demuxer.trackBackings) {
+			if (backing.getType() === this.getType()) {
+				number++;
+			}
+			if ((backing as AviTrackBacking) === this) {
+				break;
+			}
+		}
+
+		return number;
 	}
 
 	getCodec(): MediaCodec | null {
@@ -86,273 +125,147 @@ abstract class AviTrackBacking implements InputTrackBacking {
 	}
 
 	getLanguageCode(): string {
-		return 'eng';
+		return UNDETERMINED_LANGUAGE;
 	}
 
 	getTimeResolution(): number {
-		if (this.streamInfo.header.rate > 0) {
+		if (this.streamInfo.header.rate > 0 && this.streamInfo.header.scale > 0) {
 			return this.streamInfo.header.rate / this.streamInfo.header.scale;
 		}
 		return 1000000;
 	}
 
-	async getFirstTimestamp(): Promise<number> {
-		if (this.streamInfo.packets.length === 0) return 0;
-
-		// Return first keyframe timestamp plus one frame duration
-		// This ensures proper decoding from the keyframe
-		if (this.streamInfo.keyPacketIndices.length > 0) {
-			const firstKeyIndex = this.streamInfo.keyPacketIndices[0]!;
-			const firstKeyPacket = this.streamInfo.packets[firstKeyIndex]!;
-			return firstKeyPacket.timestamp + firstKeyPacket.duration;
-		}
-
-		// Fallback to first packet if no keyframes (shouldn't happen in valid video)
-		return this.streamInfo.packets[0]!.timestamp;
+	isRelativeToUnixEpoch() {
+		return false;
 	}
 
-	async computeDuration(): Promise<number> {
-		const lastPacket = await this.getPacket(Infinity, { metadataOnly: true });
-		return (lastPacket?.timestamp ?? 0) + (lastPacket?.duration ?? 0);
+	getUnixTimeForTimestamp() {
+		return null;
 	}
 
-	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
-		// Return the first keyframe to ensure decodable start
-		if (this.streamInfo.keyPacketIndices.length === 0) return null;
-
-		const firstKeyIndex = this.streamInfo.keyPacketIndices[0]!;
-		const packetInfo = this.streamInfo.packets[firstKeyIndex]!;
-
-		if (options.metadataOnly) {
-			const packet = new EncodedPacket(
-				new Uint8Array(),
-				'key',
-				packetInfo.timestamp,
-				packetInfo.duration,
-				firstKeyIndex,
-				packetInfo.entry.size,
-			);
-			this.packetToIndex.set(packet, firstKeyIndex);
-			return packet;
-		}
-
-		const packet = await this.demuxer.readPacket(packetInfo.entry, packetInfo.timestamp, packetInfo.duration, firstKeyIndex);
-		if (packet) {
-			this.packetToIndex.set(packet, firstKeyIndex);
-		}
-		return packet;
+	getDisposition(): TrackDisposition {
+		return {
+			...DEFAULT_TRACK_DISPOSITION,
+		};
 	}
 
-	async getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
-		if (this.streamInfo.presentationTimestamps.length === 0) {
+	getPairingMask() {
+		return 1n;
+	}
+
+	getBitrate() {
+		return null;
+	}
+
+	getAverageBitrate() {
+		return null;
+	}
+
+	async getDurationFromMetadata(): Promise<number | null> {
+		const { header } = this.streamInfo;
+		if (header.rate === 0 || header.scale === 0 || header.length === 0) {
 			return null;
 		}
 
-		// Binary search for the closest packet
-		const index = binarySearchLessOrEqual(
-			this.streamInfo.presentationTimestamps,
-			timestamp,
-			x => x.timestamp,
-		);
+		return (header.start + header.length) * header.scale / header.rate;
+	}
 
-		if (index === -1) {
-			// All timestamps are greater than requested, return the first packet
-			const entry = this.streamInfo.presentationTimestamps[0]!;
-			const packetIndex = entry.packetIndex;
-			const packetInfo = this.streamInfo.packets[packetIndex]!;
+	async getLiveRefreshInterval() {
+		return null;
+	}
 
-			if (options.metadataOnly) {
-				const packet = new EncodedPacket(
-					new Uint8Array(),
-					(packetInfo.entry.flags & AVIIF_KEYFRAME) ? 'key' : 'delta',
-					packetInfo.timestamp,
-					packetInfo.duration,
-					packetIndex,
-					packetInfo.entry.size,
-				);
-				this.packetToIndex.set(packet, packetIndex);
-				return packet;
-			}
+	private async createPacket(packetIndex: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+		const packetInfo = this.streamInfo.packets[packetIndex]!;
 
-			const packet = await this.demuxer.readPacket(packetInfo.entry, packetInfo.timestamp, packetInfo.duration, packetIndex);
-			if (packet) {
-				this.packetToIndex.set(packet, packetIndex);
-			}
-			return packet;
-		}
-
-		const entry = this.streamInfo.presentationTimestamps[index]!;
-		let packetIndex = entry.packetIndex;
-		let packetInfo = this.streamInfo.packets[packetIndex]!;
-
-		// Adjust to next packet if timestamp is past halfway through current packet
-		if (timestamp > packetInfo.timestamp && index + 1 < this.streamInfo.presentationTimestamps.length) {
-			const nextEntry = this.streamInfo.presentationTimestamps[index + 1]!;
-			const nextPacketInfo = this.streamInfo.packets[nextEntry.packetIndex]!;
-
-			if (timestamp > packetInfo.timestamp + packetInfo.duration * 0.5) {
-				packetIndex = nextEntry.packetIndex;
-				packetInfo = nextPacketInfo;
-			}
-		}
-
+		let packet: EncodedPacket | null;
 		if (options.metadataOnly) {
-			const packet = new EncodedPacket(
-				new Uint8Array(),
-				(packetInfo.entry.flags & AVIIF_KEYFRAME) ? 'key' : 'delta',
+			packet = new EncodedPacket(
+				PLACEHOLDER_DATA,
+				packetInfo.isKey ? 'key' : 'delta',
 				packetInfo.timestamp,
 				packetInfo.duration,
 				packetIndex,
 				packetInfo.entry.size,
 			);
-			this.packetToIndex.set(packet, packetIndex);
-			return packet;
+		} else {
+			packet = await this.demuxer.readPacket(packetInfo, packetIndex);
 		}
 
-		const packet = await this.demuxer.readPacket(packetInfo.entry, packetInfo.timestamp, packetInfo.duration, packetIndex);
 		if (packet) {
 			this.packetToIndex.set(packet, packetIndex);
 		}
 		return packet;
+	}
+
+	private getPacketIndex(packet: EncodedPacket) {
+		const index = this.packetToIndex.get(packet);
+		if (index === undefined) {
+			throw new Error('Packet was not created from this track.');
+		}
+
+		return index;
+	}
+
+	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+		if (this.streamInfo.packets.length === 0) {
+			return null;
+		}
+
+		return this.createPacket(0, options);
+	}
+
+	async getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+		const index = binarySearchLessOrEqual(this.streamInfo.packets, timestamp, x => x.timestamp);
+		if (index === -1) {
+			return null;
+		}
+
+		return this.createPacket(index, options);
 	}
 
 	async getNextPacket(packet: EncodedPacket, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
-		const index = this.packetToIndex.get(packet);
-		if (index === undefined) {
-			throw new Error('Packet was not created from this track.');
+		const nextIndex = this.getPacketIndex(packet) + 1;
+		if (nextIndex >= this.streamInfo.packets.length) {
+			return null;
 		}
 
-		const nextIndex = index + 1;
-		if (nextIndex >= this.streamInfo.packets.length) return null;
-
-		const packetInfo = this.streamInfo.packets[nextIndex]!;
-		if (options.metadataOnly) {
-			const newPacket = new EncodedPacket(
-				new Uint8Array(),
-				(packetInfo.entry.flags & AVIIF_KEYFRAME) ? 'key' : 'delta',
-				packetInfo.timestamp,
-				packetInfo.duration,
-				nextIndex,
-				packetInfo.entry.size,
-			);
-			this.packetToIndex.set(newPacket, nextIndex);
-			return newPacket;
-		}
-
-		const newPacket = await this.demuxer.readPacket(packetInfo.entry, packetInfo.timestamp, packetInfo.duration, nextIndex);
-		if (newPacket) {
-			this.packetToIndex.set(newPacket, nextIndex);
-		}
-		return newPacket;
+		return this.createPacket(nextIndex, options);
 	}
 
 	async getKeyPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
-		if (this.streamInfo.keyPacketIndices.length === 0) return null;
-
-		let bestKeyIndex = -1;
-
-		// Use binary search on keyPacketIndices
-		let left = 0;
-		let right = this.streamInfo.keyPacketIndices.length - 1;
-
-		while (left <= right) {
-			const mid = Math.floor((left + right) / 2);
-			const packetIndex = this.streamInfo.keyPacketIndices[mid]!;
-			const packetInfo = this.streamInfo.packets[packetIndex]!;
-
-			if (packetInfo.timestamp <= timestamp) {
-				bestKeyIndex = packetIndex;
-				left = mid + 1; // Look for a closer keyframe
-			} else {
-				right = mid - 1;
-			}
+		const keyPacketIndices = this.streamInfo.keyPacketIndices;
+		const keyIndex = binarySearchLessOrEqual(
+			keyPacketIndices,
+			timestamp,
+			x => this.streamInfo.packets[x]!.timestamp,
+		);
+		if (keyIndex === -1) {
+			return null;
 		}
 
-		// If no keyframe before timestamp, use the first keyframe
-		if (bestKeyIndex === -1 && this.streamInfo.keyPacketIndices.length > 0) {
-			bestKeyIndex = this.streamInfo.keyPacketIndices[0]!;
-		}
-
-		if (bestKeyIndex === -1) return null;
-
-		const packetInfo = this.streamInfo.packets[bestKeyIndex]!;
-
-		if (options.metadataOnly) {
-			const packet = new EncodedPacket(
-				new Uint8Array(),
-				'key',
-				packetInfo.timestamp,
-				packetInfo.duration,
-				bestKeyIndex,
-				packetInfo.entry.size,
-			);
-			this.packetToIndex.set(packet, bestKeyIndex);
-			return packet;
-		}
-
-		const packet = await this.demuxer.readPacket(packetInfo.entry, packetInfo.timestamp, packetInfo.duration, bestKeyIndex);
-		if (packet) {
-			this.packetToIndex.set(packet, bestKeyIndex);
-		}
-		return packet;
+		return this.createPacket(keyPacketIndices[keyIndex]!, options);
 	}
 
 	async getNextKeyPacket(packet: EncodedPacket, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
-		const index = this.packetToIndex.get(packet);
-		if (index === undefined) {
-			throw new Error('Packet was not created from this track.');
+		const index = this.getPacketIndex(packet);
+
+		// The first key packet after the given one
+		const keyPacketIndices = this.streamInfo.keyPacketIndices;
+		const keyIndex = binarySearchLessOrEqual(keyPacketIndices, index, x => x) + 1;
+		if (keyIndex >= keyPacketIndices.length) {
+			return null;
 		}
 
-		// Binary search for the next keyframe after current index
-		const keyIndex = binarySearchExact(
-			this.streamInfo.keyPacketIndices,
-			index,
-			x => x,
-		);
-
-		let nextKeyIndex = -1;
-		if (keyIndex !== -1) {
-			// Found the current packet in keyframes, get the next one
-			if (keyIndex + 1 < this.streamInfo.keyPacketIndices.length) {
-				nextKeyIndex = this.streamInfo.keyPacketIndices[keyIndex + 1]!;
-			}
-		} else {
-			// Current packet is not a keyframe, find the first keyframe after it
-			for (let i = 0; i < this.streamInfo.keyPacketIndices.length; i++) {
-				const keyPacketIndex = this.streamInfo.keyPacketIndices[i]!;
-				if (keyPacketIndex > index) {
-					nextKeyIndex = keyPacketIndex;
-					break;
-				}
-			}
-		}
-
-		if (nextKeyIndex === -1) return null;
-
-		const packetInfo = this.streamInfo.packets[nextKeyIndex]!;
-		if (options.metadataOnly) {
-			const newPacket = new EncodedPacket(
-				new Uint8Array(),
-				'key',
-				packetInfo.timestamp,
-				packetInfo.duration,
-				nextKeyIndex,
-				packetInfo.entry.size,
-			);
-			this.packetToIndex.set(newPacket, nextKeyIndex);
-			return newPacket;
-		}
-
-		const newPacket = await this.demuxer.readPacket(packetInfo.entry, packetInfo.timestamp, packetInfo.duration, nextKeyIndex);
-		if (newPacket) {
-			this.packetToIndex.set(newPacket, nextKeyIndex);
-		}
-		return newPacket;
+		return this.createPacket(keyPacketIndices[keyIndex]!, options);
 	}
 }
 
 class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBacking {
-	decoderConfigPromise: Promise<VideoDecoderConfig> | null = null;
+	decoderConfigPromise: Promise<VideoDecoderConfig | null> | null = null;
+
+	getType() {
+		return 'video' as const;
+	}
 
 	override getCodec(): VideoCodec | null {
 		const format = this.streamInfo.format as AVIBitmapInfoHeader;
@@ -373,27 +286,78 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 		return Math.abs(format.height);
 	}
 
-	getRotation(): Rotation {
-		return 0;
+	getSquarePixelWidth(): number {
+		return this.getCodedWidth();
+	}
+
+	getSquarePixelHeight(): number {
+		return this.getCodedHeight();
+	}
+
+	getTransformationMatrix(): TransformationMatrix {
+		return [...IDENTITY_MATRIX];
 	}
 
 	async getColorSpace(): Promise<VideoColorSpaceInit> {
-		return {};
+		const config = await this.getDecoderConfig();
+		return config?.colorSpace ?? {};
 	}
 
 	async canBeTransparent(): Promise<boolean> {
 		return false;
 	}
 
-	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
-		const codec = this.getCodec();
-		if (!codec) return null;
+	getDecoderConfig(): Promise<VideoDecoderConfig | null> {
+		return this.decoderConfigPromise ??= (async () => {
+			const codec = this.getCodec();
+			if (!codec) {
+				return null;
+			}
 
-		return this.decoderConfigPromise ??= (async (): Promise<VideoDecoderConfig> => {
+			const format = this.streamInfo.format as AVIBitmapInfoHeader;
+
+			// AVC and HEVC extradata is a configuration record when the packets are length-prefixed, and the first
+			// packet carries the parameter sets when they are in Annex B
+			let codecDescription = format.extraData ?? null;
+			if ((codec === 'avc' || codec === 'hevc') && codecDescription && codecDescription[0] !== 1) {
+				codecDescription = null;
+			}
+
+			const needsFirstPacket = codec === 'vp9'
+				|| codec === 'av1'
+				|| ((codec === 'avc' || codec === 'hevc') && !codecDescription);
+
+			const firstPacket = needsFirstPacket ? await this.getFirstPacket({}) : null;
+
+			const codecInfo = {
+				width: this.getCodedWidth(),
+				height: this.getCodedHeight(),
+				codec,
+				codecDescription,
+				colorSpace: null,
+				avcType: 1 as const,
+				avcCodecInfo: codec === 'avc' && firstPacket
+					? extractAvcDecoderConfigurationRecord(firstPacket.data)
+					: null,
+				hevcCodecInfo: codec === 'hevc' && firstPacket
+					? extractHevcDecoderConfigurationRecord(firstPacket.data)
+					: null,
+				vp9CodecInfo: codec === 'vp9' && firstPacket
+					? extractVp9CodecInfoFromPacket(firstPacket.data)
+					: null,
+				av1CodecInfo: codec === 'av1' && firstPacket
+					? extractAv1CodecInfoFromPacket(firstPacket.data)
+					: null,
+				proresCodecInfo: null,
+				proresFormat: null,
+			};
+
 			return {
-				codec: codec,
-				codedWidth: this.getCodedWidth(),
-				codedHeight: this.getCodedHeight(),
+				codec: extractVideoCodecString(codecInfo),
+				codedWidth: codecInfo.width,
+				codedHeight: codecInfo.height,
+				description: codecDescription ?? undefined,
+				colorSpace: extractColorSpace(codecInfo),
 			};
 		})();
 	}
@@ -402,9 +366,13 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBacking {
 	decoderConfig: AudioDecoderConfig | null = null;
 
+	getType() {
+		return 'audio' as const;
+	}
+
 	override getCodec(): AudioCodec | null {
 		const format = this.streamInfo.format as AVIWaveFormatEx;
-		return aviAudioFormatTagToCodec(format.formatTag);
+		return aviAudioFormatTagToCodec(format.formatTag, format.bitsPerSample);
 	}
 
 	getNumberOfChannels(): number {
@@ -417,14 +385,31 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 		return format.samplesPerSec;
 	}
 
+	getHasOnlyKeyPackets() {
+		return true;
+	}
+
 	async getDecoderConfig(): Promise<AudioDecoderConfig | null> {
 		const codec = this.getCodec();
-		if (!codec) return null;
+		if (!codec) {
+			return null;
+		}
+
+		const format = this.streamInfo.format as AVIWaveFormatEx;
+		// Only AAC's extradata, its AudioSpecificConfig, is a decoder description
+		const codecDescription = codec === 'aac' ? format.extraData ?? null : null;
 
 		return this.decoderConfig ??= {
-			codec: codec,
+			codec: extractAudioCodecString({
+				codec,
+				codecDescription,
+				// Without an AudioSpecificConfig, assume AAC-LC
+				aacCodecInfo: codec === 'aac' ? { isMpeg2: false, objectType: codecDescription ? null : 2 } : null,
+				dtsFormat: null,
+			}),
 			numberOfChannels: this.getNumberOfChannels(),
 			sampleRate: this.getSampleRate(),
+			description: codecDescription ?? undefined,
 		};
 	}
 }
@@ -435,9 +420,9 @@ export class AVIDemuxer extends Demuxer {
 	private streams: StreamInfo[] = [];
 	private index: AVIIndexEntry[] = [];
 	private moviStart = 0;
-	private moviSize = 0;
-	private isRIFX = false;
-	private inputTracks: InputTrack[] = [];
+	/** Whether the idx1 offsets count from the file start instead of the movi list. */
+	private indexOffsetsAreAbsolute = false;
+	trackBackings: (AviVideoTrackBacking | AviAudioTrackBacking)[] = [];
 	private metadataPromise: Promise<void> | null = null;
 
 	constructor(input: Input) {
@@ -445,50 +430,16 @@ export class AVIDemuxer extends Demuxer {
 		this.reader = input._reader;
 	}
 
-	static async _canReadInput(input: Input): Promise<boolean> {
-		const reader = input._reader;
-		const slice = await reader.requestSlice(0, 12);
-		if (!slice || slice.remainingLength < 12) return false;
-
-		const riffBytes = readBytes(slice, 4);
-		if (!riffBytes) return false;
-		const riffType = AVIDemuxer.fourcc(riffBytes);
-
-		if (riffType !== 'RIFF' && riffType !== 'RIFX' && riffType !== 'RF64') {
-			return false;
-		}
-
-		slice.skip(4); // Skip file size
-		const typeBytes = readBytes(slice, 4);
-		if (!typeBytes) return false;
-		const fileType = AVIDemuxer.fourcc(typeBytes);
-
-		return fileType === 'AVI ';
-	}
-
 	private static fourcc(bytes: Uint8Array | null): string {
-		if (!bytes || bytes.length !== 4) return '    ';
+		if (!bytes || bytes.length !== 4) {
+			return '    ';
+		}
 		return textDecoder.decode(bytes);
 	}
 
-	async computeDuration(): Promise<number> {
+	async getTrackBackings(): Promise<InputTrackBacking[]> {
 		await this.ensureMetadata();
-		if (this.mainHeader && this.mainHeader.microSecPerFrame > 0 && this.mainHeader.totalFrames > 0) {
-			return (this.mainHeader.totalFrames * this.mainHeader.microSecPerFrame) / 1_000_000;
-		}
-		let maxDuration = 0;
-		for (const track of this.inputTracks) {
-			const duration = await track.computeDuration();
-			if (duration > maxDuration) {
-				maxDuration = duration;
-			}
-		}
-		return maxDuration;
-	}
-
-	async getTracks(): Promise<InputTrack[]> {
-		await this.ensureMetadata();
-		return this.inputTracks;
+		return this.trackBackings;
 	}
 
 	async getMimeType(): Promise<string> {
@@ -512,15 +463,12 @@ export class AVIDemuxer extends Demuxer {
 			throw new Error('Invalid AVI file: insufficient header');
 		}
 
-		const magic = AVIDemuxer.fourcc(readBytes(slice, 4));
-		const fileSize = readU32Le(slice);
+		slice.skip(8); // RIFF and the file size
 		const fileType = AVIDemuxer.fourcc(readBytes(slice, 4));
 
 		if (fileType !== 'AVI ') {
 			throw new Error('Invalid AVI file type');
 		}
-
-		this.isRIFX = magic === 'RIFX';
 
 		// Parse chunks
 		await this.parseChunks();
@@ -537,26 +485,27 @@ export class AVIDemuxer extends Demuxer {
 
 		while (true) {
 			const chunk = await this.readChunkHeader(position);
-			if (!chunk) break;
+			if (!chunk) {
+				break;
+			}
 
 			if (chunk.fourcc === 'LIST') {
 				const listTypeSlice = await this.reader.requestSlice(position + 8, 4);
-				if (!listTypeSlice) break;
+				if (!listTypeSlice) {
+					break;
+				}
 				const listType = AVIDemuxer.fourcc(readBytes(listTypeSlice, 4));
 
 				if (listType === 'hdrl') {
 					await this.parseHeaderList(position + 12, chunk.size - 4);
 				} else if (listType === 'movi') {
 					this.moviStart = position + 8;
-					this.moviSize = chunk.size - 4;
 				}
-				position += 8 + chunk.size;
 			} else if (chunk.fourcc === 'idx1') {
 				await this.parseIndex(position + 8, chunk.size);
-				position += 8 + chunk.size;
-			} else {
-				position += 8 + chunk.size;
 			}
+
+			position += 8 + chunk.size;
 
 			// Align to word boundary
 			if (chunk.size % 2 !== 0) {
@@ -567,10 +516,12 @@ export class AVIDemuxer extends Demuxer {
 
 	private async readChunkHeader(position: number): Promise<ChunkInfo | null> {
 		const slice = await this.reader.requestSlice(position, 8);
-		if (!slice || slice.remainingLength < 8) return null;
+		if (!slice || slice.remainingLength < 8) {
+			return null;
+		}
 
 		const chunkFourcc = AVIDemuxer.fourcc(readBytes(slice, 4));
-		const chunkSize = this.isRIFX ? readU32Le(slice) : readU32Le(slice);
+		const chunkSize = readU32Le(slice);
 
 		return {
 			fourcc: chunkFourcc,
@@ -579,20 +530,30 @@ export class AVIDemuxer extends Demuxer {
 		};
 	}
 
+	private async readChunkData(chunk: ChunkInfo): Promise<DataView | null> {
+		const slice = await this.reader.requestSlice(chunk.position, chunk.size);
+		if (!slice) {
+			return null;
+		}
+
+		return new DataView(slice.bytes.buffer, slice.bytes.byteOffset + slice.bufferPos, chunk.size);
+	}
+
 	private async parseHeaderList(position: number, size: number): Promise<void> {
 		const endPos = position + size;
 		let currentPos = position;
 
 		while (currentPos < endPos) {
 			const chunk = await this.readChunkHeader(currentPos);
-			if (!chunk) break;
+			if (!chunk) {
+				break;
+			}
 
 			if (chunk.fourcc === 'avih') {
-				const slice = await this.reader.requestSlice(chunk.position, chunk.size);
-				if (slice) {
-					this.mainHeader = parseMainHeader(new DataView(slice.bytes.buffer, slice.bytes.byteOffset + slice.bufferPos, chunk.size));
+				const data = await this.readChunkData(chunk);
+				if (data) {
+					this.mainHeader = parseMainHeader(data);
 				}
-				currentPos = chunk.position + chunk.size;
 			} else if (chunk.fourcc === 'LIST') {
 				const listTypeSlice = await this.reader.requestSlice(chunk.position, 4);
 				if (listTypeSlice) {
@@ -601,10 +562,9 @@ export class AVIDemuxer extends Demuxer {
 						await this.parseStreamList(chunk.position + 4, chunk.size - 4);
 					}
 				}
-				currentPos = chunk.position + chunk.size;
-			} else {
-				currentPos = chunk.position + chunk.size;
 			}
+
+			currentPos = chunk.position + chunk.size;
 
 			// Align to word boundary
 			if (chunk.size % 2 !== 0) {
@@ -616,37 +576,32 @@ export class AVIDemuxer extends Demuxer {
 	private async parseStreamList(position: number, size: number): Promise<void> {
 		const endPos = position + size;
 		let currentPos = position;
-		const streamInfo: Partial<StreamInfo> & { packets: PacketInfo[]; presentationTimestamps: any[]; keyPacketIndices: number[]; index: number } = {
-			packets: [],
-			presentationTimestamps: [],
-			keyPacketIndices: [],
-			index: this.streams.length,
-		};
+		let header: AVIStreamHeader | null = null;
+		let format: AVIBitmapInfoHeader | AVIWaveFormatEx | null = null;
 
 		while (currentPos < endPos) {
 			const chunk = await this.readChunkHeader(currentPos);
-			if (!chunk) break;
+			if (!chunk) {
+				break;
+			}
 
 			if (chunk.fourcc === 'strh') {
-				const slice = await this.reader.requestSlice(chunk.position, chunk.size);
-				if (slice) {
-					streamInfo.header = parseStreamHeader(new DataView(slice.bytes.buffer, slice.bytes.byteOffset + slice.bufferPos, chunk.size));
+				const data = await this.readChunkData(chunk);
+				if (data) {
+					header = parseStreamHeader(data);
 				}
-				currentPos = chunk.position + chunk.size;
 			} else if (chunk.fourcc === 'strf') {
-				const slice = await this.reader.requestSlice(chunk.position, chunk.size);
-				if (slice && streamInfo.header) {
-					const dataView = new DataView(slice.bytes.buffer, slice.bytes.byteOffset + slice.bufferPos, chunk.size);
-					if (streamInfo.header.fccType === 'vids') {
-						streamInfo.format = parseBitmapInfoHeader(dataView);
-					} else if (streamInfo.header.fccType === 'auds') {
-						streamInfo.format = parseWaveFormatEx(dataView);
+				const data = await this.readChunkData(chunk);
+				if (data && header) {
+					if (header.fccType === 'vids') {
+						format = parseBitmapInfoHeader(data);
+					} else if (header.fccType === 'auds') {
+						format = parseWaveFormatEx(data);
 					}
 				}
-				currentPos = chunk.position + chunk.size;
-			} else {
-				currentPos = chunk.position + chunk.size;
 			}
+
+			currentPos = chunk.position + chunk.size;
 
 			// Align to word boundary
 			if (chunk.size % 2 !== 0) {
@@ -654,22 +609,27 @@ export class AVIDemuxer extends Demuxer {
 			}
 		}
 
-		if (streamInfo.header && streamInfo.format) {
-			const completeStream: StreamInfo = {
-				header: streamInfo.header,
-				format: streamInfo.format,
-				packets: streamInfo.packets,
-				presentationTimestamps: streamInfo.presentationTimestamps,
-				keyPacketIndices: streamInfo.keyPacketIndices,
-				index: streamInfo.index,
-			};
-			this.streams.push(completeStream);
+		// Every strl takes a stream number, whether or not the stream is usable
+		const streamIndex = this.streams.length;
+		this.streams.push({
+			header: header ?? parseStreamHeader(new DataView(new ArrayBuffer(56))),
+			format: format ?? parseWaveFormatEx(new DataView(new ArrayBuffer(16))),
+			packets: [],
+			keyPacketIndices: [],
+			index: streamIndex,
+			chunkCount: 0,
+			byteCount: 0,
+		});
+		if (!header || !format) {
+			this.streams[streamIndex]!.header.fccType = '    ';
 		}
 	}
 
 	private async parseIndex(position: number, size: number): Promise<void> {
 		const slice = await this.reader.requestSlice(position, size);
-		if (!slice) return;
+		if (!slice) {
+			return;
+		}
 
 		const dataView = new DataView(slice.bytes.buffer, slice.bytes.byteOffset + slice.bufferPos, size);
 		const numEntries = Math.floor(size / 16);
@@ -680,40 +640,54 @@ export class AVIDemuxer extends Demuxer {
 	}
 
 	private processIndex(): void {
-		// Group index entries by stream and calculate timestamps
+		// idx1 offsets normally count from the movi list's type, but some muxers write file offsets
+		const firstEntry = this.index.find(entry => parseStreamChunkId(entry.ckid) !== null);
+		this.indexOffsetsAreAbsolute = firstEntry !== undefined && firstEntry.offset >= this.moviStart;
+
 		for (const entry of this.index) {
 			const parsed = parseStreamChunkId(entry.ckid);
-			if (!parsed) continue;
+			if (!parsed) {
+				continue;
+			}
 
-			const streamIndex = parsed.streamNumber;
-			if (streamIndex >= this.streams.length) continue;
+			const stream = this.streams[parsed.streamNumber];
+			if (!stream) {
+				continue;
+			}
 
-			const stream = this.streams[streamIndex]!;
-			const packetIndex = stream.packets.length;
-			const timestamp = this.calculateTimestamp(stream, packetIndex);
+			const { header } = stream;
+			const chunkTypes = header.fccType === 'vids' ? VIDEO_CHUNK_TYPES : AUDIO_CHUNK_TYPES;
+			if (!chunkTypes.includes(parsed.type)) {
+				continue; // Palette changes and other non-media chunks
+			}
 
-			const duration = this.calculatePacketDuration(stream, packetIndex);
+			// A stream with a sample size times its chunks by their byte count, and every other stream counts one
+			// sample per chunk; either way, rate / scale samples make a second
+			const secondsPerSample = header.rate > 0 && header.scale > 0 ? header.scale / header.rate : 0;
+			const samplesBefore = header.sampleSize > 0
+				? stream.byteCount / header.sampleSize
+				: stream.chunkCount;
+			const sampleCount = header.sampleSize > 0 ? entry.size / header.sampleSize : 1;
+
+			stream.chunkCount++;
+			stream.byteCount += entry.size;
+
+			// An empty chunk drops a frame, so it takes time but holds no packet
+			if (entry.size === 0) {
+				continue;
+			}
+
+			const isKey = header.fccType !== 'vids' || (entry.flags & AVIIF_KEYFRAME) !== 0;
+			if (isKey) {
+				stream.keyPacketIndices.push(stream.packets.length);
+			}
+
 			stream.packets.push({
 				entry,
-				timestamp,
-				duration,
+				timestamp: (header.start + samplesBefore) * secondsPerSample,
+				duration: sampleCount * secondsPerSample,
+				isKey,
 			});
-
-			// Add to presentation timestamps array
-			stream.presentationTimestamps.push({
-				timestamp,
-				packetIndex,
-			});
-
-			// Track keyframes
-			if (entry.flags & AVIIF_KEYFRAME) {
-				stream.keyPacketIndices.push(packetIndex);
-			}
-		}
-
-		// Sort presentation timestamps by timestamp
-		for (const stream of this.streams) {
-			stream.presentationTimestamps.sort((a, b) => a.timestamp - b.timestamp);
 		}
 	}
 
@@ -722,82 +696,38 @@ export class AVIDemuxer extends Demuxer {
 			const { header, format } = stream;
 
 			if (header.fccType === 'vids' && 'compression' in format) {
-				const bmpInfo = format;
-				let codec = aviVideoFourccToCodec(bmpInfo.compression);
-				if (!codec || bmpInfo.compression.trim() === '') {
-					codec = aviVideoFourccToCodec(header.fccHandler);
-				}
-
-				if (codec) {
-					const backing = new AviVideoTrackBacking(this, stream);
-					stream.track = backing;
-					const track = new InputVideoTrack(this.input, backing);
-					this.inputTracks.push(track);
+				const backing = new AviVideoTrackBacking(this, stream);
+				if (backing.getCodec()) {
+					stream.backing = backing;
+					this.trackBackings.push(backing);
 				}
 			} else if (header.fccType === 'auds' && 'formatTag' in format) {
-				const waveFormat = format;
-				const codec = aviAudioFormatTagToCodec(waveFormat.formatTag);
-
-				if (codec) {
-					const backing = new AviAudioTrackBacking(this, stream);
-					stream.track = backing;
-					const track = new InputAudioTrack(this.input, backing);
-					this.inputTracks.push(track);
+				const backing = new AviAudioTrackBacking(this, stream);
+				if (backing.getCodec()) {
+					stream.backing = backing;
+					this.trackBackings.push(backing);
 				}
 			}
 		}
 	}
 
-	async readPacket(entry: AVIIndexEntry, timestamp: number, duration: number = 0, sequenceNumber: number = -1): Promise<EncodedPacket | null> {
-		const packetPos = this.moviStart + entry.offset + 8;
-		const slice = await this.reader.requestSlice(packetPos, entry.size);
-		if (!slice) return null;
+	async readPacket(packetInfo: PacketInfo, sequenceNumber: number): Promise<EncodedPacket | null> {
+		const { entry } = packetInfo;
+		const chunkPos = this.indexOffsetsAreAbsolute ? entry.offset : this.moviStart + entry.offset;
+		const slice = await this.reader.requestSlice(chunkPos + 8, entry.size);
+		if (!slice) {
+			return null;
+		}
 
 		const data = readBytes(slice, entry.size);
-		if (!data) return null;
 
 		return new EncodedPacket(
 			data,
-			(entry.flags & AVIIF_KEYFRAME) ? 'key' : 'delta',
-			timestamp,
-			duration,
+			packetInfo.isKey ? 'key' : 'delta',
+			packetInfo.timestamp,
+			packetInfo.duration,
 			sequenceNumber,
 			data.byteLength,
 		);
-	}
-
-	private calculateTimestamp(stream: StreamInfo, packetIndex: number): number {
-		if (stream.header.fccType === 'vids' && stream.header.rate > 0 && stream.header.scale > 0) {
-			return (packetIndex * stream.header.scale) / stream.header.rate;
-		} else if (stream.header.fccType === 'auds') {
-			const format = stream.format as AVIWaveFormatEx;
-			if (stream.header.sampleSize === 0 || stream.header.sampleSize === 1) {
-				const samplesPerFrame = 1152;
-				return (packetIndex * samplesPerFrame) / format.samplesPerSec;
-			}
-			if (stream.header.rate > 0 && stream.header.scale > 0) {
-				return (packetIndex * stream.header.scale) / stream.header.rate;
-			}
-		}
-		return 0;
-	}
-
-	private calculatePacketDuration(stream: StreamInfo, packetIndex: number): number {
-		if (stream.header.fccType === 'vids' && stream.header.rate > 0 && stream.header.scale > 0) {
-			// Video frame duration
-			return stream.header.scale / stream.header.rate;
-		} else if (stream.header.fccType === 'auds') {
-			const format = stream.format as AVIWaveFormatEx;
-			if (stream.header.sampleSize === 0 || stream.header.sampleSize === 1) {
-				// Compressed audio (e.g., MP3)
-				const samplesPerFrame = 1152;
-				return samplesPerFrame / format.samplesPerSec;
-			}
-			if (stream.header.rate > 0 && stream.header.scale > 0) {
-				// Uncompressed audio
-				return stream.header.scale / stream.header.rate;
-			}
-		}
-		return 0;
 	}
 }

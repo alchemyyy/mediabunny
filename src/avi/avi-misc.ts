@@ -55,6 +55,7 @@ export interface AVIBitmapInfoHeader {
 	yPelsPerMeter: number;
 	clrUsed: number;
 	clrImportant: number;
+	extraData?: Uint8Array;
 }
 
 export interface AVIWaveFormatEx {
@@ -112,7 +113,7 @@ const AUDIO_FORMAT_TAG_TO_CODEC: Record<number, AudioCodec> = {
 	0x0055: 'mp3',
 	0x0092: 'ac3',
 	0x00FF: 'aac',
-	0x2000: 'aac',
+	0x2000: 'ac3', // WAVE_FORMAT_DVM, which FFmpeg and most muxers write for AC-3
 	0x566F: 'vorbis',
 	0x674F: 'vorbis',
 	0xF1AC: 'flac',
@@ -123,7 +124,25 @@ export function aviVideoFourccToCodec(fourccStr: string): VideoCodec | null {
 	return codec as VideoCodec || null;
 }
 
-export function aviAudioFormatTagToCodec(formatTag: number): AudioCodec | null {
+export function aviAudioFormatTagToCodec(formatTag: number, bitsPerSample: number): AudioCodec | null {
+	// The PCM tags cover every sample size, which bitsPerSample tells apart
+	if (formatTag === 0x0001) {
+		switch (bitsPerSample) {
+			case 8: return 'pcm-u8';
+			case 16: return 'pcm-s16';
+			case 24: return 'pcm-s24';
+			case 32: return 'pcm-s32';
+			default: return null;
+		}
+	}
+	if (formatTag === 0x0003) {
+		switch (bitsPerSample) {
+			case 32: return 'pcm-f32';
+			case 64: return 'pcm-f64';
+			default: return null;
+		}
+	}
+
 	const codec = AUDIO_FORMAT_TAG_TO_CODEC[formatTag];
 	return codec as AudioCodec || null;
 }
@@ -150,6 +169,17 @@ export function aviVideoCodecToFourcc(codec: VideoCodec): string | null {
 }
 
 export function aviAudioCodecToFormatTag(codec: AudioCodec): number | null {
+	switch (codec) {
+		case 'pcm-u8':
+		case 'pcm-s16':
+		case 'pcm-s24':
+		case 'pcm-s32':
+			return 0x0001;
+		case 'pcm-f32':
+		case 'pcm-f64':
+			return 0x0003;
+	}
+
 	for (const [tag, codecId] of Object.entries(AUDIO_FORMAT_TAG_TO_CODEC)) {
 		if (codecId === codec) {
 			return Number(tag);
@@ -200,8 +230,16 @@ export function parseStreamHeader(data: DataView): AVIStreamHeader {
 
 export function parseBitmapInfoHeader(data: DataView): AVIBitmapInfoHeader {
 	const decoder = new TextDecoder('latin1');
+	const size = data.getUint32(0, true);
+
+	// Codec extradata, such as an MPEG-4 Part 2 VOL header or an avcC record, follows the header
+	let extraData: Uint8Array | undefined;
+	if (size >= 40 && data.byteLength > size) {
+		extraData = new Uint8Array(data.buffer, data.byteOffset + size, data.byteLength - size);
+	}
+
 	return {
-		size: data.getUint32(0, true),
+		size,
 		width: data.getInt32(4, true),
 		height: data.getInt32(8, true),
 		planes: data.getUint16(12, true),
@@ -212,6 +250,7 @@ export function parseBitmapInfoHeader(data: DataView): AVIBitmapInfoHeader {
 		yPelsPerMeter: data.getInt32(28, true),
 		clrUsed: data.getUint32(32, true),
 		clrImportant: data.getUint32(36, true),
+		extraData,
 	};
 }
 
