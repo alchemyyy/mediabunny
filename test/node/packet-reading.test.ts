@@ -3,12 +3,13 @@ import { Input, InputDisposedError } from '../../src/input.js';
 import { BufferSource, FilePathSource } from '../../src/source.js';
 import path from 'node:path';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { PacketCursor } from '../../src/cursors.js';
 import { promiseAllEnsureOrder } from '../../src/misc.js';
 import { EncodedPacket, PacketReader } from '../../src/packet.js';
 
-const __dirname = new URL('.', import.meta.url).pathname;
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 test('Packet reader', async () => {
 	using input = new Input({
