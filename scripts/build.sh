@@ -12,6 +12,7 @@ rm -rf packages/aac-encoder/dist
 rm -rf packages/flac-encoder/dist
 rm -rf packages/prores/dist
 rm -rf packages/server/dist
+rm -rf packages/mpeg4/dist
 
 # Ensure license headers on all source files
 tsx scripts/ensure-license-headers.ts
@@ -25,6 +26,10 @@ tsc -p packages/aac-encoder
 tsc -p packages/flac-encoder
 tsc -p packages/prores
 tsc -p packages/server
+tsc -p packages/mpeg4/src
+
+# Copy WASM files to dist (TypeScript doesn't copy non-TS/JS files)
+cp packages/mpeg4/build/*.wasm packages/mpeg4/dist/modules/build/ 2>/dev/null || true
 
 # Generate the root again, now with internals properly stripped
 rm -rf dist
@@ -37,6 +42,9 @@ npm run fix-build-import-paths
 # Creates bundles for all packages
 tsx scripts/bundle.ts
 
+# Copy WASM files to bundle directories for ESM usage
+cp packages/mpeg4/build/*.wasm packages/mpeg4/dist/bundles/ 2>/dev/null || true
+
 # Declaration file rollup and checks
 api-extractor run
 api-extractor run -c packages/mp3-encoder/api-extractor.json
@@ -46,6 +54,7 @@ api-extractor run -c packages/aac-encoder/api-extractor.json
 api-extractor run -c packages/flac-encoder/api-extractor.json
 api-extractor run -c packages/prores/api-extractor.json
 api-extractor run -c packages/server/api-extractor.json
+api-extractor run -c packages/mpeg4/api-extractor.json
 
 # Checks that all symbols are documented
 tsx scripts/check-docblocks.ts dist/mediabunny.d.ts
@@ -56,6 +65,7 @@ tsx scripts/check-docblocks.ts packages/aac-encoder/dist/mediabunny-aac-encoder.
 tsx scripts/check-docblocks.ts packages/flac-encoder/dist/mediabunny-flac-encoder.d.ts
 tsx scripts/check-docblocks.ts packages/prores/dist/mediabunny-prores.d.ts
 tsx scripts/check-docblocks.ts packages/server/dist/mediabunny-server.d.ts
+tsx scripts/check-docblocks.ts packages/mpeg4/dist/mediabunny-mpeg4.d.ts
 
 # Checks that API docs are generatable
 npm run docs:generate -- --dry
@@ -69,3 +79,4 @@ echo 'export as namespace MediabunnyAacEncoder;' >> packages/aac-encoder/dist/me
 echo 'export as namespace MediabunnyFlacEncoder;' >> packages/flac-encoder/dist/mediabunny-flac-encoder.d.ts
 echo 'export as namespace MediabunnyProres;' >> packages/prores/dist/mediabunny-prores.d.ts
 echo 'export as namespace MediabunnyServer;' >> packages/server/dist/mediabunny-server.d.ts
+echo 'export as namespace MediabunnyMpeg4;' >> packages/mpeg4/dist/mediabunny-mpeg4.d.ts

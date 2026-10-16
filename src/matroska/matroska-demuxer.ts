@@ -85,6 +85,9 @@ import {
 import { buildMatroskaMimeType } from './matroska-misc';
 import { FileSlice, readBytes, Reader, readI16Be, readU8 } from '../reader';
 
+// Simple, Advanced Simple, and Advanced Profile MPEG-4 Part 2
+const MATROSKA_MPEG4_PART2_CODEC_IDS: (string | null)[] = ['V_MPEG4/ISO/SP', 'V_MPEG4/ISO/ASP', 'V_MPEG4/ISO/AP'];
+
 type Segment = {
 	seekHeadSeen: boolean;
 	infoSeen: boolean;
@@ -1151,6 +1154,9 @@ export class MatroskaDemuxer extends Demuxer {
 								// Either an invalid string or ProRes RAW, which we don't support yet (it's a
 								// different codec).
 							}
+						} else if (MATROSKA_MPEG4_PART2_CODEC_IDS.includes(this.currentTrack.codecId)) {
+							this.currentTrack.info.codec = 'mpeg4';
+							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate;
 						}
 
 						const videoTrack = this.currentTrack as InternalVideoTrack;

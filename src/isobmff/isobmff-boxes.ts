@@ -1892,6 +1892,7 @@ const videoCodecToBoxName = (codec: VideoCodec, fullCodecString: string) => {
 		case 'vp9': return 'vp09';
 		case 'av1': return 'av01';
 		case 'prores': return fullCodecString;
+		case 'mpeg4': return 'mp4v';
 	}
 };
 
@@ -1905,6 +1906,7 @@ const VIDEO_CODEC_TO_CONFIGURATION_BOX: Record<
 	vp9: vpcC,
 	av1: av1C,
 	prores: null,
+	mpeg4: null,
 };
 
 const audioCodecToBoxName = (codec: AudioCodec, fullCodecString: string, isQuickTime: boolean): string => {
@@ -1951,6 +1953,8 @@ const audioCodecToBoxName = (codec: AudioCodec, fullCodecString: string, isQuick
 			case 'pcm-f64be': return 'fpcm';
 		}
 	}
+
+	throw new Error(`Unsupported audio codec: ${codec}`);
 };
 
 const audioCodecToConfigurationBox = (codec: AudioCodec, isQuickTime: boolean) => {

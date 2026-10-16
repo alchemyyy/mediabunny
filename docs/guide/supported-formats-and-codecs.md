@@ -42,6 +42,7 @@ Mediabunny ships with built-in decoders and encoders for all audio PCM codecs, m
 - `'vp9'` - VP9
 - `'av1'` - AOMedia Video 1 (AV1)
 - `'prores'` - Apple ProRes [^prores]
+- `'mpeg4'` - MPEG-4 Part 2 (requires [@mediabunny/mpeg4](https://www.npmjs.com/package/@mediabunny/mpeg4) extension)
 
 ### Audio codecs
 
@@ -84,6 +85,7 @@ Not all codecs can be used with all containers. The following table specifies th
 | `'vp9'`        |    ✓     |   ✓   |   ✓   |     ✓     |   ✓   |       |       |       |       |       |       |
 | `'av1'`        |    ✓     |   ✓   |   ✓   |     ✓     |   ✓   |       |       |       |       |       |       |
 | `'prores'`     |    ✓     |   ✓   |   ✓   |           |       |       |       |       |       |       |       |
+| `'mpeg4'`      |    ✓     |   ✓   |   ✓   |           |   ✓   |       |       |       |       |       |       |
 | `'aac'`        |    ✓     |   ✓   |   ✓   |           |   ✓   |       |       |       |   ✓   |       |   ✓   |
 | `'opus'`       |    ✓     |   ✓   |   ✓   |     ✓     |       |   ✓   |       |       |       |       |       |
 | `'mp3'`        |    ✓     |   ✓   |   ✓   |           |   ✓   |       |   ✓   |       |       |       |   ✓   |

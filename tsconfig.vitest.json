@@ -11,6 +11,7 @@
 			"@mediabunny/aac-encoder": ["./packages/aac-encoder/src/index.ts"],
 			"@mediabunny/flac-encoder": ["./packages/flac-encoder/src/index.ts"],
 			"@mediabunny/mp3-encoder": ["./packages/mp3-encoder/src/index.ts"],
+			"@mediabunny/mpeg4": ["./packages/mpeg4/src/index.ts"],
 			"@mediabunny/prores": ["./packages/prores/src/index.ts"],
 			"@mediabunny/server": ["./packages/server/src/index.ts"],
 		},
@@ -23,6 +24,7 @@
 		{ "path": "./packages/aac-encoder" },
 		{ "path": "./packages/flac-encoder" },
 		{ "path": "./packages/mp3-encoder" },
+		{ "path": "./packages/mpeg4/src" },
 		{ "path": "./packages/prores" },
 		{ "path": "./packages/server" },
 	]

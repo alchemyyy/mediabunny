@@ -11,6 +11,7 @@ import {
 import { registerAc3Decoder } from '@mediabunny/ac3';
 import { registerDtsDecoder } from '@mediabunny/dts';
 import { registerProresDecoder } from '@mediabunny/prores';
+import { registerMpeg4Decoder } from '@mediabunny/mpeg4';
 
 import SampleFileUrl from '../../docs/assets/big-buck-bunny-trimmed.mp4';
 
@@ -18,6 +19,7 @@ import SampleFileUrl from '../../docs/assets/big-buck-bunny-trimmed.mp4';
 registerAc3Decoder();
 registerDtsDecoder();
 registerProresDecoder();
+registerMpeg4Decoder();
 
 (document.querySelector('#sample-file-download') as HTMLAnchorElement).href = SampleFileUrl;
 

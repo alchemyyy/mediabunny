@@ -1258,6 +1258,13 @@ export class Conversion {
 						'\nThe @mediabunny/flac-encoder extension package provides support for encoding FLAC.',
 					);
 				}
+
+				if (uniqueCodecs.includes('mpeg4')) {
+					elements.push(
+						'\nThe @mediabunny/mpeg4 extension package provides support'
+						+ ' for encoding and decoding MPEG-4 Part 2.',
+					);
+				}
 			} else {
 				elements.push('\nCheck the discardedTracks field for more info.');
 			}
