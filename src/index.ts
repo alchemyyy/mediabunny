@@ -263,6 +263,7 @@ export {
 	type InputTrackQuery,
 	type FrameRateMetrics,
 	type FrameRateMetricsOptions,
+	type UnsupportedTrackFeature,
 	type PacketStats,
 	asc,
 	desc,
