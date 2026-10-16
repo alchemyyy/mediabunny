@@ -1133,6 +1133,11 @@ export class IsobmffDemuxer extends Demuxer {
 						} else if ((PRORES_FOURCCS as readonly string[]).includes(lowercaseBoxName)) {
 							track.info.codec = 'prores';
 							track.info.proresFormat = lowercaseBoxName as ProresFourCc;
+						} else if (codecName === 'mp4v') {
+							// The esds box sets the codec when its object type indication is MPEG-4 Visual
+							if (track.info.codec !== 'mpeg4') {
+								Logging._warn(`Unsupported video codec (mp4v sample entry without MPEG-4 Visual).`);
+							}
 						} else if (codecName === null) {
 							Logging._warn(`Unknown encrypted video codec due to missing frma box.`);
 						} else {
@@ -1591,35 +1596,41 @@ export class IsobmffDemuxer extends Demuxer {
 
 			case 'esds': {
 				const track = this.currentTrack;
-				if (!track || track.info?.type !== 'audio') {
+				if (!track || (track.info?.type !== 'audio' && track.info?.type !== 'video')) {
 					break;
 				}
 
 				slice.skip(4); // Version + flags
 
 				const { objectTypeIndication, decoderSpecificInfo } = readEsDescriptor(slice);
-				if (objectTypeIndication === 0x40 || objectTypeIndication === 0x67) {
-					track.info.codec = 'aac';
-					track.info.aacCodecInfo = {
-						isMpeg2: objectTypeIndication === 0x67,
-						objectType: null,
-					};
-				} else if (objectTypeIndication === 0x69 || objectTypeIndication === 0x6b) {
-					track.info.codec = 'mp3';
-				} else if (objectTypeIndication === 0xdd) {
-					track.info.codec = 'vorbis'; // "nonstandard, gpac uses it" - FFmpeg
-				} else if (objectTypeIndication === 0xa9) {
-					track.info.codec = 'dts';
-				} else {
-					Logging._warn(
-						`Unsupported audio codec (objectTypeIndication ${objectTypeIndication}) - discarding track.`,
-					);
+				if (track.info.type === 'audio') {
+					if (objectTypeIndication === 0x40 || objectTypeIndication === 0x67) {
+						track.info.codec = 'aac';
+						track.info.aacCodecInfo = {
+							isMpeg2: objectTypeIndication === 0x67,
+							objectType: null,
+						};
+					} else if (objectTypeIndication === 0x69 || objectTypeIndication === 0x6b) {
+						track.info.codec = 'mp3';
+					} else if (objectTypeIndication === 0xdd) {
+						track.info.codec = 'vorbis'; // "nonstandard, gpac uses it" - FFmpeg
+					} else if (objectTypeIndication === 0xa9) {
+						track.info.codec = 'dts';
+					} else {
+						Logging._warn(
+							`Unsupported audio codec (objectTypeIndication ${objectTypeIndication}) - discarding track.`,
+						);
+					}
+				} else if (track.info.type === 'video') {
+					if (objectTypeIndication === 0x20) {
+						track.info.codec = 'mpeg4';
+					}
 				}
 
 				if (decoderSpecificInfo) {
 					track.info.codecDescription = decoderSpecificInfo;
 
-					if (track.info.codec === 'aac') {
+					if (track.info.type === 'audio' && track.info.codec === 'aac') {
 						// Let's try to deduce more accurate values directly from the AudioSpecificConfig:
 						const audioSpecificConfig = parseAacAudioSpecificConfig(track.info.codecDescription);
 						if (audioSpecificConfig.outputNumberOfChannels !== null) {

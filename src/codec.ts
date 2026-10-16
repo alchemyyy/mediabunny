@@ -50,6 +50,7 @@ export const VIDEO_CODECS = [
 	'av1',
 	'vp8',
 	'prores',
+	'mpeg4',
 ] as const;
 /**
  * List of known PCM (uncompressed) audio codecs, ordered by encoding preference.
@@ -338,6 +339,8 @@ export const buildVideoCodecString = (
 		}
 
 		return bestFourCc;
+	} else if (codec === 'mpeg4') {
+		return 'mp4v.20.9';
 	} else {
 		assertNever(codec);
 	}
@@ -592,6 +595,8 @@ export const extractVideoCodecString = (trackInfo: {
 		return string;
 	} else if (codec === 'prores') {
 		return proresFormat ?? 'apch';
+	} else if (codec === 'mpeg4') {
+		return 'mp4v';
 	} else if (codec !== null) {
 		assertNever(codec);
 	}
@@ -894,6 +899,8 @@ export const inferCodecFromCodecString = (codecString: string): MediaCodec | nul
 		return 'av1';
 	} else if ((PRORES_FOURCCS as readonly string[]).includes(codecString)) {
 		return 'prores';
+	} else if (codecString === 'mp4v' || codecString.startsWith('mp4v.')) {
+		return 'mpeg4';
 	}
 
 	// Audio codecs
@@ -971,7 +978,9 @@ export const getAudioEncoderConfigExtension = (codec: AudioCodec) => {
 	return {};
 };
 
-const VALID_VIDEO_CODEC_STRING_PREFIXES = ['avc1', 'avc3', 'hev1', 'hvc1', 'vp8', 'vp09', 'av01', ...PRORES_FOURCCS];
+const VALID_VIDEO_CODEC_STRING_PREFIXES = [
+	'avc1', 'avc3', 'hev1', 'hvc1', 'vp8', 'vp09', 'av01', 'mp4v', ...PRORES_FOURCCS,
+];
 const AVC_CODEC_STRING_REGEX = /^(avc1|avc3)\.[0-9a-fA-F]{6}$/;
 const HEVC_CODEC_STRING_REGEX = /^(hev1|hvc1)\.(?:[ABC]?\d+)\.[0-9a-fA-F]{1,8}\.[LH]\d+(?:\.[0-9a-fA-F]{1,2}){0,6}$/;
 const VP9_CODEC_STRING_REGEX = /^vp09(?:\.\d{2}){3}(?:(?:\.\d{2}){5})?$/;
@@ -1149,6 +1158,11 @@ export const validateVideoChunkMetadata = (
 				`Video chunk metadata decoder configuration codec string for ProRes must be one of the valid ProRes`
 				+ ` four-character codes: ${PRORES_FOURCCS.join(', ')}.`,
 			);
+		}
+	} else if (metadata.decoderConfig.codec === 'mp4v' || metadata.decoderConfig.codec.startsWith('mp4v.')) {
+		// MPEG-4 Part 2 validation
+		if (metadata.decoderConfig.codec !== 'mp4v') {
+			throw new TypeError('Video chunk metadata decoder configuration codec string for MPEG-4 must be "mp4v".');
 		}
 	}
 

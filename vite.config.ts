@@ -31,6 +31,8 @@ export default defineConfig({
 				path.resolve(__dirname, './packages/flac-encoder/dist/bundles/mediabunny-flac-encoder.mjs'),
 			'@mediabunny/prores':
 				path.resolve(__dirname, './packages/prores/dist/bundles/mediabunny-prores.mjs'),
+			'@mediabunny/mpeg4':
+				path.resolve(__dirname, './packages/mpeg4/dist/bundles/mediabunny-mpeg4.mjs'),
 		},
 	},
 	plugins: [

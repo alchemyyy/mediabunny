@@ -2,6 +2,7 @@ import { Input, ALL_FORMATS, BlobSource, UrlSource, VideoSampleCursor } from 'me
 import { registerAc3Decoder } from '@mediabunny/ac3';
 import { registerDtsDecoder } from '@mediabunny/dts';
 import { registerProresDecoder } from '@mediabunny/prores';
+import { registerMpeg4Decoder } from '@mediabunny/mpeg4';
 
 import SampleFileUrl from '../../docs/assets/big-buck-bunny-trimmed.mp4';
 import { canvasTransformer } from '../../src/cursors.js';
@@ -10,6 +11,7 @@ import { canvasTransformer } from '../../src/cursors.js';
 registerAc3Decoder();
 registerDtsDecoder();
 registerProresDecoder();
+registerMpeg4Decoder();
 
 (document.querySelector('#sample-file-download') as HTMLAnchorElement).href = SampleFileUrl;
 

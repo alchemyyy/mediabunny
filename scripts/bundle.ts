@@ -289,6 +289,37 @@ const serverVariants = await createVariants(
 	},
 );
 
+const mpeg4Variants = await createVariants(
+	'packages/mpeg4/src/index.ts',
+	'MediabunnyMpeg4',
+	'packages/mpeg4/dist/bundles/mediabunny-mpeg4',
+	'js', // The bundles are purely for the browser, not for Node (due to the peer dependency)
+	{
+		plugins: [
+			PluginExternalGlobal.externalGlobalPlugin({
+				mediabunny: 'Mediabunny',
+			}),
+			inlineWorkerPlugin({
+				define: {
+					'import.meta.url': '""',
+				},
+				legalComments: 'none',
+			}),
+		],
+	},
+	{
+		external: ['mediabunny'],
+		plugins: [
+			inlineWorkerPlugin({
+				define: {
+					'import.meta.url': '""',
+				},
+				legalComments: 'none',
+			}),
+		],
+	},
+);
+
 const contexts = [
 	...mediabunnyVariants,
 	...mp3EncoderVariants,
@@ -298,6 +329,7 @@ const contexts = [
 	...flacEncoderVariants,
 	...proresVariants,
 	...serverVariants,
+	...mpeg4Variants,
 ];
 
 if (process.argv[2] === '--watch') {
