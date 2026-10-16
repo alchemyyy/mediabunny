@@ -100,7 +100,8 @@ export class AVIMuxer extends Muxer {
 	}
 
 	async start() {
-		const release = await this.mutex.acquire();
+		using lock = this.mutex.lock();
+		if (lock.pending) await lock.ready;
 
 		// The header and index sizes are patched in place once known
 		this.writer = await this.output._getRootWriter(false);
@@ -122,8 +123,6 @@ export class AVIMuxer extends Muxer {
 		// We'll finalize header and write stream headers when we get first packet
 
 		await this.writer.flush();
-
-		release();
 	}
 
 	private writeMainHeader(): void {
@@ -276,7 +275,8 @@ export class AVIMuxer extends Muxer {
 		packet: EncodedPacket,
 		meta?: EncodedVideoChunkMetadata,
 	): Promise<void> {
-		const release = await this.mutex.acquire();
+		using lock = this.mutex.lock();
+		if (lock.pending) await lock.ready;
 
 		let trackData = this.getVideoTrackData(track);
 
@@ -337,8 +337,6 @@ export class AVIMuxer extends Muxer {
 		trackData.maxChunkSize = Math.max(trackData.maxChunkSize, packet.data.length);
 		this.totalFrames = Math.max(this.totalFrames, trackData.frameCount);
 		this.duration = Math.max(this.duration, packet.timestamp);
-
-		release();
 	}
 
 	async addEncodedAudioPacket(
@@ -346,7 +344,8 @@ export class AVIMuxer extends Muxer {
 		packet: EncodedPacket,
 		meta?: EncodedAudioChunkMetadata,
 	): Promise<void> {
-		const release = await this.mutex.acquire();
+		using lock = this.mutex.lock();
+		if (lock.pending) await lock.ready;
 
 		let trackData = this.getAudioTrackData(track);
 
@@ -408,8 +407,6 @@ export class AVIMuxer extends Muxer {
 		trackData.lastTimestamp = packet.timestamp;
 		trackData.maxChunkSize = Math.max(trackData.maxChunkSize, packet.data.length);
 		this.duration = Math.max(this.duration, packet.timestamp);
-
-		release();
 	}
 
 	async addSubtitleCue(): Promise<void> {
@@ -418,7 +415,8 @@ export class AVIMuxer extends Muxer {
 	}
 
 	async finalize(): Promise<void> {
-		const release = await this.mutex.acquire();
+		using lock = this.mutex.lock();
+		if (lock.pending) await lock.ready;
 
 		// Ensure header was finalized if no packets were written
 		if (!this.headerFinalized) {
@@ -458,7 +456,6 @@ export class AVIMuxer extends Muxer {
 		this.writer.seek(endPos);
 
 		await this.writer.flush();
-		release();
 	}
 
 	private updateMainHeader(): void {

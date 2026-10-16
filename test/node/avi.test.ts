@@ -6,7 +6,7 @@ import { expect, test, beforeAll } from 'vitest';
 import { Input, Output } from '../../src/index.js';
 import { BufferSource, BufferTarget, FilePathSource } from '../../src/index.js';
 import { ALL_FORMATS, AVI, AviOutputFormat } from '../../src/index.js';
-import { EncodedVideoPacketSource, EncodedAudioPacketSource, EncodedPacketSink } from '../../src/index.js';
+import { EncodedVideoPacketSource, EncodedAudioPacketSource, PacketCursor, PacketReader } from '../../src/index.js';
 import { EncodedPacket } from '../../src/index.js';
 import { registerMpeg4Decoder, registerMpeg4Encoder } from '../../packages/mpeg4/src/index.js';
 
@@ -309,7 +309,7 @@ test('AVI packet timestamps follow each stream\'s rate, scale, and sample size',
 	const pcmBytesPerFrame = 2 * await pcmTrack.getNumberOfChannels();
 
 	let expectedTimestamp = 0;
-	for await (const packet of new EncodedPacketSink(pcmTrack).packets()) {
+	for await (const packet of new PacketCursor(pcmTrack)) {
 		expect(packet.timestamp).toBeCloseTo(expectedTimestamp, 9);
 		expect(packet.duration).toBeCloseTo(packet.byteLength / pcmBytesPerFrame / pcmSampleRate, 9);
 		expectedTimestamp += packet.duration;
@@ -322,13 +322,13 @@ test('AVI packet timestamps follow each stream\'s rate, scale, and sample size',
 		formats: ALL_FORMATS,
 	});
 	const videoTrack = (await videoInput.getVideoTracks())[0]!;
-	const sink = new EncodedPacketSink(videoTrack);
-	const firstPacket = (await sink.getFirstPacket())!;
+	const reader = new PacketReader(videoTrack);
+	const firstPacket = (await reader.getFirst())!;
 	expect(firstPacket.type).toBe('key');
 	expect(firstPacket.timestamp).toBe(0);
-	const secondPacket = (await sink.getNextPacket(firstPacket))!;
+	const secondPacket = (await reader.getNext(firstPacket))!;
 	expect(secondPacket.timestamp).toBeCloseTo(firstPacket.duration, 9);
-	expect(await sink.getPacket(-1)).toBeNull();
+	expect(await reader.getAt(-1)).toBeNull();
 
 	const decoderConfig = (await videoTrack.getDecoderConfig())!;
 	expect(decoderConfig.codec).toMatch(/^avc1\.[0-9a-f]{6}$/);

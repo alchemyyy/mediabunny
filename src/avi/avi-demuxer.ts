@@ -7,7 +7,7 @@
  */
 
 import { Demuxer } from '../demuxer';
-import { EncodedPacket, PLACEHOLDER_DATA } from '../packet';
+import { EncodedPacket, PacketRetrievalOptions, PacketRetrievalResult, PLACEHOLDER_DATA } from '../packet';
 import { Input } from '../input';
 import {
 	InputVideoTrackBacking,
@@ -15,7 +15,6 @@ import {
 	InputTrackBacking,
 } from '../input-track';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
-import { PacketRetrievalOptions } from '../media-sink';
 import {
 	VideoCodec,
 	AudioCodec,
@@ -36,6 +35,8 @@ import {
 	textDecoder,
 	binarySearchLessOrEqual,
 	IDENTITY_MATRIX,
+	MaybeRelevantPromise,
+	ResultValue,
 	TransformationMatrix,
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
@@ -77,8 +78,6 @@ const VIDEO_CHUNK_TYPES = ['db', 'dc'];
 const AUDIO_CHUNK_TYPES = ['wb'];
 
 abstract class AviTrackBacking implements InputTrackBacking {
-	packetToIndex = new WeakMap<EncodedPacket, number>();
-
 	constructor(
 		public demuxer: AVIDemuxer,
 		public streamInfo: StreamInfo,
@@ -174,65 +173,79 @@ abstract class AviTrackBacking implements InputTrackBacking {
 		return null;
 	}
 
-	private async createPacket(packetIndex: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+	/** Creates the packet at an index of the stream's chunks; its sequence number is that index. */
+	private async createPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		packetIndex: number,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
 		const packetInfo = this.streamInfo.packets[packetIndex]!;
 
-		let packet: EncodedPacket | null;
 		if (options.metadataOnly) {
-			packet = new EncodedPacket(
+			return res.set(new PacketRetrievalResult(new EncodedPacket(
 				PLACEHOLDER_DATA,
 				packetInfo.isKey ? 'key' : 'delta',
 				packetInfo.timestamp,
 				packetInfo.duration,
 				packetIndex,
 				packetInfo.entry.size,
-			);
-		} else {
-			packet = await this.demuxer.readPacket(packetInfo, packetIndex);
+			)));
 		}
 
-		if (packet) {
-			this.packetToIndex.set(packet, packetIndex);
-		}
-		return packet;
+		return res.set(new PacketRetrievalResult(await this.demuxer.readPacket(packetInfo, packetIndex)));
 	}
 
 	private getPacketIndex(packet: EncodedPacket) {
-		const index = this.packetToIndex.get(packet);
-		if (index === undefined) {
+		const index = packet.sequenceNumber;
+		if (!Number.isInteger(index) || index < 0 || index >= this.streamInfo.packets.length) {
 			throw new Error('Packet was not created from this track.');
 		}
 
 		return index;
 	}
 
-	async getFirstPacket(options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+	async getFirstPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
 		if (this.streamInfo.packets.length === 0) {
-			return null;
+			return res.set(new PacketRetrievalResult(null));
 		}
 
-		return this.createPacket(0, options);
+		return this.createPacket(res, 0, options);
 	}
 
-	async getPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+	async getPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		timestamp: number,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
 		const index = binarySearchLessOrEqual(this.streamInfo.packets, timestamp, x => x.timestamp);
 		if (index === -1) {
-			return null;
+			return res.set(new PacketRetrievalResult(null));
 		}
 
-		return this.createPacket(index, options);
+		return this.createPacket(res, index, options);
 	}
 
-	async getNextPacket(packet: EncodedPacket, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+	async getNextPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		packet: EncodedPacket,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
 		const nextIndex = this.getPacketIndex(packet) + 1;
 		if (nextIndex >= this.streamInfo.packets.length) {
-			return null;
+			return res.set(new PacketRetrievalResult(null));
 		}
 
-		return this.createPacket(nextIndex, options);
+		return this.createPacket(res, nextIndex, options);
 	}
 
-	async getKeyPacket(timestamp: number, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+	async getKeyPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		timestamp: number,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
 		const keyPacketIndices = this.streamInfo.keyPacketIndices;
 		const keyIndex = binarySearchLessOrEqual(
 			keyPacketIndices,
@@ -240,23 +253,27 @@ abstract class AviTrackBacking implements InputTrackBacking {
 			x => this.streamInfo.packets[x]!.timestamp,
 		);
 		if (keyIndex === -1) {
-			return null;
+			return res.set(new PacketRetrievalResult(null));
 		}
 
-		return this.createPacket(keyPacketIndices[keyIndex]!, options);
+		return this.createPacket(res, keyPacketIndices[keyIndex]!, options);
 	}
 
-	async getNextKeyPacket(packet: EncodedPacket, options: PacketRetrievalOptions): Promise<EncodedPacket | null> {
+	async getNextKeyPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		packet: EncodedPacket,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
 		const index = this.getPacketIndex(packet);
 
 		// The first key packet after the given one
 		const keyPacketIndices = this.streamInfo.keyPacketIndices;
 		const keyIndex = binarySearchLessOrEqual(keyPacketIndices, index, x => x) + 1;
 		if (keyIndex >= keyPacketIndices.length) {
-			return null;
+			return res.set(new PacketRetrievalResult(null));
 		}
 
-		return this.createPacket(keyPacketIndices[keyIndex]!, options);
+		return this.createPacket(res, keyPacketIndices[keyIndex]!, options);
 	}
 }
 
@@ -327,7 +344,14 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 				|| codec === 'av1'
 				|| ((codec === 'avc' || codec === 'hevc') && !codecDescription);
 
-			const firstPacket = needsFirstPacket ? await this.getFirstPacket({}) : null;
+			let firstPacket: EncodedPacket | null = null;
+			if (needsFirstPacket) {
+				const result = new ResultValue<PacketRetrievalResult>();
+				const promise = this.getFirstPacket(result, {});
+				if (result.pending) await promise;
+
+				firstPacket = result.value.packet;
+			}
 
 			const codecInfo = {
 				width: this.getCodedWidth(),
