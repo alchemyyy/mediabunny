@@ -54,10 +54,8 @@ type StreamInfo = {
 	keyPacketIndices: number[];
 	/** The stream's number, which its chunk IDs carry. */
 	index: number;
-	/** Chunks seen so far, empty ones included, for streams that time chunks by count. */
-	chunkCount: number;
-	/** Bytes seen so far, for streams that time chunks by size. */
-	byteCount: number;
+	/** The samples the chunks seen so far take, in units of scale / rate seconds. */
+	sampleCount: number;
 };
 
 type PacketInfo = {
@@ -75,6 +73,42 @@ type ChunkInfo = {
 
 const VIDEO_CHUNK_TYPES = ['db', 'dc'];
 const AUDIO_CHUNK_TYPES = ['wb'];
+
+// Sample sizes that, with an equal block alignment, mark one AAC or MP3 frame per chunk rather than bytes, as FFmpeg
+// reads them
+const AAC_FRAME_SAMPLE_SIZES = [1024, 4096];
+const MP3_FRAME_SAMPLE_SIZE = 1152;
+const WAVE_FORMAT_MPEG_LAYER_3 = 0x0055;
+const WAVE_FORMAT_AAC_TAGS = [0x00ff, 0x1600, 0x1601];
+
+/**
+ * Returns the sample size by which a stream's chunks are timed: by bytes when it is nonzero, else per chunk or block.
+ * Follows FFmpeg's reading: video is always timed per chunk, an audio sample size that disagrees with the block
+ * alignment takes the block alignment, and variable-bitrate AAC and MP3, which declare their frame size as both, are
+ * timed per frame.
+ */
+const getTimingSampleSize = (header: AVIStreamHeader, format: AVIBitmapInfoHeader | AVIWaveFormatEx) => {
+	if (header.fccType !== 'auds' || !('formatTag' in format)) {
+		return 0;
+	}
+
+	let sampleSize = header.sampleSize;
+	if (sampleSize !== 0 && format.blockAlign !== 0 && sampleSize !== format.blockAlign) {
+		sampleSize = format.blockAlign;
+	}
+
+	const isFramedAac = WAVE_FORMAT_AAC_TAGS.includes(format.formatTag)
+		&& AAC_FRAME_SAMPLE_SIZES.includes(sampleSize)
+		&& format.blockAlign === sampleSize;
+	const isFramedMp3 = format.formatTag === WAVE_FORMAT_MPEG_LAYER_3
+		&& sampleSize === MP3_FRAME_SAMPLE_SIZE
+		&& format.blockAlign === sampleSize;
+	if (isFramedAac || isFramedMp3) {
+		return 0;
+	}
+
+	return sampleSize;
+};
 
 abstract class AviTrackBacking implements InputTrackBacking {
 	packetToIndex = new WeakMap<EncodedPacket, number>();
@@ -609,6 +643,10 @@ export class AVIDemuxer extends Demuxer {
 			}
 		}
 
+		if (header && format) {
+			header.sampleSize = getTimingSampleSize(header, format);
+		}
+
 		// Every strl takes a stream number, whether or not the stream is usable
 		const streamIndex = this.streams.length;
 		this.streams.push({
@@ -617,8 +655,7 @@ export class AVIDemuxer extends Demuxer {
 			packets: [],
 			keyPacketIndices: [],
 			index: streamIndex,
-			chunkCount: 0,
-			byteCount: 0,
+			sampleCount: 0,
 		});
 		if (!header || !format) {
 			this.streams[streamIndex]!.header.fccType = '    ';
@@ -661,18 +698,21 @@ export class AVIDemuxer extends Demuxer {
 				continue; // Palette changes and other non-media chunks
 			}
 
-			// A stream with a sample size times its chunks by their byte count, and every other stream counts one
-			// sample per chunk; either way, rate / scale samples make a second
+			// rate / scale samples make a second.
+			// A stream with a sample size counts bytes as samples, an audio stream with a block alignment counts its
+			// started blocks, and every other stream counts one sample per chunk, as FFmpeg does
 			const secondsPerSample = header.rate > 0 && header.scale > 0 ? header.scale / header.rate : 0;
-			const samplesBefore = header.sampleSize > 0
-				? stream.byteCount / header.sampleSize
-				: stream.chunkCount;
-			const sampleCount = header.sampleSize > 0 ? entry.size / header.sampleSize : 1;
+			const blockAlign = 'formatTag' in stream.format ? stream.format.blockAlign : 0;
+			let sampleCount = 1;
+			if (header.sampleSize > 0) {
+				sampleCount = entry.size / header.sampleSize;
+			} else if (blockAlign > 0) {
+				sampleCount = Math.ceil(entry.size / blockAlign);
+			}
+			const samplesBefore = stream.sampleCount;
+			stream.sampleCount += sampleCount;
 
-			stream.chunkCount++;
-			stream.byteCount += entry.size;
-
-			// An empty chunk drops a frame, so it takes time but holds no packet
+			// An empty video chunk drops a frame, so it takes time but holds no packet
 			if (entry.size === 0) {
 				continue;
 			}

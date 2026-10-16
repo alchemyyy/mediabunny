@@ -333,3 +333,21 @@ test('AVI packet timestamps follow each stream\'s rate, scale, and sample size',
 	const decoderConfig = (await videoTrack.getDecoderConfig())!;
 	expect(decoderConfig.codec).toMatch(/^avc1\.[0-9a-f]{6}$/);
 });
+
+test('AVI variable-bitrate MP3 is timed one frame per chunk, as FFmpeg reads it', async () => {
+	// FFmpeg's muxer declares a block alignment of 1152 for VBR MP3, and writes empty chunks that take no time
+	using input = new Input({
+		source: new FilePathSource('test/public/avi/h264-mp3-vbr.avi'),
+		formats: ALL_FORMATS,
+	});
+	const audioTrack = (await input.getAudioTracks())[0]!;
+	const frameDuration = 1152 / await audioTrack.getSampleRate();
+
+	let packetIndex = 0;
+	for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
+		expect(packet.timestamp).toBeCloseTo(packetIndex * frameDuration, 9);
+		expect(packet.duration).toBeCloseTo(frameDuration, 9);
+		packetIndex++;
+	}
+	expect(packetIndex).toBeGreaterThan(1);
+});
