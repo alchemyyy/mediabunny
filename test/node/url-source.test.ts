@@ -13,6 +13,7 @@ import {
 	Input,
 	Logging,
 	LogLevel,
+	ReadCanceledError,
 	UrlSource,
 } from '../../src/index.js';
 import { PacketCursor } from '../../src/cursors.js';
@@ -302,6 +303,213 @@ test('UrlSource reads the full decoded body of a compressed 206 response', async
 		server.close();
 	}
 });
+
+const rangedResourceSize = 2 ** 25; // 32 MiB
+const sequentialReadSize = 2 ** 16;
+const testReadAhead = 2 ** 22; // 4 MiB
+// What socket and stream buffers may hold beyond what the client read, which the server counts as sent
+const sendBufferSlack = 2 ** 23;
+const responseHoldTime = 4000;
+
+const readSequentially = async (reader: Reader, start: number, end: number) => {
+	for (let pos = start; pos < end; pos += sequentialReadSize) {
+		let slice = reader.requestSlice(pos, sequentialReadSize);
+		if (slice instanceof Promise) slice = await slice;
+		assert(slice);
+		expect(readBytes(slice, 1)[0]).toBe(rangedResourceByte(pos));
+	}
+};
+
+test('UrlSource keeps a sequential reader on one response, across pauses shorter than its hold', async () => {
+	const server = await startRangedServer();
+
+	try {
+		const source = new UrlSource(server.url, { readAhead: testReadAhead });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, rangedResourceSize / 2);
+		// The response reaches its target meanwhile and waits there, read ahead of the reader by readAhead
+		await new Promise(resolve => setTimeout(resolve, 1000));
+		expect(server.bytesSent()).toBeLessThan(rangedResourceSize / 2 + testReadAhead + sendBufferSlack);
+
+		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize);
+
+		expect(server.requestCount()).toBe(1);
+		expect(server.abortedResponses()).toBe(0);
+	} finally {
+		server.close();
+	}
+});
+
+test('UrlSource closes a held response after its hold time and reads on with a new request', async () => {
+	const server = await startRangedServer();
+
+	try {
+		const source = new UrlSource(server.url, { readAhead: testReadAhead });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, testReadAhead);
+		await new Promise(resolve => setTimeout(resolve, responseHoldTime + 1000));
+		expect(server.abortedResponses()).toBe(1);
+
+		await readSequentially(reader, testReadAhead, 4 * testReadAhead);
+		expect(server.requestCount()).toBe(2);
+	} finally {
+		server.close();
+	}
+}, 15_000);
+
+test('UrlSource.cancelReads rejects waiting reads and stops prefetching, while reading on continues', async () => {
+	const server = await startRangedServer();
+
+	try {
+		const source = new UrlSource(server.url, { readAhead: testReadAhead });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, testReadAhead);
+		const requestsBeforeFarRead = server.requestCount();
+
+		const farRead = reader.requestSlice(rangedResourceSize / 2, sequentialReadSize);
+		assert(farRead instanceof Promise);
+		source.cancelReads();
+		await expect(farRead).rejects.toBeInstanceOf(ReadCanceledError);
+
+		// Reading on where reading stopped continues on the response that was open, without a new request
+		await readSequentially(reader, testReadAhead, 2 * testReadAhead);
+		expect(server.requestCount()).toBe(requestsBeforeFarRead + 1);
+
+		// A read elsewhere afterwards works as usual
+		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize / 2 + testReadAhead);
+	} finally {
+		server.close();
+	}
+});
+
+test('UrlSource lets a held response give way to a read that needs its request', async () => {
+	const server = await startRangedServer();
+
+	try {
+		const source = new UrlSource(server.url, { readAhead: testReadAhead, parallelism: 1 });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, testReadAhead);
+		// Let the only response reach its target and wait there
+		await new Promise(resolve => setTimeout(resolve, 500));
+
+		const farReadStart = performance.now();
+		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize / 2 + sequentialReadSize);
+
+		expect(performance.now() - farReadStart).toBeLessThan(responseHoldTime / 2);
+		expect(server.requestCount()).toBe(2);
+	} finally {
+		server.close();
+	}
+});
+
+test('UrlSource keeps pinned data cached while evicting the rest', async () => {
+	const server = await startRangedServer();
+
+	try {
+		const source = new UrlSource(server.url, { readAhead: 2 ** 20, maxCacheSize: 2 ** 21 });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, 2 ** 18);
+		source.pinCache();
+		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize / 2 + 2 ** 18);
+		// Far more than the cache holds
+		await readSequentially(reader, rangedResourceSize / 4, rangedResourceSize / 4 + 2 ** 23);
+
+		const pinnedSlice = reader.requestSlice(0, 2 ** 18);
+		expect(pinnedSlice).not.toBeInstanceOf(Promise);
+
+		const evictedSlice = reader.requestSlice(rangedResourceSize / 2, 2 ** 18);
+		expect(evictedSlice).toBeInstanceOf(Promise);
+		await evictedSlice;
+	} finally {
+		server.close();
+	}
+});
+
+test('UrlSource validates its read-ahead and cache size', () => {
+	expect(() => new UrlSource('https://example.com/a.mp4', { readAhead: 0 })).toThrow(TypeError);
+
+	const source = new UrlSource('https://example.com/a.mp4');
+	expect(() => source.setReadAhead(-1)).toThrow(TypeError);
+	expect(() => source.setReadAhead(Number.NaN)).toThrow(TypeError);
+	expect(() => source.setMaxCacheSize(-1)).toThrow(TypeError);
+	source.setReadAhead(2 ** 20);
+	source.setMaxCacheSize(0);
+});
+
+const rangedResourceByte = (pos: number) => (pos * 7 + 3) & 0xff;
+
+/** Serves a synthetic resource with range support, writing each response with backpressure. */
+const startRangedServer = async () => {
+	let requestCount = 0;
+	let bytesSent = 0;
+	let abortedResponses = 0;
+
+	const server = http.createServer((req, res) => {
+		requestCount++;
+		const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+		const start = range ? Number(range[1]) : 0;
+		const end = range && range[2] ? Number(range[2]) + 1 : rangedResourceSize;
+
+		res.on('error', () => {}); // The client may abort the connection at any time
+		res.on('close', () => {
+			if (!res.writableFinished) {
+				abortedResponses++;
+			}
+		});
+		res.writeHead(range ? 206 : 200, {
+			'Content-Type': 'application/octet-stream',
+			'Content-Length': end - start,
+			...(range ? { 'Content-Range': `bytes ${start}-${end - 1}/${rangedResourceSize}` } : {}),
+		});
+
+		let pos = start;
+		const writeMore = () => {
+			while (pos < end) {
+				const chunk = Buffer.alloc(Math.min(2 ** 14, end - pos));
+				for (let i = 0; i < chunk.length; i++) {
+					chunk[i] = rangedResourceByte(pos + i);
+				}
+
+				pos += chunk.length;
+				bytesSent += chunk.length;
+
+				if (!res.write(chunk)) {
+					res.once('drain', writeMore);
+					return;
+				}
+			}
+
+			res.end();
+		};
+		writeMore();
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	const address = server.address();
+	if (!address || typeof address === 'string') throw new Error('Unexpected server address');
+
+	return {
+		url: `http://localhost:${address.port}/resource.bin`,
+		requestCount: () => requestCount,
+		bytesSent: () => bytesSent,
+		abortedResponses: () => abortedResponses,
+		close: () => {
+			server.closeAllConnections();
+			server.close();
+		},
+	};
+};
 
 const startRangelessServer = async (
 	options: { responseByteLimits?: number[]; trailingPaddingSize?: number } = {},
