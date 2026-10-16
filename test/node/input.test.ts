@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { fileURLToPath } from 'node:url';
 import { Input, UnsupportedInputFormatError } from '../../src/input.js';
 import { ALL_FORMATS, HLS } from '../../src/input-format.js';
 import { BufferSource, CustomPathedSource, FilePathSource } from '../../src/source.js';
@@ -69,7 +70,7 @@ const makeEditList = (edits: Edit[], version: number) => {
 
 const createEditFixture = async (trackEdits: Edit[][], version = 0) => {
 	using source = new Input({
-		source: new FilePathSource(new URL('../public/frames.webm', import.meta.url).pathname),
+		source: new FilePathSource(fileURLToPath(new URL('../public/frames.webm', import.meta.url))),
 		formats: ALL_FORMATS,
 	});
 	const track = await source.getPrimaryVideoTrack();
@@ -167,7 +168,7 @@ test('Segment inputs inherit edit-list diagnostics from their initialization inp
 test('Tracks without detected unsupported features return an empty array', async () => {
 	for (const file of ['frames.webm', 'rotate-buck-bunny.mp4']) {
 		using input = new Input({
-			source: new FilePathSource(new URL(`../public/${file}`, import.meta.url).pathname),
+			source: new FilePathSource(fileURLToPath(new URL(`../public/${file}`, import.meta.url))),
 			formats: ALL_FORMATS,
 		});
 		const track = await input.getPrimaryVideoTrack();
