@@ -979,6 +979,11 @@ export class CallSerializer {
 	call(fn: () => Promise<void> | void) {
 		return this.currentPromise = this.currentPromise.then(fn);
 	}
+
+	/** Like `call`, but also runs `fn` when an earlier call rejected, which `call` skips. */
+	callAfterSettled(fn: () => Promise<void> | void) {
+		return this.currentPromise = this.currentPromise.then(fn, fn);
+	}
 }
 
 let isWebKitCache: boolean | null = null;

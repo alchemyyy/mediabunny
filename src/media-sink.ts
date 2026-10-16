@@ -1381,7 +1381,10 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 
 	close() {
 		if (this.customDecoder) {
-			void this.customDecoderCallSerializer.call(() => this.customDecoder!.close());
+			// The decoder must be closed even if one of its earlier calls failed
+			void this.customDecoderCallSerializer
+				.callAfterSettled(() => this.customDecoder!.close())
+				.catch(error => this.onError(error));
 		} else {
 			assert(this.decoder);
 
@@ -2333,7 +2336,10 @@ class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 	close() {
 		if (this.customDecoder) {
-			void this.customDecoderCallSerializer.call(() => this.customDecoder!.close());
+			// The decoder must be closed even if one of its earlier calls failed
+			void this.customDecoderCallSerializer
+				.callAfterSettled(() => this.customDecoder!.close())
+				.catch(error => this.onError(error));
 		} else {
 			assert(this.decoder);
 
