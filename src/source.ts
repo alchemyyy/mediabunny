@@ -954,8 +954,9 @@ export class UrlSource extends PathedSource {
 
 	/**
 	 * Keeps everything cached so far in the cache for the lifetime of this source, while later data is evicted as
-	 * usual. Useful for data that every reader of the source reads again, such as a container's header and index when
-	 * multiple inputs read the same source one after another.
+	 * usual. Pinned data doesn't count toward the max cache size, so it never crowds out the data being read. Useful
+	 * for data that every reader of the source reads again, such as a container's header and index when multiple
+	 * inputs read the same source one after another.
 	 */
 	pinCache() {
 		this._orchestrator.pinCache();
@@ -2861,8 +2862,20 @@ class ReadOrchestrator {
 			break; // After the join case, we're done: the next entry cannot possibly overlap with the inserted one.
 		}
 
-		// LRU eviction of cache entries, which never takes pinned ones
-		while (this.currentCacheSize > this.options.maxCacheSize) {
+		if (this.currentCacheSize <= this.options.maxCacheSize) {
+			return;
+		}
+
+		// LRU eviction of cache entries. Pinned entries are never evicted and don't count toward the max size, so that
+		// pinned data never crowds out the data being read.
+		let unpinnedCacheSize = 0;
+		for (const entry of this.cache) {
+			if (!entry.pinned) {
+				unpinnedCacheSize += entry.bytes.length;
+			}
+		}
+
+		while (unpinnedCacheSize > this.options.maxCacheSize) {
 			let oldestIndex = -1;
 			for (let i = 0; i < this.cache.length; i++) {
 				const entry = this.cache[i]!;
@@ -2872,22 +2885,19 @@ class ReadOrchestrator {
 				}
 			}
 
-			if (oldestIndex === -1) {
-				break;
-			}
-
 			const oldestEntry = this.cache[oldestIndex]!;
-			if (this.currentCacheSize - oldestEntry.bytes.length <= this.options.maxCacheSize) {
+			if (unpinnedCacheSize - oldestEntry.bytes.length <= this.options.maxCacheSize) {
 				// Don't evict if it would shrink the cache below the max size
 				break;
 			}
 
 			this.cache.splice(oldestIndex, 1);
 			this.currentCacheSize -= oldestEntry.bytes.length;
+			unpinnedCacheSize -= oldestEntry.bytes.length;
 		}
 	}
 
-	/** Pins every cache entry, so that it's never evicted. */
+	/** Pins every cache entry, so that it's never evicted nor counted toward the max cache size. */
 	pinCache() {
 		for (const entry of this.cache) {
 			entry.pinned = true;
