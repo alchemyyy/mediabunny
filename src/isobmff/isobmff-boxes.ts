@@ -755,7 +755,8 @@ export const stsd = (trackData: IsobmffTrackData) => {
 			sampleDescription = chapterTextSampleDescription();
 		} else {
 			sampleDescription = subtitleSampleDescription(
-				SUBTITLE_CODEC_TO_BOX_NAME[trackData.track.source._codec],
+				// Non-null: only ISOBMFF-supported subtitle codecs reach the muxer (validated on add).
+				SUBTITLE_CODEC_TO_BOX_NAME[trackData.track.source._codec]!,
 				trackData,
 			);
 		}
@@ -1236,7 +1237,8 @@ export const subtitleSampleDescription = (
 	Array(6).fill(0), // Reserved
 	u16(1), // Data reference index
 ], [
-	SUBTITLE_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec](trackData),
+	// Non-null: only ISOBMFF-supported subtitle codecs reach the muxer (validated on add).
+	SUBTITLE_CODEC_TO_CONFIGURATION_BOX[trackData.track.source._codec]!(trackData),
 	btrt(trackData),
 ]);
 
@@ -2171,14 +2173,16 @@ const audioCodecToConfigurationBox = (codec: AudioCodec, isQuickTime: boolean) =
 	return null;
 };
 
-const SUBTITLE_CODEC_TO_BOX_NAME: Record<SubtitleCodec, string> = {
+// ISOBMFF only supports the subtitle codecs listed here; others (e.g. 'ass', which is
+// Matroska-only) are rejected at track-add time and never reach these maps.
+const SUBTITLE_CODEC_TO_BOX_NAME: Partial<Record<SubtitleCodec, string>> = {
 	webvtt: 'wvtt',
 };
 
-const SUBTITLE_CODEC_TO_CONFIGURATION_BOX: Record<
+const SUBTITLE_CODEC_TO_CONFIGURATION_BOX: Partial<Record<
 	SubtitleCodec,
 	(trackData: IsobmffSubtitleTrackData) => Box | null
-> = {
+>> = {
 	webvtt: vttC,
 };
 
