@@ -51,6 +51,8 @@ export default tseslint.config(
 			'packages/flac-encoder/build',
 			'packages/prores/dist',
 			'packages/server/dist',
+			'packages/mpeg4/dist',
+			'packages/mpeg4/build',
 			'eslint.config.mjs',
 			'docs/.vitepress/cache',
 			'test/public',

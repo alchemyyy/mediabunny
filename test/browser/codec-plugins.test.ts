@@ -19,11 +19,11 @@ test('Can read MP4 with mpeg4 video codec', async () => {
 
 	const videoTracks = await input.getVideoTracks();
 	expect(videoTracks.length).toBeGreaterThan(0);
-	expect(videoTracks[0]!.codec).toBe('mpeg4');
+	expect(await videoTracks[0]!.getCodec()).toBe('mpeg4');
 
 	const audioTracks = await input.getAudioTracks();
 	expect(audioTracks.length).toBeGreaterThan(0);
-	expect(audioTracks[0]!.codec).toBe('aac');
+	expect(await audioTracks[0]!.getCodec()).toBe('aac');
 });
 
 test('Can read MOV with mpeg4 video codec', async () => {
@@ -36,7 +36,7 @@ test('Can read MOV with mpeg4 video codec', async () => {
 
 	const videoTracks = await input.getVideoTracks();
 	expect(videoTracks.length).toBeGreaterThan(0);
-	expect(videoTracks[0]!.codec).toBe('mpeg4');
+	expect(await videoTracks[0]!.getCodec()).toBe('mpeg4');
 });
 
 test('Can read MKV with mpeg4 video codec', async () => {
@@ -49,7 +49,7 @@ test('Can read MKV with mpeg4 video codec', async () => {
 
 	const videoTracks = await input.getVideoTracks();
 	expect(videoTracks.length).toBeGreaterThan(0);
-	expect(videoTracks[0]!.codec).toBe('mpeg4');
+	expect(await videoTracks[0]!.getCodec()).toBe('mpeg4');
 });
 
 test('Can read AVI with mpeg4 video codec', async () => {
@@ -62,10 +62,10 @@ test('Can read AVI with mpeg4 video codec', async () => {
 
 	const videoTracks = await input.getVideoTracks();
 	expect(videoTracks.length).toBeGreaterThan(0);
-	expect(videoTracks[0]!.codec).toBe('mpeg4');
+	expect(await videoTracks[0]!.getCodec()).toBe('mpeg4');
 
 	const audioTracks = await input.getAudioTracks();
-	expect(audioTracks[0]!.codec).toBe('mp3');
+	expect(await audioTracks[0]!.getCodec()).toBe('mp3');
 });
 
 test('Can read AVI with various video codecs', async () => {
@@ -87,10 +87,10 @@ test('Can read AVI with various video codecs', async () => {
 
 		const videoTracks = await input.getVideoTracks();
 		expect(videoTracks.length).toBeGreaterThan(0);
-		expect(videoTracks[0]!.codec).toBe(videoCodec);
+		expect(await videoTracks[0]!.getCodec()).toBe(videoCodec);
 
 		const audioTracks = await input.getAudioTracks();
 		expect(audioTracks.length).toBeGreaterThan(0);
-		expect(audioTracks[0]!.codec).toBe(audioCodec);
+		expect(await audioTracks[0]!.getCodec()).toBe(audioCodec);
 	}
 });

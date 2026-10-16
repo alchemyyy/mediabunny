@@ -11,6 +11,7 @@
 			"@mediabunny/aac-encoder": ["./packages/aac-encoder/src/index.ts"],
 			"@mediabunny/flac-encoder": ["./packages/flac-encoder/src/index.ts"],
 			"@mediabunny/prores": ["./packages/prores/src/index.ts"],
+			"@mediabunny/mpeg4": ["./packages/mpeg4/src/index.ts"],
 		},
 		"types": ["vite/client"]
 	},
@@ -21,6 +22,7 @@
 	"references": [
 		{ "path": "./src" },
 		{ "path": "./packages/ac3" },
-		{ "path": "./packages/prores" }
+		{ "path": "./packages/prores" },
+		{ "path": "./packages/mpeg4/src" }
 	]
 }

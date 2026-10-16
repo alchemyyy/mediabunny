@@ -1,5 +1,5 @@
 /*!
- * Copyright (c) 2025-present, Vanilagy and contributors
+ * Copyright (c) 2026-present, Vanilagy and contributors
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -9,20 +9,17 @@
 import { Muxer } from '../muxer';
 import { EncodedPacket } from '../packet';
 import { Writer } from '../writer';
-import { Output, OutputAudioTrack, OutputVideoTrack, OutputSubtitleTrack } from '../output';
+import { Output, OutputAudioTrack, OutputVideoTrack } from '../output';
 import { AviOutputFormat } from '../output-format';
 import { RIFFWriter } from './riff-writer';
 import { promiseWithResolvers } from '../misc';
 import { validateVideoChunkMetadata, validateAudioChunkMetadata } from '../codec';
-import { SubtitleCue, SubtitleMetadata } from '../subtitles';
 import {
 	aviVideoCodecToFourcc,
 	aviAudioCodecToFormatTag,
 	makeStreamChunkId,
 	AVIIF_KEYFRAME,
 } from './avi-misc';
-
-const APP_NAME = 'MediaBunny';
 
 type InternalMediaChunk = {
 	data: Uint8Array;
@@ -415,11 +412,7 @@ export class AVIMuxer extends Muxer {
 		release();
 	}
 
-	async addSubtitleCue(
-		track: OutputSubtitleTrack,
-		cue: SubtitleCue,
-		meta?: SubtitleMetadata,
-	): Promise<void> {
+	async addSubtitleCue(): Promise<void> {
 		// AVI doesn't support subtitles
 		throw new Error('AVI format does not support subtitle tracks');
 	}

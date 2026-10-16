@@ -55,9 +55,9 @@ test('Should read MP4 files with mpeg4 codec', async () => {
 		}
 
 		expect(videoTracks.length).toBeGreaterThan(0);
-		expect(videoTracks[0]!.codec).toBe(expectedVideoCodec);
+		expect(await videoTracks[0]!.getCodec()).toBe(expectedVideoCodec);
 
 		expect(audioTracks.length).toBeGreaterThan(0);
-		expect(audioTracks[0]!.codec).toBe(expectedAudioCodec);
+		expect(await audioTracks[0]!.getCodec()).toBe(expectedAudioCodec);
 	}
 });

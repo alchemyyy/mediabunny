@@ -1647,7 +1647,8 @@ export class IsobmffDemuxer extends Demuxer {
 						track.info.codec = 'dts';
 					} else {
 						Logging._warn(
-							`Unsupported audio codec (objectTypeIndication ${objectTypeIndication}) - discarding track.`,
+							`Unsupported audio codec (objectTypeIndication ${objectTypeIndication})`
+							+ ' - discarding track.',
 						);
 					}
 				} else if (track.info.type === 'video') {

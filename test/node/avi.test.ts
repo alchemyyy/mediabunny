@@ -4,9 +4,9 @@
 
 import { expect, test, beforeAll } from 'vitest';
 import { Input, Output } from '../../src/index.js';
-import { BufferSource, BufferTarget } from '../../src/index.js';
+import { BufferSource, BufferTarget, FilePathSource } from '../../src/index.js';
 import { ALL_FORMATS, AVI, AviOutputFormat } from '../../src/index.js';
-import { EncodedVideoPacketSource, EncodedAudioPacketSource } from '../../src/index.js';
+import { EncodedVideoPacketSource, EncodedAudioPacketSource, EncodedPacketSink } from '../../src/index.js';
 import { EncodedPacket } from '../../src/index.js';
 import { registerMpeg4Decoder, registerMpeg4Encoder } from '../../packages/mpeg4/src/index.js';
 
@@ -49,11 +49,11 @@ test('Should be able to create AVI output with video track', async () => {
 		'key',
 		0,
 		0.033,
-		0
+		0,
 	);
 
 	const videoSource = new EncodedVideoPacketSource('avc');
-	await output.addVideoTrack(videoSource);
+	output.addVideoTrack(videoSource);
 	await output.start();
 
 	await videoSource.add(videoPacket, {
@@ -94,11 +94,11 @@ test('Should be able to create AVI output with audio track', async () => {
 		'key',
 		0,
 		0.026,
-		0
+		0,
 	);
 
 	const audioSource = new EncodedAudioPacketSource('mp3');
-	await output.addAudioTrack(audioSource);
+	output.addAudioTrack(audioSource);
 	await output.start();
 
 	await audioSource.add(audioPacket, {
@@ -120,19 +120,19 @@ test('Should be able to create AVI output with audio track', async () => {
 		resultView.getUint8(0),
 		resultView.getUint8(1),
 		resultView.getUint8(2),
-		resultView.getUint8(3)
+		resultView.getUint8(3),
 	);
 	expect(riff).toBe('RIFF');
 	const aviType = String.fromCharCode(
 		resultView.getUint8(8),
 		resultView.getUint8(9),
 		resultView.getUint8(10),
-		resultView.getUint8(11)
+		resultView.getUint8(11),
 	);
-	expect(aviType).toBe('AVI ')
+	expect(aviType).toBe('AVI ');
 });
 
-test('Should properly handle AVI codec mappings', async () => {
+test('Should properly handle AVI codec mappings', () => {
 	const format = new AviOutputFormat();
 
 	const supportedVideoCodecs = format.getSupportedVideoCodecs();
@@ -171,7 +171,7 @@ test('Should be able to create AVI with both video and audio', async () => {
 			i === 0 ? 'key' : 'delta',
 			i * 0.033,
 			0.033,
-			i
+			i,
 		));
 	}
 
@@ -182,35 +182,39 @@ test('Should be able to create AVI with both video and audio', async () => {
 			'key',
 			i * 0.026,
 			0.026,
-			i
+			i,
 		));
 	}
 
 	const videoSource = new EncodedVideoPacketSource('avc');
 	const audioSource = new EncodedAudioPacketSource('mp3');
 
-	await output.addVideoTrack(videoSource);
-	await output.addAudioTrack(audioSource);
+	output.addVideoTrack(videoSource);
+	output.addAudioTrack(audioSource);
 	await output.start();
 
 	for (let i = 0; i < videoPackets.length; i++) {
-		await videoSource.add(videoPackets[i]!, i === 0 ? {
-			decoderConfig: {
-				codec: 'avc1.640028',
-				codedWidth: 640,
-				codedHeight: 480,
-			},
-		} : undefined);
+		await videoSource.add(videoPackets[i]!, i === 0
+			? {
+					decoderConfig: {
+						codec: 'avc1.640028',
+						codedWidth: 640,
+						codedHeight: 480,
+					},
+				}
+			: undefined);
 	}
 
 	for (let i = 0; i < audioPackets.length; i++) {
-		await audioSource.add(audioPackets[i]!, i === 0 ? {
-			decoderConfig: {
-				codec: 'mp3',
-				sampleRate: 44100,
-				numberOfChannels: 2,
-			},
-		} : undefined);
+		await audioSource.add(audioPackets[i]!, i === 0
+			? {
+					decoderConfig: {
+						codec: 'mp3',
+						sampleRate: 44100,
+						numberOfChannels: 2,
+					},
+				}
+			: undefined);
 	}
 
 	await output.finalize();
@@ -241,7 +245,6 @@ test('Should read AVI files with various video codecs', async () => {
 	];
 
 	for (const { file, expectedVideoCodec, expectedAudioCodec } of testFiles) {
-		const { FilePathSource } = await import('../../src/index.js');
 		using input = new Input({
 			source: new FilePathSource(`test/public/avi/${file}`),
 			formats: ALL_FORMATS,
@@ -253,14 +256,16 @@ test('Should read AVI files with various video codecs', async () => {
 		const audioTracks = await input.getAudioTracks();
 
 		if (videoTracks.length === 0 && audioTracks.length === 0) {
-			throw new Error(`No tracks found in ${file}. This indicates the AVI demuxer is not parsing streams correctly.`);
+			throw new Error(
+				`No tracks found in ${file}. This indicates the AVI demuxer is not parsing streams correctly.`,
+			);
 		}
 
 		expect(videoTracks.length).toBeGreaterThan(0);
-		expect(videoTracks[0]!.codec).toBe(expectedVideoCodec);
+		expect(await videoTracks[0]!.getCodec()).toBe(expectedVideoCodec);
 
 		expect(audioTracks.length).toBeGreaterThan(0);
-		expect(audioTracks[0]!.codec).toBe(expectedAudioCodec);
+		expect(await audioTracks[0]!.getCodec()).toBe(expectedAudioCodec);
 	}
 });
 
@@ -277,7 +282,6 @@ test('Should read audio-only AVI files', async () => {
 	];
 
 	for (const { file, expectedCodec } of testFiles) {
-		const { FilePathSource } = await import('../../src/index.js');
 		using input = new Input({
 			source: new FilePathSource(`test/public/avi/${file}`),
 			formats: ALL_FORMATS,
@@ -290,6 +294,42 @@ test('Should read audio-only AVI files', async () => {
 
 		const audioTracks = await input.getAudioTracks();
 		expect(audioTracks.length).toBeGreaterThan(0);
-		expect(audioTracks[0]!.codec).toBe(expectedCodec);
+		expect(await audioTracks[0]!.getCodec()).toBe(expectedCodec);
 	}
+});
+
+test('AVI packet timestamps follow each stream\'s rate, scale, and sample size', async () => {
+	// PCM chunks hold many samples each, so their timestamps follow their byte counts
+	using pcmInput = new Input({
+		source: new FilePathSource('test/public/avi/pcm-s16.avi'),
+		formats: ALL_FORMATS,
+	});
+	const pcmTrack = (await pcmInput.getAudioTracks())[0]!;
+	const pcmSampleRate = await pcmTrack.getSampleRate();
+	const pcmBytesPerFrame = 2 * await pcmTrack.getNumberOfChannels();
+
+	let expectedTimestamp = 0;
+	for await (const packet of new EncodedPacketSink(pcmTrack).packets()) {
+		expect(packet.timestamp).toBeCloseTo(expectedTimestamp, 9);
+		expect(packet.duration).toBeCloseTo(packet.byteLength / pcmBytesPerFrame / pcmSampleRate, 9);
+		expectedTimestamp += packet.duration;
+	}
+	expect(expectedTimestamp).toBeGreaterThan(0);
+
+	// Video chunks take one frame each, and the first packet is a key packet
+	using videoInput = new Input({
+		source: new FilePathSource('test/public/avi/avc-aac.avi'),
+		formats: ALL_FORMATS,
+	});
+	const videoTrack = (await videoInput.getVideoTracks())[0]!;
+	const sink = new EncodedPacketSink(videoTrack);
+	const firstPacket = (await sink.getFirstPacket())!;
+	expect(firstPacket.type).toBe('key');
+	expect(firstPacket.timestamp).toBe(0);
+	const secondPacket = (await sink.getNextPacket(firstPacket))!;
+	expect(secondPacket.timestamp).toBeCloseTo(firstPacket.duration, 9);
+	expect(await sink.getPacket(-1)).toBeNull();
+
+	const decoderConfig = (await videoTrack.getDecoderConfig())!;
+	expect(decoderConfig.codec).toMatch(/^avc1\.[0-9a-f]{6}$/);
 });

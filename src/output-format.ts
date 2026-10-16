@@ -1152,7 +1152,8 @@ export class AviOutputFormat extends OutputFormat {
 		return [
 			...VIDEO_CODECS.filter(codec => ['avc', 'hevc', 'vp8', 'vp9', 'av1', 'mpeg4'].includes(codec)),
 			...AUDIO_CODECS.filter(codec => [
-				'mp3', 'aac', 'vorbis', 'flac', 'ac3', 'pcm-s16', 'pcm-s24', 'pcm-s32', 'pcm-f32', 'pcm-u8', 'ulaw', 'alaw',
+				'mp3', 'aac', 'vorbis', 'flac', 'ac3',
+				'pcm-s16', 'pcm-s24', 'pcm-s32', 'pcm-f32', 'pcm-u8', 'ulaw', 'alaw',
 			].includes(codec)),
 		];
 	}

@@ -6,7 +6,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { CustomVideoDecoder, CustomVideoEncoder, VideoCodec, EncodedPacket, VideoSample, registerDecoder, registerEncoder } from 'mediabunny';
+import {
+	CustomVideoDecoder,
+	CustomVideoEncoder,
+	VideoCodec,
+	EncodedPacket,
+	VideoSample,
+	registerDecoder,
+	registerEncoder,
+} from 'mediabunny';
 import type { WorkerCommand, WorkerResponse, WorkerResponseData } from './shared';
 import decodeWorkerUrl from './decode.worker?url';
 import encodeWorkerUrl from './encode.worker?url';
@@ -23,6 +31,7 @@ class Mpeg4Decoder extends CustomVideoDecoder {
 		reject: (reason?: unknown) => void;
 	}>();
 
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	static override supports(codec: VideoCodec, config: VideoDecoderConfig): boolean {
 		return codec === 'mpeg4';
 	}
@@ -54,7 +63,7 @@ class Mpeg4Decoder extends CustomVideoDecoder {
 		});
 	}
 
-	async decode(packet: EncodedPacket, meta?: EncodedVideoChunkMetadata) {
+	async decode(packet: EncodedPacket) {
 		const frameData = packet.data.slice().buffer;
 
 		const result = await this.sendCommand({
@@ -109,16 +118,31 @@ class Mpeg4Decoder extends CustomVideoDecoder {
 	}
 }
 
+type EncoderCommand = {
+	type: 'init';
+	data: { width: number; height: number; bitrate: number; fpsNum: number; fpsDen: number };
+} | {
+	type: 'encode';
+	data: { yuvData: ArrayBuffer; forceKeyframe: boolean };
+} | {
+	type: 'close';
+};
+
+type EncoderResponseData = { encodedData: ArrayBuffer } | { closed: true } | null;
+
+type EncoderResponse = { id: number; success: boolean; data: EncoderResponseData; error?: Error };
+
 class Mpeg4Encoder extends CustomVideoEncoder {
 	private worker: Worker | null = null;
 	private nextMessageId = 0;
 	private pendingMessages = new Map<number, {
-		resolve: (value: { encodedData: ArrayBuffer } | { closed: true } | null) => void;
+		resolve: (value: EncoderResponseData) => void;
 		reject: (reason?: unknown) => void;
 	}>();
 
 	private frameCount = 0;
 
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	static override supports(codec: VideoCodec, config: VideoEncoderConfig): boolean {
 		return codec === 'mpeg4';
 	}
@@ -126,7 +150,7 @@ class Mpeg4Encoder extends CustomVideoEncoder {
 	async init() {
 		this.worker = createWorker(encodeWorkerUrl);
 
-		const onMessage = (event: MessageEvent<{ id: number; success: boolean; data: { encodedData: ArrayBuffer } | { closed: true } | null; error?: Error }>) => {
+		const onMessage = (event: MessageEvent<EncoderResponse>) => {
 			const data = event.data;
 			const pending = this.pendingMessages.get(data.id);
 			assert(pending !== undefined);
@@ -184,7 +208,7 @@ class Mpeg4Encoder extends CustomVideoEncoder {
 		this.onPacket(encodedPacket, this.frameCount === 1
 			? {
 					decoderConfig: {
-						codec: 'mpeg4',
+						codec: 'mp4v',
 						codedWidth: this.config.width,
 						codedHeight: this.config.height,
 					},
@@ -203,10 +227,10 @@ class Mpeg4Encoder extends CustomVideoEncoder {
 	}
 
 	private sendCommand(
-		command: { type: 'init'; data: { width: number; height: number; bitrate: number; fpsNum: number; fpsDen: number } } | { type: 'encode'; data: { yuvData: ArrayBuffer; forceKeyframe: boolean } } | { type: 'close' },
+		command: EncoderCommand,
 		transferables?: Transferable[],
 	) {
-		return new Promise<{ encodedData: ArrayBuffer } | { closed: true } | null>((resolve, reject) => {
+		return new Promise<EncoderResponseData>((resolve, reject) => {
 			const id = this.nextMessageId++;
 			this.pendingMessages.set(id, { resolve, reject });
 
