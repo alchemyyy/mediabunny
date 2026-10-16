@@ -435,6 +435,27 @@ test('UrlSource keeps pinned data cached while evicting the rest', async () => {
 	}
 });
 
+test('UrlSource keeps the data being read cached beside pinned data larger than its max cache size', async () => {
+	const server = await startRangedServer();
+
+	try {
+		const source = new UrlSource(server.url, { readAhead: 2 ** 18 });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, 2 ** 22);
+		source.pinCache();
+		// A quarter of what's pinned
+		source.setMaxCacheSize(2 ** 20);
+		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize / 2 + 2 ** 18);
+
+		expect(reader.requestSlice(0, 2 ** 22)).not.toBeInstanceOf(Promise);
+		expect(reader.requestSlice(rangedResourceSize / 2, 2 ** 18)).not.toBeInstanceOf(Promise);
+	} finally {
+		server.close();
+	}
+});
+
 test('UrlSource validates its read-ahead and cache size', () => {
 	expect(() => new UrlSource('https://example.com/a.mp4', { readAhead: 0 })).toThrow(TypeError);
 
