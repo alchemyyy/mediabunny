@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
 	AIFF,
 	AiffOutputFormat,
@@ -14,7 +15,7 @@ import {
 	Output,
 } from '../../src/index.js';
 
-const __dirname = new URL('.', import.meta.url).pathname;
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
 const SAMPLE_RATE = 44100;
 const NUM_FRAMES = 11025; // 0.25s at 44100 Hz
