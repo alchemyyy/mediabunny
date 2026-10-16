@@ -1954,7 +1954,7 @@ const audioCodecToBoxName = (codec: AudioCodec, fullCodecString: string, isQuick
 		}
 	}
 
-	throw new Error(`Unsupported audio codec: ${codec}`);
+	throw new Error(`Unsupported audio codec: ${String(codec)}`);
 };
 
 const audioCodecToConfigurationBox = (codec: AudioCodec, isQuickTime: boolean) => {

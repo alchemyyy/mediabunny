@@ -4,7 +4,7 @@
   "contributors": [
     "Wiedy Mi <https://github.com/wiedymi>"
   ],
-  "version": "1.21.0",
+  "version": "1.61.5",
   "description": "MPEG-4 Part 2 (XVID/DIVX) decoder extension for Mediabunny.",
   "main": "./dist/bundles/mediabunny-mpeg4.mjs",
   "module": "./dist/bundles/mediabunny-mpeg4.mjs",

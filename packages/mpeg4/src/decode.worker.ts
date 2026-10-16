@@ -38,7 +38,11 @@ const init = async (w: number, h: number) => {
 	module = await getXvidModule();
 
 	initDecoder = module.cwrap('init_decoder', 'number', ['number', 'number']);
-	decodeFrame = module.cwrap('decode_frame', 'number', ['number', 'number', 'number', 'number', 'number', 'number', 'number']);
+	decodeFrame = module.cwrap(
+		'decode_frame',
+		'number',
+		['number', 'number', 'number', 'number', 'number', 'number', 'number'],
+	);
 	closeDecoder = module.cwrap('close_decoder', null, ['number']);
 
 	decoderState = initDecoder(width, height);
@@ -179,12 +183,13 @@ let parentPort: {
 
 if (typeof self === 'undefined') {
 	const workerModule = 'worker_threads';
+	// eslint-disable-next-line @stylistic/max-len
 	// eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
 	parentPort = require(workerModule).parentPort;
 }
 
 if (parentPort) {
-	parentPort.on('message', onMessage);
+	parentPort.on('message', (data: never) => void onMessage(data));
 } else {
 	self.addEventListener('message', event => void onMessage(event.data as never));
 }

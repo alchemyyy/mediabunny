@@ -25,6 +25,9 @@ tsc -p packages/prores
 rm -rf packages/server/dist/modules
 tsc -p packages/server
 
+rm -rf packages/mpeg4/dist/modules
+tsc -p packages/mpeg4/src
+
 tsc -p tsconfig.vitest.json --noEmit
 
 tsc -p scripts --noEmit

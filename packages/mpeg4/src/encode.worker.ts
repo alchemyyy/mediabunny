@@ -121,7 +121,8 @@ const onMessage = async (data: { id: number; command: WorkerCommand }) => {
 		const { command } = data;
 
 		if (command.type === 'init') {
-			await init(command.data.width, command.data.height, command.data.bitrate, command.data.fpsNum, command.data.fpsDen);
+			const { width, height, bitrate, fpsNum, fpsDen } = command.data;
+			await init(width, height, bitrate, fpsNum, fpsDen);
 			responseData = null;
 		} else if (command.type === 'encode') {
 			responseData = encode(command.data.yuvData, command.data.forceKeyframe);
@@ -158,12 +159,13 @@ let parentPort: {
 
 if (typeof self === 'undefined') {
 	const workerModule = 'worker_threads';
+	// eslint-disable-next-line @stylistic/max-len
 	// eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
 	parentPort = require(workerModule).parentPort;
 }
 
 if (parentPort) {
-	parentPort.on('message', onMessage);
+	parentPort.on('message', (data: never) => void onMessage(data));
 } else {
 	self.addEventListener('message', event => void onMessage(event.data as never));
 }
