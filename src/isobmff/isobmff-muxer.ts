@@ -25,7 +25,15 @@ import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideoTrack, TrackType } from '../output';
 import { Writer } from '../writer';
 import { BufferTarget } from '../target';
-import { assert, computeRationalApproximation, last, promiseWithResolvers, Rational, simplifyRational } from '../misc';
+import {
+	assert,
+	computeRationalApproximation,
+	last,
+	promiseWithResolvers,
+	Rational,
+	simplifyRational,
+	textEncoder,
+} from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
@@ -49,7 +57,7 @@ import {
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
 } from '../codec-data';
-import { buildIsobmffMimeType } from './isobmff-misc';
+import { buildIsobmffMimeType, isReferencedTrackId } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
 
 export const GLOBAL_TIMESCALE = 57600; // LCM of a bunch of common frame rates (24, 25, 30, 60, 144, ...)
@@ -145,6 +153,7 @@ export type IsobmffTrackData = {
 	};
 	lastCueEndTimestamp: number | null;
 	cueQueue: SubtitleCue[];
+	allCues: SubtitleCue[];
 	nextSourceId: number;
 	cueToSourceId: WeakMap<SubtitleCue, number>;
 });
@@ -234,6 +243,12 @@ export class IsobmffMuxer extends Muxer {
 	minimumFragmentDuration: number;
 	private segmentHeaderSize: number | null = null;
 
+	private static CHAPTER_TEXT_MODIFIER_SAMPLE = /* #__PURE__ */ new Uint8Array([
+		0x00, 0x00, 0x00, 0x0c, // box size
+		0x65, 0x6e, 0x63, 0x64, // 'encd'
+		0x00, 0x00, 0x01, 0x00,
+	]);
+
 	constructor(output: Output, format: IsobmffOutputFormat) {
 		super(output);
 
@@ -301,6 +316,7 @@ export class IsobmffMuxer extends Muxer {
 				holdsAvc: holdsAvc,
 				fragmented: this.isFragmented,
 				cmaf: this.isCmaf,
+				appleAudiobook: !!this.formatOptions.appleAudiobook,
 			}));
 
 			if (this.formatOptions.onFtyp) {
@@ -651,6 +667,7 @@ export class IsobmffMuxer extends Muxer {
 
 			lastCueEndTimestamp: null,
 			cueQueue: [],
+			allCues: [],
 			nextSourceId: 0,
 			cueToSourceId: new WeakMap(),
 		};
@@ -807,12 +824,17 @@ export class IsobmffMuxer extends Muxer {
 
 		try {
 			const trackData = this.getSubtitleTrackData(track, meta);
+			trackData.allCues.push(cue);
 
 			this.validateTimestamp(trackData.track, cue.timestamp, true);
 
 			if (track.source._codec === 'webvtt') {
 				trackData.cueQueue.push(cue);
-				await this.processWebVTTCues(trackData, cue.timestamp);
+				if (this.isChapterTrack(trackData)) {
+					await this.processChapterTextCues(trackData, cue.timestamp);
+				} else {
+					await this.processWebVTTCues(trackData, cue.timestamp);
+				}
 			} else {
 				// TODO
 			}
@@ -913,6 +935,73 @@ export class IsobmffMuxer extends Muxer {
 
 			await this.registerSample(trackData, sample);
 			trackData.lastCueEndTimestamp = sampleEnd;
+		}
+	}
+
+	private isChapterTrack(trackData: IsobmffSubtitleTrackData) {
+		return isReferencedTrackId(
+			trackData.track.output._isobmffChapterTrackReferences,
+			trackData.track.id,
+		);
+	}
+
+	private normalizeChapterCueText(text: string) {
+		return text
+			.replaceAll('\r\n', '\n')
+			.replaceAll('\r', '\n')
+			.split('\n')
+			.map(line => line.trim())
+			.filter(line => line.length > 0)
+			.join(' ');
+	}
+
+	private truncateUtf8(text: string, maxBytes: number) {
+		let result = '';
+		let bytesUsed = 0;
+
+		for (const character of text) {
+			const encodedCharacter = textEncoder.encode(character);
+			if (bytesUsed + encodedCharacter.byteLength > maxBytes) {
+				break;
+			}
+
+			result += character;
+			bytesUsed += encodedCharacter.byteLength;
+		}
+
+		return textEncoder.encode(result);
+	}
+
+	private createChapterTextSample(cue: SubtitleCue) {
+		const normalizedText = this.normalizeChapterCueText(cue.text);
+		const textBytes = this.truncateUtf8(normalizedText, 0xffff);
+		const data = new Uint8Array(
+			2 + textBytes.byteLength + IsobmffMuxer.CHAPTER_TEXT_MODIFIER_SAMPLE.byteLength,
+		);
+
+		data[0] = textBytes.byteLength >> 8;
+		data[1] = textBytes.byteLength & 0xff;
+		data.set(textBytes, 2);
+		data.set(
+			IsobmffMuxer.CHAPTER_TEXT_MODIFIER_SAMPLE,
+			2 + textBytes.byteLength,
+		);
+
+		return data;
+	}
+
+	private async processChapterTextCues(trackData: IsobmffSubtitleTrackData, until: number) {
+		while (trackData.cueQueue.length > 0 && trackData.cueQueue[0]!.timestamp <= until) {
+			const cue = trackData.cueQueue.shift()!;
+			const cueDuration = Math.max(cue.duration, 0.001);
+			const sample = this.createSampleForTrack(
+				trackData,
+				this.createChapterTextSample(cue),
+				cue.timestamp,
+				cueDuration,
+				'key',
+			);
+			await this.registerSample(trackData, sample);
 		}
 	}
 
@@ -1493,7 +1582,11 @@ export class IsobmffMuxer extends Muxer {
 			trackData.closed = true;
 
 			if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
-				await this.processWebVTTCues(trackData, Infinity);
+				if (this.isChapterTrack(trackData)) {
+					await this.processChapterTextCues(trackData, Infinity);
+				} else {
+					await this.processWebVTTCues(trackData, Infinity);
+				}
 			}
 
 			this.processTimestamps(trackData);
@@ -1570,7 +1663,11 @@ export class IsobmffMuxer extends Muxer {
 			trackData.closed = true;
 
 			if (trackData.type === 'subtitle' && trackData.track.source._codec === 'webvtt') {
-				await this.processWebVTTCues(trackData, Infinity);
+				if (this.isChapterTrack(trackData)) {
+					await this.processChapterTextCues(trackData, Infinity);
+				} else {
+					await this.processWebVTTCues(trackData, Infinity);
+				}
 			}
 
 			this.processTimestamps(trackData);

@@ -30,6 +30,19 @@ export const buildIsobmffMimeType = (info: {
 	return string;
 };
 
+export const isReferencedTrackId = (
+	references: ReadonlyMap<number, readonly number[]>,
+	trackId: number,
+) => {
+	for (const referencedTrackIds of references.values()) {
+		if (referencedTrackIds.includes(trackId)) {
+			return true;
+		}
+	}
+
+	return false;
+};
+
 /**
  * Represents a Protection System Specific Header box as used by ISOBMFF Common Encryption. Contains
  * DRM system-specific data that can be used to obtain a decryption key.
