@@ -1314,6 +1314,16 @@ export class NaiveCallSerializer {
 				throw error;
 			});
 	}
+
+	/** Like `call`, but also runs `fn` when an earlier call rejected, which `call` skips. */
+	callAfterSettled(fn: () => Promise<void> | void) {
+		return this.currentPromise = this.currentPromise
+			.then(fn, fn)
+			.catch((error) => {
+				this.errored = true;
+				throw error;
+			});
+	}
 }
 
 /**
