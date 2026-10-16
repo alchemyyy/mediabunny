@@ -191,6 +191,41 @@ test('AC-3 decoding', async () => {
 	expect(sampleCount).toBe(packetCount);
 });
 
+test('AC-3 with header stripping in laced Matroska blocks', async () => {
+	registerAc3Decoder();
+
+	// The track strips each frame's 0x0B77 sync word, and its blocks use Xiph, fixed-size, EBML, and no lacing
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '..', 'public/ac3-header-stripping-laced.mkv')),
+		formats: ALL_FORMATS,
+	});
+
+	const track = (await input.getPrimaryAudioTrack())!;
+	expect(await track.getCodec()).toBe('ac3');
+
+	const packetSink = new EncodedPacketSink(track);
+	let packetCount = 0;
+
+	for await (const packet of packetSink.packets()) {
+		expect(packet.timestamp).toBeCloseTo(packetCount * 0.032);
+		expect(packet.data.byteLength).toBe(384);
+		expect([...packet.data.subarray(0, 2)]).toEqual([0x0b, 0x77]);
+		packetCount++;
+	}
+
+	expect(packetCount).toBe(16);
+
+	const sampleSink = new AudioSampleSink(track);
+	let sampleCount = 0;
+
+	for await (using sample of sampleSink.samples()) {
+		expect(sample.timestamp).toBeCloseTo(sampleCount * 0.032);
+		sampleCount++;
+	}
+
+	expect(sampleCount).toBe(packetCount);
+});
+
 test('E-AC-3 decoding', async () => {
 	registerAc3Decoder();
 
