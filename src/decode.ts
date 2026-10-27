@@ -89,6 +89,8 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	frameQueue: VideoFrame[] = []; // Safari-specific thing, check usage.
 	currentPacketIndex = 0;
 	raslSkipped = false; // For HEVC stuff
+	/** The timestamp of the key packet decoding started at. */
+	firstPacketTimestamp = -Infinity;
 
 	// Alpha stuff
 	alphaDecoder: VideoDecoder | null = null;
@@ -260,6 +262,15 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			}
 
 			this.raslSkipped = true;
+		}
+
+		if (this.currentPacketIndex === 0) {
+			this.firstPacketTimestamp = packet.timestamp;
+		} else if (this.codec === 'avc' && packet.timestamp < this.firstPacketTimestamp) {
+			// A picture presenting before the key packet decoding started at is a leading picture of an open group,
+			// which references pictures before that key packet. Decoders drop it, and its timestamp would then be
+			// handed to a later frame, so drop it here, as RASL pictures are dropped for HEVC.
+			return;
 		}
 
 		if (this.customDecoder) {
