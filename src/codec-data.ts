@@ -170,7 +170,7 @@ export const extractNalUnitTypeForAvc = (byte: number) => {
 	return byte & 0x1F;
 };
 
-const removeEmulationPreventionBytes = (data: Uint8Array) => {
+export const removeEmulationPreventionBytes = (data: Uint8Array) => {
 	const result: number[] = [];
 	const len = data.length;
 
@@ -528,6 +528,15 @@ export type AvcSpsInfo = {
 	vuiParametersFlagBitOffset: number;
 	bitstreamRestrictionFlagBitOffset: number | null;
 	bitstreamRestrictionFlag: number | null;
+	seqParameterSetId: number;
+	separateColourPlaneFlag: number;
+	log2MaxFrameNumMinus4: number;
+	picOrderCntType: number;
+	log2MaxPicOrderCntLsbMinus4: number;
+	deltaPicOrderAlwaysZeroFlag: number;
+	offsetForNonRefPic: number;
+	offsetForTopToBottomField: number;
+	offsetForRefFrame: number[];
 };
 
 const AVC_HEVC_ASPECT_RATIO_IDC_TABLE: Partial<Record<number, Rational>> = {
@@ -567,7 +576,7 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 		const constraintFlags = bitstream.readAlignedByte();
 		const levelIdc = bitstream.readAlignedByte();
 
-		readExpGolomb(bitstream); // seq_parameter_set_id
+		const seqParameterSetId = readExpGolomb(bitstream);
 
 		// "When chroma_format_idc is not present, it shall be inferred to be equal to 1 (4:2:0 chroma format)."
 		let chromaFormatIdc = 1;
@@ -617,18 +626,23 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			}
 		}
 
-		readExpGolomb(bitstream); // log2_max_frame_num_minus4
+		const log2MaxFrameNumMinus4 = readExpGolomb(bitstream);
 
 		const picOrderCntType = readExpGolomb(bitstream);
+		let log2MaxPicOrderCntLsbMinus4 = 0;
+		let deltaPicOrderAlwaysZeroFlag = 0;
+		let offsetForNonRefPic = 0;
+		let offsetForTopToBottomField = 0;
+		const offsetForRefFrame: number[] = [];
 		if (picOrderCntType === 0) {
-			readExpGolomb(bitstream); // log2_max_pic_order_cnt_lsb_minus4
+			log2MaxPicOrderCntLsbMinus4 = readExpGolomb(bitstream);
 		} else if (picOrderCntType === 1) {
-			bitstream.skipBits(1); // delta_pic_order_always_zero_flag
-			readSignedExpGolomb(bitstream); // offset_for_non_ref_pic
-			readSignedExpGolomb(bitstream); // offset_for_top_to_bottom_field
+			deltaPicOrderAlwaysZeroFlag = bitstream.readBits(1);
+			offsetForNonRefPic = readSignedExpGolomb(bitstream);
+			offsetForTopToBottomField = readSignedExpGolomb(bitstream);
 			const numRefFramesInPicOrderCntCycle = readExpGolomb(bitstream);
 			for (let i = 0; i < numRefFramesInPicOrderCntCycle; i++) {
-				readSignedExpGolomb(bitstream); // offset_for_ref_frame[i]
+				offsetForRefFrame.push(readSignedExpGolomb(bitstream));
 			}
 		}
 
@@ -828,6 +842,15 @@ export const parseAvcSps = (sps: Uint8Array): AvcSpsInfo | null => {
 			vuiParametersFlagBitOffset,
 			bitstreamRestrictionFlagBitOffset,
 			bitstreamRestrictionFlag,
+			seqParameterSetId,
+			separateColourPlaneFlag,
+			log2MaxFrameNumMinus4,
+			picOrderCntType,
+			log2MaxPicOrderCntLsbMinus4,
+			deltaPicOrderAlwaysZeroFlag,
+			offsetForNonRefPic,
+			offsetForTopToBottomField,
+			offsetForRefFrame,
 		};
 	} catch (error) {
 		Logging._error('Error parsing AVC SPS:', error);
@@ -950,6 +973,10 @@ export type HevcSpsInfo = {
 	bitDepthLumaMinus8: number;
 	bitDepthChromaMinus8: number;
 	minSpatialSegmentationIdc: number;
+	seqParameterSetId: number;
+	separateColourPlaneFlag: number;
+	log2MaxPicOrderCntLsbMinus4: number;
+	spsMaxNumReorderPics: number;
 };
 
 export const concatHevcNalUnits = (nalUnits: Uint8Array[], decoderConfig: VideoDecoderConfig) => {
@@ -1003,7 +1030,7 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 			general_level_idc,
 		} = parseProfileTierLevel(bitstream, spsMaxSubLayersMinus1);
 
-		readExpGolomb(bitstream); // sps_seq_parameter_set_id
+		const seqParameterSetId = readExpGolomb(bitstream);
 
 		const chromaFormatIdc = readExpGolomb(bitstream);
 		let separateColourPlaneFlag = 0;
@@ -1041,7 +1068,7 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 
 		const bitDepthLumaMinus8 = readExpGolomb(bitstream);
 		const bitDepthChromaMinus8 = readExpGolomb(bitstream);
-		readExpGolomb(bitstream); // log2_max_pic_order_cnt_lsb_minus4
+		const log2MaxPicOrderCntLsbMinus4 = readExpGolomb(bitstream);
 
 		const spsSubLayerOrderingInfoPresentFlag = bitstream.readBits(1);
 		const startI = spsSubLayerOrderingInfoPresentFlag ? 0 : spsMaxSubLayersMinus1;
@@ -1128,6 +1155,10 @@ export const parseHevcSps = (sps: Uint8Array): HevcSpsInfo | null => {
 			bitDepthLumaMinus8,
 			bitDepthChromaMinus8,
 			minSpatialSegmentationIdc,
+			seqParameterSetId,
+			separateColourPlaneFlag,
+			log2MaxPicOrderCntLsbMinus4,
+			spsMaxNumReorderPics,
 		};
 	} catch (error) {
 		Logging._error('Error parsing HEVC SPS:', error);

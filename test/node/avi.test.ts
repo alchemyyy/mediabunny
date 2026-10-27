@@ -319,9 +319,10 @@ test('AVI packet timestamps follow each stream\'s rate, scale, and sample size',
 	}
 	expect(expectedTimestamp).toBeGreaterThan(0);
 
-	// Video chunks take one frame each, and the first packet is a key packet
+	// Video chunks take one frame each, and the first packet is a key packet; VP8 presents in decode order, and the
+	// empty chunk FFmpeg's muxer writes after the first frame takes a slot without a packet
 	using videoInput = new Input({
-		source: new FilePathSource('test/public/avi/avc-aac.avi'),
+		source: new FilePathSource('test/public/avi/vp8-mp3.avi'),
 		formats: ALL_FORMATS,
 	});
 	const videoTrack = (await videoInput.getVideoTracks())[0]!;
@@ -330,11 +331,13 @@ test('AVI packet timestamps follow each stream\'s rate, scale, and sample size',
 	expect(firstPacket.type).toBe('key');
 	expect(firstPacket.timestamp).toBe(0);
 	const secondPacket = (await reader.getNext(firstPacket))!;
-	expect(secondPacket.timestamp).toBeCloseTo(firstPacket.duration, 9);
+	expect(secondPacket.timestamp).toBeCloseTo(2 * firstPacket.duration, 9);
+	const thirdPacket = (await reader.getNext(secondPacket))!;
+	expect(thirdPacket.timestamp).toBeCloseTo(secondPacket.timestamp + secondPacket.duration, 9);
 	expect(await reader.getAt(-1)).toBeNull();
 
 	const decoderConfig = (await videoTrack.getDecoderConfig())!;
-	expect(decoderConfig.codec).toMatch(/^avc1\.[0-9a-f]{6}$/);
+	expect(decoderConfig.codec).toBe('vp8');
 });
 
 test('AVI variable-bitrate MP3 is timed one frame per chunk, as FFmpeg reads it', async () => {
@@ -353,6 +356,96 @@ test('AVI variable-bitrate MP3 is timed one frame per chunk, as FFmpeg reads it'
 		packetIndex++;
 	}
 	expect(packetIndex).toBeGreaterThan(1);
+});
+
+// Each packet's presentation timestamp in frames, in decode order, as FFprobe's best-effort timestamps give the same
+// pictures: their order counts sorted, then delayed by the reorder depth each stream's sequence parameter set declares
+const PRESENTATION_FRAMES = [
+	{
+		// H.264 without B-frames, whose order counts follow decode order, presents in its slots without delay
+		file: 'avc-no-bframes.avi',
+		frames: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+	},
+	{
+		// H.264 High with B-pyramids
+		file: 'avc-aac.avi',
+		frames: [2, 6, 4, 3, 5, 10, 8, 7, 9, 14, 12, 11, 13, 18, 16, 15, 17, 22, 20, 19, 21, 26, 24, 23, 25],
+	},
+	{
+		// H.264 High in two groups, the second starting at packet 6
+		file: 'h264-mp3-vbr.avi',
+		frames: [2, 5, 3, 4, 7, 6, 8, 11, 9, 10, 13, 12],
+	},
+	{
+		file: 'hevc-aac.avi',
+		frames: [2, 6, 4, 3, 5, 10, 8, 7, 9, 14, 12, 11, 13, 18, 16, 15, 17, 22, 20, 19, 21, 26, 24, 23, 25],
+	},
+	{
+		// HEVC in open groups: the CRA pictures at packets 22 and 32 have leading pictures, decoded after them and
+		// presented before them
+		file: 'hevc-open-gop.avi',
+		frames: [
+			2, 7, 5, 3, 4, 6, 10, 9, 8, 13, 12, 11, 14, 18, 16, 15, 17, 23, 21, 19, 20, 22, 26, 25, 24, 27, 31, 29, 28,
+			30, 33, 32, 38, 36, 34, 35, 37, 40, 39, 45, 43, 41, 42, 44, 49, 47, 46, 48,
+		],
+	},
+];
+
+test('AVI H.264 and HEVC packets carry their pictures\' presentation timestamps, as FFmpeg gives them', async () => {
+	for (const { file, frames } of PRESENTATION_FRAMES) {
+		using input = new Input({
+			source: new FilePathSource(`test/public/avi/${file}`),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getVideoTracks())[0]!;
+		const frameRate = await track.getTimeResolution();
+
+		const presentationFrames: number[] = [];
+		for await (const packet of new PacketCursor(track)) {
+			presentationFrames.push(Math.round(packet.timestamp * frameRate));
+			expect(packet.duration).toBeCloseTo(1 / frameRate, 9);
+		}
+		expect(presentationFrames).toEqual(frames);
+
+		// Read without the packets' data, the timestamps are the same
+		const reader = new PacketReader(track);
+		const lastPacket = (await reader.getAt(Infinity, { metadataOnly: true }))!;
+		expect(Math.round(lastPacket.timestamp * frameRate)).toBe(Math.max(...frames));
+		expect(await track.computeDuration()).toBeCloseTo((Math.max(...frames) + 1) / frameRate, 9);
+	}
+});
+
+test('AVI H.264 and HEVC packets are found by presentation timestamp, whichever group is read first', async () => {
+	using input = new Input({
+		source: new FilePathSource('test/public/avi/hevc-open-gop.avi'),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getVideoTracks())[0]!;
+	const frameDuration = 1 / await track.getTimeResolution();
+	const reader = new PacketReader(track);
+	const sequenceNumberAt = async (frames: number) => (await reader.getAt(frames * frameDuration))?.sequenceNumber;
+	const keySequenceNumberAt = async (frames: number) => {
+		return (await reader.getKeyAt(frames * frameDuration))?.sequenceNumber;
+	};
+
+	// The last group first: its leading pictures present at 34 to 37, before its CRA picture at 38
+	expect(await sequenceNumberAt(40.5)).toBe(37);
+	expect(await keySequenceNumberAt(37.5)).toBe(22);
+	expect(await keySequenceNumberAt(38.5)).toBe(32);
+
+	// The picture presenting at a timestamp is the one found, and seeking takes the last key packet that presents
+	// before it, which a leading picture's own CRA picture does not
+	expect(await sequenceNumberAt(24.5)).toBe(24);
+	expect(await sequenceNumberAt(25.5)).toBe(23);
+	expect(await keySequenceNumberAt(25.5)).toBe(12);
+	expect(await keySequenceNumberAt(26.5)).toBe(22);
+	expect(await sequenceNumberAt(13.5)).toBe(9);
+
+	// Nothing presents before the first picture, two frames in, after the stream's reorder depth
+	expect(await sequenceNumberAt(1.5)).toBeUndefined();
+	expect(await keySequenceNumberAt(1.5)).toBeUndefined();
+	expect(await sequenceNumberAt(2.25)).toBe(0);
+	expect(await track.getFirstTimestamp()).toBeCloseTo(2 * frameDuration, 9);
 });
 
 test('AVI WAVE_FORMAT_EXTENSIBLE audio takes its codec from the SubFormat and its sample size', async () => {
