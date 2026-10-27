@@ -92,7 +92,7 @@ Not all codecs can be used with all containers. The following table specifies th
 | `'mpeg4'`      |    ✓     |   ✓   |   ✓   |           |   ✓   |       |       |       |       |       |       |
 | `'mpeg1'`      |          |       |       |           |       |       |       |       |       |       |   ✓   |
 | `'mpeg2'`      |          |       |       |           |       |       |       |       |       |       |   ✓   |
-| `'vc1'`        |          |       |       |           |       |       |       |       |       |       |   ✓   |
+| `'vc1'`        |    ✓     |   ✓   |       |           |       |       |       |       |       |       |   ✓   |
 | `'aac'`        |    ✓     |   ✓   |   ✓   |           |   ✓   |       |       |       |   ✓   |       |   ✓   |
 | `'opus'`       |    ✓     |   ✓   |   ✓   |     ✓     |       |   ✓   |       |       |       |       |       |
 | `'mp3'`        |    ✓     |   ✓   |   ✓   |           |   ✓   |       |   ✓   |       |       |       |   ✓   |
@@ -127,7 +127,7 @@ For HLS, the supported codecs depend on the segment format chosen.
 [^dts]: DTS is not natively supported by WebCodecs. To encode or decode it, you can use the [`@mediabunny/dts`](./extensions/dts) extension package.
 [^webm]: WebM only supports a small subset of the codecs supported by Matroska. However, this library can technically read all codecs from a WebM that are supported by Matroska.
 [^webvtt]: WebVTT can only be written, not read.
-[^mpegts-video]: MPEG-1 Video, MPEG-2 Video, and VC-1 can only be read, from MPEG-TS and M2TS files (VC-1 under its registration descriptor). WebCodecs decodes none of them, so they can be demuxed but not decoded.
+[^mpegts-video]: MPEG-1 Video, MPEG-2 Video, and VC-1 can only be read, from MPEG-TS and M2TS files (VC-1 under its registration descriptor), and VC-1 also from MP4 and MOV files, whose `dvc1` box gives the Advanced profile its description. WebCodecs decodes none of them, so they can be demuxed but not decoded.
 
 ## Querying codec encodability
 
