@@ -686,3 +686,86 @@ test('AVI OpenDML files keep to idx1 when a super index locates no standard inde
 	});
 	expect(audioPackets).toHaveLength((await readAllPackets(oneRiffInput, 'audio')).length);
 });
+
+const readVideoPackets = async (path: string) => {
+	using input = new Input({
+		source: new FilePathSource(path),
+		formats: ALL_FORMATS,
+	});
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new PacketCursor((await input.getVideoTracks())[0]!)) {
+		packets.push(packet);
+	}
+
+	return packets;
+};
+
+const USER_DATA_START_CODE = [0x00, 0x00, 0x01, 0xb2];
+
+/** Returns a packet's bytes without its user data, which runs from its start code to the next start code. */
+const withoutUserData = (data: Uint8Array) => {
+	const bytes = [...data];
+	const start = bytes.findIndex((_, i) => USER_DATA_START_CODE.every((byte, j) => bytes[i + j] === byte));
+	if (start === -1) {
+		return bytes;
+	}
+
+	let end = start + USER_DATA_START_CODE.length;
+	while (end + 2 < bytes.length && !(bytes[end] === 0 && bytes[end + 1] === 0 && bytes[end + 2] === 1)) {
+		end++;
+	}
+	return [...bytes.slice(0, start), ...bytes.slice(end)];
+};
+
+const latin1 = new TextDecoder('latin1');
+
+test('AVI DivX packed B-frames are unpacked to one VOP per packet, as by FFmpeg\'s mpeg4_unpack_bframes', async () => {
+	// mpeg4-bframes-mp3.avi is an FFmpeg encode with B-frames, in decode order; mpeg4-packed-bframes-mp3.avi is the
+	// same encode packed as DivX 5 packs it: each first B-VOP joins its reference VOP's chunk, an N-VOP takes the slot
+	// it leaves, and DivX user data ending in 'p' marks the key frames
+	const unpackedPackets = await readVideoPackets('test/public/avi/mpeg4-packed-bframes-mp3.avi');
+	const encodedPackets = await readVideoPackets('test/public/avi/mpeg4-bframes-mp3.avi');
+
+	expect(unpackedPackets.map(packet => withoutUserData(packet.data)))
+		.toEqual(encodedPackets.map(packet => withoutUserData(packet.data)));
+	// Every packet keeps its chunk's slot, so the stream stays in decode order
+	expect(unpackedPackets.map(packet => [packet.type, packet.timestamp, packet.duration]))
+		.toEqual(encodedPackets.map(packet => [packet.type, packet.timestamp, packet.duration]));
+	// The first key frame plays as itself, with the packed marker cleared
+	expect(latin1.decode(unpackedPackets[0]!.data)).toContain('DivX503b1393\0');
+});
+
+test('AVI DivX packed B-frames unpack the same when read from a key frame or a B-VOP\'s slot', async () => {
+	const sequentialPackets = await readVideoPackets('test/public/avi/mpeg4-packed-bframes-mp3.avi');
+
+	for (const packetIndex of sequentialPackets.keys()) {
+		using input = new Input({
+			source: new FilePathSource('test/public/avi/mpeg4-packed-bframes-mp3.avi'),
+			formats: ALL_FORMATS,
+		});
+		const reader = new PacketReader((await input.getVideoTracks())[0]!);
+		const packet = (await reader.getAt(sequentialPackets[packetIndex]!.timestamp))!;
+		expect([...packet.data]).toEqual([...sequentialPackets[packetIndex]!.data]);
+	}
+});
+
+test('AVI MPEG-4 Part 2 without the packed marker keeps its chunks as they are', async () => {
+	const bytes = new Uint8Array(readFileSync('test/public/avi/mpeg4-packed-bframes-mp3.avi'));
+	// Without its final 'p' the DivX user data no longer marks the stream as packed
+	for (let position = Buffer.from(bytes).indexOf('1393p'); position !== -1;
+		position = Buffer.from(bytes).indexOf('1393p', position)) {
+		bytes[position + 4] = 'x'.charCodeAt(0);
+	}
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	const reader = new PacketReader((await input.getVideoTracks())[0]!);
+	const packedPacket = (await reader.getNext((await reader.getFirst())!))!;
+	// The second chunk still holds a P-VOP and the B-VOP packed after it
+	const vopStartCodes = [...packedPacket.data].filter((byte, i, data) =>
+		byte === 0 && data[i + 1] === 0 && data[i + 2] === 1 && data[i + 3] === 0xb6,
+	);
+	expect(vopStartCodes).toHaveLength(2);
+});
