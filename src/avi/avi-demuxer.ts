@@ -112,6 +112,42 @@ const getTimingSampleSize = (header: AVIStreamHeader, format: AVIBitmapInfoHeade
 	return sampleSize;
 };
 
+const FLAC_STREAMINFO_SIZE = 34;
+const FLAC_STREAMINFO_BLOCK_HEADER = [0x80, 0x00, 0x00, FLAC_STREAMINFO_SIZE]; // Last block, STREAMINFO, 34 bytes
+
+/**
+ * Returns the decoder description a codec's strf extradata gives, as FFmpeg's muxer stores it: AAC's
+ * AudioSpecificConfig, FLAC's STREAMINFO, made into the 'fLaC' stream header WebCodecs expects, and Vorbis's three
+ * headers in Xiph lacing, which is WebCodecs's form already.
+ */
+const getAudioCodecDescription = (codec: AudioCodec, extraData: Uint8Array | undefined): Uint8Array | null => {
+	if (!extraData) {
+		return null;
+	}
+
+	switch (codec) {
+		case 'aac':
+			return extraData;
+		case 'flac': {
+			if (textDecoder.decode(extraData.subarray(0, 4)) === 'fLaC') {
+				return extraData;
+			}
+			if (extraData.length < FLAC_STREAMINFO_SIZE) {
+				return null;
+			}
+			const description = new Uint8Array(8 + FLAC_STREAMINFO_SIZE);
+			description.set([0x66, 0x4C, 0x61, 0x43, ...FLAC_STREAMINFO_BLOCK_HEADER]); // 'fLaC'
+			description.set(extraData.subarray(0, FLAC_STREAMINFO_SIZE), 8);
+			return description;
+		}
+		case 'vorbis':
+			// Xiph lacing starts with the packet count less one; other layouts are not WebCodecs descriptions
+			return extraData[0] === 2 ? extraData : null;
+		default:
+			return null;
+	}
+};
+
 abstract class AviTrackBacking implements InputTrackBacking {
 	constructor(
 		public demuxer: AVIDemuxer,
@@ -458,8 +494,7 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 		}
 
 		const format = this.streamInfo.format as AVIWaveFormatEx;
-		// Only AAC's extradata, its AudioSpecificConfig, is a decoder description
-		const codecDescription = codec === 'aac' ? format.extraData ?? null : null;
+		const codecDescription = getAudioCodecDescription(codec, format.extraData);
 
 		return this.decoderConfig ??= {
 			codec: extractAudioCodecString({
@@ -730,7 +765,12 @@ export class AVIDemuxer extends Demuxer {
 			// A stream with a sample size counts bytes as samples, an audio stream with a block alignment counts its
 			// started blocks, and every other stream counts one sample per chunk, as FFmpeg does
 			const secondsPerSample = header.rate > 0 && header.scale > 0 ? header.scale / header.rate : 0;
-			const blockAlign = 'formatTag' in stream.format ? stream.format.blockAlign : 0;
+			// FLAC's block alignment is no block size: each chunk holds one frame, which FFmpeg's muxer times by rate
+			// and scale
+			const blockAlign = 'formatTag' in stream.format
+				&& aviWaveFormatToCodec(stream.format) !== 'flac'
+				? stream.format.blockAlign
+				: 0;
 			let sampleCount = 1;
 			if (header.sampleSize > 0) {
 				sampleCount = entry.size / header.sampleSize;
