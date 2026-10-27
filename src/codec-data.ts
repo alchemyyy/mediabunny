@@ -1962,6 +1962,8 @@ export type Av1CodecInfo = {
 	chromaSubsamplingY: number;
 	chromaSamplePosition: number;
 	videoFullRangeFlag: number;
+	/** Whether the sequence header codes the three color fields, which may themselves be 2 (unspecified). */
+	colorDescriptionPresentFlag: number;
 	colourPrimaries: number;
 	transferCharacteristics: number;
 	matrixCoefficients: number;
@@ -2273,6 +2275,7 @@ export const extractAv1CodecInfoFromPacket = (
 			chromaSubsamplingY,
 			chromaSamplePosition,
 			videoFullRangeFlag,
+			colorDescriptionPresentFlag,
 			colourPrimaries,
 			transferCharacteristics,
 			matrixCoefficients,
@@ -2283,9 +2286,7 @@ export const extractAv1CodecInfoFromPacket = (
 };
 
 export const av1CodecInfoHasColorInfo = (info: Av1CodecInfo) => {
-	return info.colourPrimaries !== 2
-		|| info.transferCharacteristics !== 2
-		|| info.matrixCoefficients !== 2;
+	return info.colorDescriptionPresentFlag === 1;
 };
 
 export type ProresCodecInfo = {

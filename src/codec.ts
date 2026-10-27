@@ -579,6 +579,13 @@ export const extractVideoCodecString = (trackInfo: {
 		}
 
 		let string = `av01.${profile}.${level}${tier}.${bitDepth}`;
+
+		// The color fields have two decimal digits, which a code point past 99 (all of them reserved) cannot fill, and
+		// the optional fields are all or none, so such a stream gets only the mandatory ones
+		if (Math.max(colorPrimaries, transferCharacteristics, matrixCoefficients) > 99) {
+			return string;
+		}
+
 		string += `.${monochrome}.${chromaSubsampling.toString().padStart(3, '0')}`;
 		string += `.${colorPrimaries.toString().padStart(2, '0')}`;
 		string += `.${transferCharacteristics.toString().padStart(2, '0')}`;

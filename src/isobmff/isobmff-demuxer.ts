@@ -1492,6 +1492,7 @@ export class IsobmffDemuxer extends Demuxer {
 					chromaSubsamplingY,
 					chromaSamplePosition,
 					videoFullRangeFlag: configObuInfo?.videoFullRangeFlag ?? 0,
+					colorDescriptionPresentFlag: configObuInfo?.colorDescriptionPresentFlag ?? 0,
 					colourPrimaries: configObuInfo?.colourPrimaries ?? 2,
 					transferCharacteristics: configObuInfo?.transferCharacteristics ?? 2,
 					matrixCoefficients: configObuInfo?.matrixCoefficients ?? 2,
