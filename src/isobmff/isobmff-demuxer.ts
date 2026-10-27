@@ -1125,16 +1125,22 @@ export class IsobmffDemuxer extends Demuxer {
 							: lowercaseBoxName;
 						track.frmaCodecString = null;
 
-						if (codecName === 'avc1' || codecName === 'avc3') {
+						// The Dolby Vision sample entries wrap a base layer of their codec and carry its configuration
+						// box: dva1 and dvav as avc1 and avc3, dvh1 and dvhe as hvc1 and hev1, and dav1 as av01
+						if (
+							codecName === 'avc1' || codecName === 'avc3' || codecName === 'dva1' || codecName === 'dvav'
+						) {
 							track.info.codec = 'avc';
-							track.info.avcType = codecName === 'avc1' ? 1 : 3;
-						} else if (codecName === 'hvc1' || codecName === 'hev1') {
+							track.info.avcType = codecName === 'avc1' || codecName === 'dva1' ? 1 : 3;
+						} else if (
+							codecName === 'hvc1' || codecName === 'hev1' || codecName === 'dvh1' || codecName === 'dvhe'
+						) {
 							track.info.codec = 'hevc';
 						} else if (codecName === 'vp08') {
 							track.info.codec = 'vp8';
 						} else if (codecName === 'vp09') {
 							track.info.codec = 'vp9';
-						} else if (codecName === 'av01') {
+						} else if (codecName === 'av01' || codecName === 'dav1') {
 							track.info.codec = 'av1';
 						} else if ((PRORES_FOURCCS as readonly string[]).includes(lowercaseBoxName)) {
 							track.info.codec = 'prores';
