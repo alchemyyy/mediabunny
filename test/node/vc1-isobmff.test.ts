@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ALL_FORMATS, BufferSource, FilePathSource, Input, MP4, PacketCursor } from '../../src/index.js';
+import { ALL_FORMATS, BufferSource, FilePathSource, Input, MP4, PacketCursor, PacketReader } from '../../src/index.js';
 import { assert, toUint8Array } from '../../src/misc.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -52,4 +52,26 @@ test('MP4 with VC-1 video outside the Advanced profile has no description, as in
 	const decoderConfig = await videoTrack.getDecoderConfig();
 	assert(decoderConfig);
 	expect(decoderConfig.description).toBeUndefined();
+});
+
+test('MP4 with VC-1 video keeps a sync sample whose entry point is left to the dvc1 box a key packet', async () => {
+	const bytes = new Uint8Array(await fs.readFile(VC1_MP4_PATH));
+	// The first sample's in-band entry point start code, after its sequence header in the mdat box
+	const file = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const sampleDataStart = file.indexOf('mdat');
+	const entryPointOffset = file.indexOf(Buffer.from([0x00, 0x00, 0x01, 0x0e]), sampleDataStart);
+	expect(sampleDataStart).toBeGreaterThan(0);
+	expect(entryPointOffset).toBeGreaterThan(sampleDataStart);
+	// A reserved start code in its place, as a sample that leaves its entry point to the dvc1 box carries none
+	bytes[entryPointOffset + 3] = 0x1e;
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const videoTrack = await input.getPrimaryVideoTrack();
+	assert(videoTrack);
+
+	const reader = new PacketReader(videoTrack);
+	const first = await reader.getFirstKey({ verifyKeyPackets: true });
+	assert(first);
+	expect(first.type).toBe('key');
+	expect(first.timestamp).toBe(0);
 });

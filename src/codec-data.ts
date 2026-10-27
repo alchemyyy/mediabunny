@@ -2852,7 +2852,9 @@ export const determineVideoPacketType = (
 					return 'key';
 				}
 			}
-			return 'delta';
+			// Without one, the picture type needs the sequence header to parse, and an MP4 or MOV sample may leave
+			// its entry point to the dvc1 box, so the container's word stands
+			return null;
 		};
 
 		default: {
