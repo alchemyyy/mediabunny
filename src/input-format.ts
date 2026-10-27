@@ -62,6 +62,13 @@ export abstract class InputFormat {
 	_isIsobmff = false;
 }
 
+/** The JPEG 2000 signature box that opens a Motion JPEG 2000 file ahead of its `ftyp` box (ISO/IEC 15444-3). */
+const JPEG_2000_SIGNATURE_BOX_SIZE = 12;
+const JPEG_2000_SIGNATURE_BOX_TYPE = 'jP  ';
+const JPEG_2000_SIGNATURE = 0x0d0a870a;
+/** The brands of Motion JPEG 2000 files, of which `mj2s` is the simple profile. */
+const MOTION_JPEG_2000_BRANDS = ['mjp2', 'mj2s'];
+
 /**
  * Format representing files compatible with the ISO base media file format (ISOBMFF), like MP4 or MOV files.
  *
@@ -78,8 +85,27 @@ export abstract class IsobmffInputFormat extends InputFormat {
 		if (isThenable(slice)) slice = await slice;
 		if (!slice) return null;
 
-		slice.skip(4);
+		const firstBoxSize = readU32Be(slice);
 		const fourCc = readAscii(slice, 4);
+
+		// A Motion JPEG 2000 file puts the JPEG 2000 signature box ahead of its ftyp box. A JPEG 2000 still image
+		// opens the same way but carries no movie, so only the Motion JPEG 2000 brands make it an ISOBMFF file.
+		const startsWithJpeg2000Signature = firstBoxSize === JPEG_2000_SIGNATURE_BOX_SIZE
+			&& fourCc === JPEG_2000_SIGNATURE_BOX_TYPE
+			&& readU32Be(slice) === JPEG_2000_SIGNATURE;
+		if (startsWithJpeg2000Signature) {
+			slice = input._reader.requestSlice(JPEG_2000_SIGNATURE_BOX_SIZE, 12);
+			if (isThenable(slice)) slice = await slice;
+			if (!slice) return null;
+
+			slice.skip(4);
+			if (readAscii(slice, 4) !== 'ftyp') {
+				return null;
+			}
+
+			const majorBrand = readAscii(slice, 4);
+			return MOTION_JPEG_2000_BRANDS.includes(majorBrand) ? majorBrand : null;
+		}
 
 		if (
 			fourCc !== 'ftyp'
