@@ -8,6 +8,7 @@
 
 import { TrackType } from '../output';
 import {
+	extractAv1CodecInfoFromConfigurationRecord,
 	extractAv1CodecInfoFromPacket,
 	extractDtsFourCcFromPacket,
 	extractAvcDecoderConfigurationRecord,
@@ -1192,6 +1193,12 @@ export class MatroskaDemuxer extends Demuxer {
 							this.currentTrack.info.codec = 'vp9';
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.av1) {
 							this.currentTrack.info.codec = 'av1';
+							// The CodecPrivate is the track's AV1CodecConfigurationRecord, which FFmpeg hands to AV1
+							// decoders as extradata; the WebCodecs AV1 registration makes no use of it, but a custom
+							// decoder may
+							this.currentTrack.info.codecDescription = this.currentTrack.codecPrivate?.byteLength
+								? this.currentTrack.codecPrivate
+								: null;
 						} else if (codecIdWithoutSuffix === CODEC_STRING_MAP.prores) {
 							const format = this.currentTrack.codecPrivate
 								? textDecoder.decode(this.currentTrack.codecPrivate)
@@ -2788,8 +2795,11 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 				vp9CodecInfo: this.internalTrack.info.codec === 'vp9' && firstPacket
 					? extractVp9CodecInfoFromPacket(firstPacket.data)
 					: null,
-				av1CodecInfo: this.internalTrack.info.codec === 'av1' && firstPacket
-					? extractAv1CodecInfoFromPacket(firstPacket.data)
+				av1CodecInfo: this.internalTrack.info.codec === 'av1'
+					? (firstPacket && extractAv1CodecInfoFromPacket(firstPacket.data))
+					// Without a sequence header in the first block, the CodecPrivate's config OBUs hold one
+					?? (this.internalTrack.info.codecDescription
+						&& extractAv1CodecInfoFromConfigurationRecord(this.internalTrack.info.codecDescription))
 					: null,
 				proresCodecInfo: this.internalTrack.info.codec === 'prores' && firstPacket
 					? extractProresCodecInfoFromPacket(firstPacket.data)

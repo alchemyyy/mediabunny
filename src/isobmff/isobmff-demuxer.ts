@@ -29,6 +29,7 @@ import {
 	Av1CodecInfo,
 	av1CodecInfoHasColorInfo,
 	AvcDecoderConfigurationRecord,
+	extractAv1CodecInfoFromConfigurationRecord,
 	extractAv1CodecInfoFromPacket,
 	extractProresCodecInfoFromPacket,
 	extractVp9CodecInfoFromPacket,
@@ -1525,44 +1526,11 @@ export class IsobmffDemuxer extends Demuxer {
 				}
 				assert(track.info?.type === 'video');
 
-				slice.skip(1); // Marker + version
-
-				const secondByte = readU8(slice);
-				const profile = secondByte >> 5;
-				const level = secondByte & 0b11111;
-
-				const thirdByte = readU8(slice);
-				const tier = thirdByte >> 7;
-				const highBitDepth = (thirdByte >> 6) & 1;
-				const twelveBit = (thirdByte >> 5) & 1;
-				const monochrome = (thirdByte >> 4) & 1;
-				const chromaSubsamplingX = (thirdByte >> 3) & 1;
-				const chromaSubsamplingY = (thirdByte >> 2) & 1;
-				const chromaSamplePosition = thirdByte & 0b11;
-
-				// Logic from https://aomediacodec.github.io/av1-spec/av1-spec.pdf
-				const bitDepth = profile === 2 && highBitDepth ? (twelveBit ? 12 : 10) : (highBitDepth ? 10 : 8);
-
-				slice.skip(1); // Reserved bits + initial presentation delay
-
-				// Parse config OBUs if there are any
-				const configObus = readBytes(slice, boxInfo.contentSize - 4);
-				const configObuInfo = extractAv1CodecInfoFromPacket(configObus);
-
-				track.info.av1CodecInfo = {
-					profile,
-					level,
-					tier,
-					bitDepth,
-					monochrome,
-					chromaSubsamplingX,
-					chromaSubsamplingY,
-					chromaSamplePosition,
-					videoFullRangeFlag: configObuInfo?.videoFullRangeFlag ?? 0,
-					colourPrimaries: configObuInfo?.colourPrimaries ?? 2,
-					transferCharacteristics: configObuInfo?.transferCharacteristics ?? 2,
-					matrixCoefficients: configObuInfo?.matrixCoefficients ?? 2,
-				};
+				// The whole record is the decoder description, as FFmpeg hands it to AV1 decoders as extradata; the
+				// WebCodecs AV1 registration makes no use of it, but a custom decoder may
+				const record = readBytes(slice, boxInfo.contentSize);
+				track.info.codecDescription = record;
+				track.info.av1CodecInfo = extractAv1CodecInfoFromConfigurationRecord(record);
 			}; break;
 
 			case 'colr': {
