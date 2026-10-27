@@ -1132,6 +1132,7 @@ export interface InputAudioTrackBacking extends InputTrackBacking {
 	getNumberOfChannels(): MaybePromise<number>;
 	getSampleRate(): MaybePromise<number>;
 	getDecoderConfig(): Promise<AudioDecoderConfig | null>;
+	getChannelMask?(): MaybePromise<number | null>;
 }
 
 /**
@@ -1180,6 +1181,16 @@ export class InputAudioTrack extends InputTrack {
 	 */
 	get numberOfChannels() {
 		return requireSync(this._backing.getNumberOfChannels(), 'numberOfChannels', 'getNumberOfChannels');
+	}
+
+	/**
+	 * Returns the speakers the track's channels feed, as the container declares them, as a WAVE channel mask
+	 * (`dwChannelMask`): one bit per speaker, front left first, with the channels in the order of their bits.
+	 * Returns null if the container doesn't declare a mask; currently only WAVE_FORMAT_EXTENSIBLE headers in WAVE and
+	 * AVI files carry one. A mask of 0 declares no speaker positions.
+	 */
+	async getChannelMask(): Promise<number | null> {
+		return (await this._backing.getChannelMask?.()) ?? null;
 	}
 
 	/** Returns the track's audio sample rate in hertz. */

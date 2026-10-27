@@ -9,6 +9,7 @@ import { ALL_FORMATS, AVI, AviOutputFormat } from '../../src/index.js';
 import { EncodedVideoPacketSource, EncodedAudioPacketSource, PacketCursor, PacketReader } from '../../src/index.js';
 import { EncodedPacket } from '../../src/index.js';
 import { registerMpeg4Decoder, registerMpeg4Encoder } from '../../packages/mpeg4/src/index.js';
+import { aviWaveFormatToCodec, parseWaveFormatEx } from '../../src/avi/avi-misc.js';
 
 beforeAll(() => {
 	registerMpeg4Decoder();
@@ -295,6 +296,8 @@ test('Should read audio-only AVI files', async () => {
 		const audioTracks = await input.getAudioTracks();
 		expect(audioTracks.length).toBeGreaterThan(0);
 		expect(await audioTracks[0]!.getCodec()).toBe(expectedCodec);
+		// Plain WAVEFORMATEX declares no speakers
+		expect(await audioTracks[0]!.getChannelMask()).toBeNull();
 	}
 });
 
@@ -350,4 +353,75 @@ test('AVI variable-bitrate MP3 is timed one frame per chunk, as FFmpeg reads it'
 		packetIndex++;
 	}
 	expect(packetIndex).toBeGreaterThan(1);
+});
+
+test('AVI WAVE_FORMAT_EXTENSIBLE audio takes its codec from the SubFormat and its sample size', async () => {
+	const testFiles = [
+		{ file: 'pcm-s24-5.1-extensible.avi', expectedCodec: 'pcm-s24', bytesPerSample: 3 },
+		{ file: 'pcm-f32-5.1-extensible.avi', expectedCodec: 'pcm-f32', bytesPerSample: 4 },
+	];
+
+	for (const { file, expectedCodec, bytesPerSample } of testFiles) {
+		using input = new Input({
+			source: new FilePathSource(`test/public/avi/${file}`),
+			formats: ALL_FORMATS,
+		});
+		const track = (await input.getAudioTracks())[0]!;
+		expect(await track.getCodec()).toBe(expectedCodec);
+		expect(await track.getNumberOfChannels()).toBe(6);
+		expect(await track.getSampleRate()).toBe(48000);
+		// FFmpeg's 5.1 with back surrounds
+		expect(await track.getChannelMask()).toBe(0x3F);
+
+		// The chunks hold whole sample frames and are timed by their byte counts
+		let totalDuration = 0;
+		for await (const packet of new PacketCursor(track)) {
+			expect(packet.byteLength % (6 * bytesPerSample)).toBe(0);
+			expect(packet.timestamp).toBeCloseTo(totalDuration, 9);
+			totalDuration += packet.duration;
+		}
+		expect(totalDuration).toBeCloseTo(0.25, 3);
+	}
+});
+
+const makeExtensibleFormat = (subFormat: number[], extraData: number[] = []) => {
+	const bytes = new Uint8Array(18 + 22 + extraData.length);
+	const view = new DataView(bytes.buffer);
+	view.setUint16(0, 0xFFFE, true);
+	view.setUint16(2, 6, true);
+	view.setUint32(4, 48000, true);
+	view.setUint16(12, 4, true);
+	view.setUint16(14, 16, true);
+	view.setUint16(16, 22 + extraData.length, true);
+	view.setUint16(18, 16, true);
+	view.setUint32(20, 0x60F, true);
+	bytes.set(subFormat, 24);
+	bytes.set(extraData, 40);
+	return view;
+};
+
+test('AVI WAVE_FORMAT_EXTENSIBLE maps the SubFormat GUIDs FFmpeg maps and keeps the channel mask', () => {
+	const mediaSubtypeBase = [0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71];
+	const pcm = parseWaveFormatEx(makeExtensibleFormat([0x01, 0x00, 0x00, 0x00, ...mediaSubtypeBase], [0xAB]));
+	expect(pcm.extensible).toEqual({
+		validBitsPerSample: 16,
+		channelMask: 0x60F,
+		subFormatTag: 1,
+		subFormatCodec: null,
+	});
+	expect(aviWaveFormatToCodec(pcm)).toBe('pcm-s16');
+	// Extradata follows the extensible fields
+	expect([...pcm.extraData!]).toEqual([0xAB]);
+
+	const ac3Guid = [0x2C, 0x80, 0x6D, 0xE0, 0x46, 0xDB, 0xCF, 0x11, 0xB4, 0xD1, 0x00, 0x80, 0x5F, 0x6C, 0xBB, 0xEA];
+	expect(aviWaveFormatToCodec(parseWaveFormatEx(makeExtensibleFormat(ac3Guid)))).toBe('ac3');
+	const eac3Guid = [0xAF, 0x87, 0xFB, 0xA7, 0x02, 0x2D, 0xFB, 0x42, 0xA4, 0xD4, 0x05, 0xCD, 0x93, 0x84, 0x3B, 0xDD];
+	expect(aviWaveFormatToCodec(parseWaveFormatEx(makeExtensibleFormat(eac3Guid)))).toBe('eac3');
+
+	const unknownGuid = new Array<number>(16).fill(0x11);
+	expect(aviWaveFormatToCodec(parseWaveFormatEx(makeExtensibleFormat(unknownGuid)))).toBeNull();
+
+	// A header cut short of the extensible fields names no codec
+	const truncated = makeExtensibleFormat([0x01, 0x00, 0x00, 0x00, ...mediaSubtypeBase]);
+	expect(aviWaveFormatToCodec(parseWaveFormatEx(new DataView(truncated.buffer, 0, 30)))).toBeNull();
 });
