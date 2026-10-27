@@ -772,6 +772,20 @@ test('AVI MPEG-4 Part 2 without the packed marker keeps its chunks as they are',
 	expect(vopStartCodes).toHaveLength(2);
 });
 
+test('AVI video tracks take the extradata after the 40-byte header as their description, as FFmpeg does', async () => {
+	// mpeg4-global-header.avi is an FFmpeg encode with a global header, whose muxer counts the 30 bytes of extradata in
+	// biSize; FFmpeg's demuxer reads the rest of the chunk whatever biSize says
+	using input = new Input({
+		source: new FilePathSource('./test/public/avi/mpeg4-global-header.avi'),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getVideoTracks())[0]!;
+	const description = new Uint8Array((await track.getDecoderConfig())!.description as ArrayBuffer);
+	expect(description.byteLength).toBe(30);
+	// The visual object sequence start code
+	expect([...description.subarray(0, 4)]).toEqual([0, 0, 1, 0xB0]);
+});
+
 test('Should keep a video track of a FourCC with no codec, codec-less, with its FourCC as its codec ID', async () => {
 	using input = new Input({
 		source: new FilePathSource('./test/public/avi/msmpeg4v3.avi'),

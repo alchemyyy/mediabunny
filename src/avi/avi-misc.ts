@@ -321,14 +321,21 @@ export function parseStreamHeader(data: DataView): AVIStreamHeader {
 	};
 }
 
+const BITMAP_INFO_HEADER_SIZE = 40;
+
 export function parseBitmapInfoHeader(data: DataView): AVIBitmapInfoHeader {
 	const decoder = new TextDecoder('latin1');
 	const size = data.getUint32(0, true);
 
-	// Codec extradata, such as an MPEG-4 Part 2 VOL header or an avcC record, follows the header
+	// Codec extradata, such as an MPEG-4 Part 2 VOL header or an avcC record, follows the 40-byte header. FFmpeg's
+	// demuxer takes the rest of the chunk whatever biSize says, since its muxer counts the extradata in biSize, except
+	// a byte that pads an odd biSize to the chunk's end
 	let extraData: Uint8Array | undefined;
-	if (size >= 40 && data.byteLength > size) {
-		extraData = new Uint8Array(data.buffer, data.byteOffset + size, data.byteLength - size);
+	const extraDataSize = size === data.byteLength - 1 && size % 2 === 1
+		? size - BITMAP_INFO_HEADER_SIZE
+		: data.byteLength - BITMAP_INFO_HEADER_SIZE;
+	if (extraDataSize > 0) {
+		extraData = new Uint8Array(data.buffer, data.byteOffset + BITMAP_INFO_HEADER_SIZE, extraDataSize);
 	}
 
 	return {
