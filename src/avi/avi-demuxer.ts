@@ -45,6 +45,8 @@ import {
 	parseMainHeader, parseStreamHeader, parseBitmapInfoHeader, parseWaveFormatEx, parseIndexEntry,
 	aviVideoFourccToCodec, aviAudioFormatTagToCodec, parseStreamChunkId, AVIIF_KEYFRAME,
 } from './avi-misc';
+import { AvcPictureOrderReader, HevcPictureOrderReader, PictureOrderReader } from './avi-picture-order';
+import { AviPresentationTimes } from './avi-presentation-times';
 
 type StreamInfo = {
 	header: AVIStreamHeader;
@@ -112,6 +114,8 @@ const getTimingSampleSize = (header: AVIStreamHeader, format: AVIBitmapInfoHeade
 };
 
 abstract class AviTrackBacking implements InputTrackBacking {
+	private presentationTimes: AviPresentationTimes | null = null;
+
 	constructor(
 		public demuxer: AVIDemuxer,
 		public streamInfo: StreamInfo,
@@ -207,6 +211,11 @@ abstract class AviTrackBacking implements InputTrackBacking {
 		return null;
 	}
 
+	/** The stream's presentation timestamps, which H.264 and HEVC read from their pictures' order counts. */
+	getPresentationTimes() {
+		return this.presentationTimes ??= this.demuxer.createPresentationTimes(this.streamInfo, this.getCodec());
+	}
+
 	/** Creates the packet at an index of the stream's chunks; its sequence number is that index. */
 	private async createPacket(
 		res: ResultValue<PacketRetrievalResult>,
@@ -214,19 +223,22 @@ abstract class AviTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
 		const packetInfo = this.streamInfo.packets[packetIndex]!;
+		const timestamp = await this.getPresentationTimes().getTimestamp(packetIndex);
 
 		if (options.metadataOnly) {
 			return res.set(new PacketRetrievalResult(new EncodedPacket(
 				PLACEHOLDER_DATA,
 				packetInfo.isKey ? 'key' : 'delta',
-				packetInfo.timestamp,
+				timestamp,
 				packetInfo.duration,
 				packetIndex,
 				packetInfo.entry.size,
 			)));
 		}
 
-		return res.set(new PacketRetrievalResult(await this.demuxer.readPacket(packetInfo, packetIndex)));
+		return res.set(new PacketRetrievalResult(
+			await this.demuxer.readPacket({ ...packetInfo, timestamp }, packetIndex),
+		));
 	}
 
 	private getPacketIndex(packet: EncodedPacket) {
@@ -254,7 +266,7 @@ abstract class AviTrackBacking implements InputTrackBacking {
 		timestamp: number,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		const index = binarySearchLessOrEqual(this.streamInfo.packets, timestamp, x => x.timestamp);
+		const index = await this.getPresentationTimes().findPacket(timestamp);
 		if (index === -1) {
 			return res.set(new PacketRetrievalResult(null));
 		}
@@ -280,17 +292,12 @@ abstract class AviTrackBacking implements InputTrackBacking {
 		timestamp: number,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		const keyPacketIndices = this.streamInfo.keyPacketIndices;
-		const keyIndex = binarySearchLessOrEqual(
-			keyPacketIndices,
-			timestamp,
-			x => this.streamInfo.packets[x]!.timestamp,
-		);
-		if (keyIndex === -1) {
+		const index = await this.getPresentationTimes().findKeyPacket(timestamp, this.streamInfo.keyPacketIndices);
+		if (index === -1) {
 			return res.set(new PacketRetrievalResult(null));
 		}
 
-		return this.createPacket(res, keyPacketIndices[keyIndex]!, options);
+		return this.createPacket(res, index, options);
 	}
 
 	async getNextKeyPacket(
@@ -775,10 +782,42 @@ export class AVIDemuxer extends Demuxer {
 		}
 	}
 
+	/** Returns where an indexed chunk's data starts in the file. */
+	private getChunkDataPosition(entry: AVIIndexEntry) {
+		return (this.indexOffsetsAreAbsolute ? entry.offset : this.moviStart + entry.offset) + 8;
+	}
+
+	/** Creates a stream's presentation times, which read H.264 and HEVC pictures' order counts from their packets. */
+	createPresentationTimes(stream: StreamInfo, codec: MediaCodec | null) {
+		const extraData = 'compression' in stream.format ? stream.format.extraData ?? null : null;
+		let reader: PictureOrderReader | null = null;
+		if (codec === 'avc') {
+			reader = new AvcPictureOrderReader(extraData);
+		} else if (codec === 'hevc') {
+			reader = new HevcPictureOrderReader(extraData);
+		}
+
+		const { header } = stream;
+		const slotDuration = header.rate > 0 && header.scale > 0 ? header.scale / header.rate : 0;
+
+		return new AviPresentationTimes(
+			stream.packets,
+			stream.keyPacketIndices,
+			reader,
+			slotDuration,
+			async (packetIndex, byteCount) => {
+				const slice = await this.reader.requestSlice(
+					this.getChunkDataPosition(stream.packets[packetIndex]!.entry),
+					byteCount,
+				);
+				return slice && readBytes(slice, byteCount);
+			},
+		);
+	}
+
 	async readPacket(packetInfo: PacketInfo, sequenceNumber: number): Promise<EncodedPacket | null> {
 		const { entry } = packetInfo;
-		const chunkPos = this.indexOffsetsAreAbsolute ? entry.offset : this.moviStart + entry.offset;
-		const slice = await this.reader.requestSlice(chunkPos + 8, entry.size);
+		const slice = await this.reader.requestSlice(this.getChunkDataPosition(entry), entry.size);
 		if (!slice) {
 			return null;
 		}
