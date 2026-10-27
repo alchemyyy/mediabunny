@@ -296,6 +296,8 @@ test('Should read audio-only AVI files', async () => {
 		const audioTracks = await input.getAudioTracks();
 		expect(audioTracks.length).toBeGreaterThan(0);
 		expect(await audioTracks[0]!.getCodec()).toBe(expectedCodec);
+		// Plain WAVEFORMATEX declares no speakers
+		expect(await audioTracks[0]!.getChannelMask()).toBeNull();
 	}
 });
 
@@ -368,6 +370,8 @@ test('AVI WAVE_FORMAT_EXTENSIBLE audio takes its codec from the SubFormat and it
 		expect(await track.getCodec()).toBe(expectedCodec);
 		expect(await track.getNumberOfChannels()).toBe(6);
 		expect(await track.getSampleRate()).toBe(48000);
+		// FFmpeg's 5.1 with back surrounds
+		expect(await track.getChannelMask()).toBe(0x3F);
 
 		// The chunks hold whole sample frames and are timed by their byte counts
 		let totalDuration = 0;

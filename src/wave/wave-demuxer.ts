@@ -36,6 +36,8 @@ export class WaveDemuxer extends Demuxer {
 		sampleRate: number;
 		sampleSizeInBytes: number;
 		blockSizeInBytes: number;
+		/** The WAVE_FORMAT_EXTENSIBLE channel mask, or null without one. */
+		channelMask: number | null;
 	} | null = null;
 
 	trackBackings: WaveAudioTrackBacking[] = [];
@@ -145,6 +147,7 @@ export class WaveDemuxer extends Demuxer {
 		const blockAlign = readU16(slice, littleEndian);
 
 		let bitsPerSample: number;
+		let channelMask: number | null = null;
 
 		if (size === 14) { // Plain WAVEFORMAT
 			bitsPerSample = 8;
@@ -160,7 +163,8 @@ export class WaveDemuxer extends Demuxer {
 
 			if (extensionSize >= 22 && formatTag === WaveFormat.EXTENSIBLE) {
 				// Parse WAVEFORMATEXTENSIBLE
-				slice.skip(2 + 4);
+				slice.skip(2);
+				channelMask = readU32(slice, littleEndian);
 				const subFormat = readBytes(slice, 16);
 
 				// Get actual format from subFormat GUID
@@ -200,6 +204,7 @@ export class WaveDemuxer extends Demuxer {
 			sampleRate,
 			sampleSizeInBytes: Math.ceil(bitsPerSample / 8),
 			blockSizeInBytes: blockAlign,
+			channelMask,
 		};
 	}
 
@@ -409,6 +414,11 @@ class WaveAudioTrackBacking implements InputAudioTrackBacking {
 	getNumberOfChannels() {
 		assert(this.demuxer.audioInfo);
 		return this.demuxer.audioInfo.numberOfChannels;
+	}
+
+	getChannelMask() {
+		assert(this.demuxer.audioInfo);
+		return this.demuxer.audioInfo.channelMask;
 	}
 
 	getSampleRate() {

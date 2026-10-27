@@ -438,6 +438,10 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 		return format.channels;
 	}
 
+	getChannelMask(): number | null {
+		return (this.streamInfo.format as AVIWaveFormatEx).extensible?.channelMask ?? null;
+	}
+
 	getSampleRate(): number {
 		const format = this.streamInfo.format as AVIWaveFormatEx;
 		return format.samplesPerSec;
