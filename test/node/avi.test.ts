@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import fs from 'node:fs';
 import { expect, test, beforeAll } from 'vitest';
 import { Input, Output } from '../../src/index.js';
 import { BufferSource, BufferTarget, FilePathSource } from '../../src/index.js';
@@ -350,4 +351,74 @@ test('AVI variable-bitrate MP3 is timed one frame per chunk, as FFmpeg reads it'
 		packetIndex++;
 	}
 	expect(packetIndex).toBeGreaterThan(1);
+});
+
+/** Reads every packet of an input's first track of a type, with its data. */
+const readAllPackets = async (input: Input, type: 'video' | 'audio') => {
+	const track = type === 'video' ? (await input.getVideoTracks())[0]! : (await input.getAudioTracks())[0]!;
+	const packets: EncodedPacket[] = [];
+	for await (const packet of new PacketCursor(track)) {
+		packets.push(packet);
+	}
+
+	return packets;
+};
+
+const describePackets = (packets: EncodedPacket[]) => packets.map(packet => ({
+	type: packet.type,
+	timestamp: packet.timestamp,
+	duration: packet.duration,
+	data: [...packet.data],
+}));
+
+test('AVI OpenDML files are read through their super and standard indexes, past the first RIFF list', async () => {
+	// The same FFmpeg encode as vp9-aac.avi, rewritten into three RIFF lists as FFmpeg's muxer writes a file past
+	// 1 GiB: idx1 lists only the first RIFF list's chunks, and each stream's indx locates an ix## in every RIFF list
+	using openDMLInput = new Input({
+		source: new FilePathSource('test/public/avi/vp9-aac-opendml.avi'),
+		formats: ALL_FORMATS,
+	});
+	using oneRiffInput = new Input({
+		source: new FilePathSource('test/public/avi/vp9-aac.avi'),
+		formats: ALL_FORMATS,
+	});
+
+	for (const type of ['video', 'audio'] as const) {
+		const openDMLPackets = await readAllPackets(openDMLInput, type);
+		expect(openDMLPackets.length).toBeGreaterThan(1);
+		expect(describePackets(openDMLPackets)).toEqual(describePackets(await readAllPackets(oneRiffInput, type)));
+	}
+
+	// The second key frame lies in the first AVIX list
+	const videoTrack = (await openDMLInput.getVideoTracks())[0]!;
+	const reader = new PacketReader(videoTrack);
+	const lastPacket = (await reader.getAt(Infinity))!;
+	const keyPacket = (await reader.getKeyAt(lastPacket.timestamp))!;
+	expect(keyPacket.timestamp).toBeGreaterThan(0);
+	expect(keyPacket.type).toBe('key');
+	expect(await videoTrack.computeDuration()).toBeCloseTo(await videoTrack.getDurationFromMetadata() ?? 0, 9);
+});
+
+test('AVI OpenDML files keep to idx1 when a super index locates no standard index', async () => {
+	const bytes = new Uint8Array(fs.readFileSync('test/public/avi/vp9-aac-opendml.avi'));
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	// The video stream's indx: its first entry's qwOffset, after the chunk header and the index header, past the end
+	const superIndexPosition = Buffer.from(bytes).indexOf('indx');
+	view.setUint32(superIndexPosition + 8 + 24, bytes.byteLength + 1, true);
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	const videoPackets = await readAllPackets(input, 'video');
+	// idx1 lists the first RIFF list's single video chunk
+	expect(videoPackets).toHaveLength(1);
+	expect(videoPackets[0]!.type).toBe('key');
+	// The audio stream's OpenDML index still reads
+	const audioPackets = await readAllPackets(input, 'audio');
+	using oneRiffInput = new Input({
+		source: new FilePathSource('test/public/avi/vp9-aac.avi'),
+		formats: ALL_FORMATS,
+	});
+	expect(audioPackets).toHaveLength((await readAllPackets(oneRiffInput, 'audio')).length);
 });

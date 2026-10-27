@@ -76,9 +76,31 @@ export interface AVIIndexEntry {
 	size: number;
 }
 
+/** The header an OpenDML index chunk, a super index (indx) or a standard index (ix##), starts with. */
+export interface AVIOpenDMLIndexHeader {
+	longsPerEntry: number;
+	indexSubType: number;
+	indexType: number;
+	entriesInUse: number;
+	/** The chunk ID of the chunks the index lists, such as 00dc. */
+	chunkId: string;
+	/** A standard index's qwBaseOffset, from which its entries' offsets count; reserved, so zero, in a super index. */
+	baseOffset: number;
+}
+
 export const AVIIF_KEYFRAME = 0x00000010;
 export const AVIIF_LIST = 0x00000001;
 export const AVIIF_NO_TIME = 0x00000100;
+
+/** bIndexType of an OpenDML super index, whose entries locate standard indexes. */
+export const AVI_INDEX_OF_INDEXES = 0x00;
+/** bIndexType of an OpenDML standard index, whose entries locate chunks. */
+export const AVI_INDEX_OF_CHUNKS = 0x01;
+export const AVI_OPENDML_INDEX_HEADER_SIZE = 24;
+export const AVI_SUPER_INDEX_ENTRY_SIZE = 16;
+export const AVI_STANDARD_INDEX_ENTRY_SIZE = 8;
+/** The bit of a standard index entry's dwSize that marks a chunk that is not a key frame. */
+export const AVI_STANDARD_INDEX_DELTA_FRAME = 0x80000000;
 
 const VIDEO_FOURCC_TO_CODEC: Record<string, VideoCodec> = {
 	'H264': 'avc',
@@ -291,6 +313,22 @@ export function parseIndexEntry(data: DataView, offset: number): AVIIndexEntry {
 		flags: data.getUint32(offset + 4, true),
 		offset: data.getUint32(offset + 8, true),
 		size: data.getUint32(offset + 12, true),
+	};
+}
+
+export function getUint64Le(data: DataView, offset: number): number {
+	return data.getUint32(offset + 4, true) * 0x100000000 + data.getUint32(offset, true);
+}
+
+export function parseOpenDMLIndexHeader(data: DataView): AVIOpenDMLIndexHeader {
+	const decoder = new TextDecoder('latin1');
+	return {
+		longsPerEntry: data.getUint16(0, true),
+		indexSubType: data.getUint8(2),
+		indexType: data.getUint8(3),
+		entriesInUse: data.getUint32(4, true),
+		chunkId: decoder.decode(new Uint8Array(data.buffer, data.byteOffset + 8, 4)),
+		baseOffset: getUint64Le(data, 12),
 	};
 }
 

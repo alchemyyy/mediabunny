@@ -44,6 +44,8 @@ import {
 	AVIMainHeader, AVIStreamHeader, AVIBitmapInfoHeader, AVIWaveFormatEx, AVIIndexEntry,
 	parseMainHeader, parseStreamHeader, parseBitmapInfoHeader, parseWaveFormatEx, parseIndexEntry,
 	aviVideoFourccToCodec, aviAudioFormatTagToCodec, parseStreamChunkId, AVIIF_KEYFRAME,
+	parseOpenDMLIndexHeader, getUint64Le, AVI_INDEX_OF_CHUNKS, AVI_INDEX_OF_INDEXES, AVI_OPENDML_INDEX_HEADER_SIZE,
+	AVI_STANDARD_INDEX_DELTA_FRAME, AVI_STANDARD_INDEX_ENTRY_SIZE, AVI_SUPER_INDEX_ENTRY_SIZE,
 } from './avi-misc';
 
 type StreamInfo = {
@@ -57,10 +59,16 @@ type StreamInfo = {
 	index: number;
 	/** The samples the chunks seen so far take, in units of scale / rate seconds. */
 	sampleCount: number;
+	/** The stream's OpenDML index chunk (indx), when its stream list holds one. */
+	openDMLIndex: ChunkInfo | null;
+	/** The chunks the stream's OpenDML index lists, once read in full; the stream keeps to idx1 without them. */
+	openDMLChunks: IndexedChunk[] | null;
 };
 
 type PacketInfo = {
 	entry: AVIIndexEntry;
+	/** The file position of the chunk's data. */
+	position: number;
 	timestamp: number;
 	duration: number;
 	isKey: boolean;
@@ -69,6 +77,12 @@ type PacketInfo = {
 type ChunkInfo = {
 	fourcc: string;
 	size: number;
+	position: number;
+};
+
+/** An index entry with the file position of its chunk's data. */
+type IndexedChunk = {
+	entry: AVIIndexEntry;
 	position: number;
 };
 
@@ -81,6 +95,10 @@ const AAC_FRAME_SAMPLE_SIZES = [1024, 4096];
 const MP3_FRAME_SAMPLE_SIZE = 1152;
 const WAVE_FORMAT_MPEG_LAYER_3 = 0x0055;
 const WAVE_FORMAT_AAC_TAGS = [0x00ff, 0x1600, 0x1601];
+// How deep OpenDML super indexes may nest, as a bound on a malformed file's reads
+const MAX_OPENDML_INDEX_DEPTH = 4;
+// A standard index entry lists a chunk's data, which follows its 8-byte chunk header
+const CHUNK_HEADER_SIZE = 8;
 
 /**
  * Returns the sample size by which a stream's chunks are timed: by bytes when it is nonzero, else per chunk or block.
@@ -531,7 +549,8 @@ export class AVIDemuxer extends Demuxer {
 		// Parse chunks
 		await this.parseChunks();
 
-		// Process index and create packet info
+		// Read each stream's OpenDML index, then process the indexes and create packet info
+		await this.readOpenDMLIndexes();
 		this.processIndex();
 
 		// Create tracks
@@ -636,6 +655,7 @@ export class AVIDemuxer extends Demuxer {
 		let currentPos = position;
 		let header: AVIStreamHeader | null = null;
 		let format: AVIBitmapInfoHeader | AVIWaveFormatEx | null = null;
+		let openDMLIndex: ChunkInfo | null = null;
 
 		while (currentPos < endPos) {
 			const chunk = await this.readChunkHeader(currentPos);
@@ -657,6 +677,8 @@ export class AVIDemuxer extends Demuxer {
 						format = parseWaveFormatEx(data);
 					}
 				}
+			} else if (chunk.fourcc === 'indx') {
+				openDMLIndex = chunk;
 			}
 
 			currentPos = chunk.position + chunk.size;
@@ -680,6 +702,8 @@ export class AVIDemuxer extends Demuxer {
 			keyPacketIndices: [],
 			index: streamIndex,
 			sampleCount: 0,
+			openDMLIndex,
+			openDMLChunks: null,
 		});
 		if (!header || !format) {
 			this.streams[streamIndex]!.header.fccType = '    ';
@@ -700,12 +724,143 @@ export class AVIDemuxer extends Demuxer {
 		}
 	}
 
-	private processIndex(): void {
+	/**
+	 * Reads the OpenDML index of every stream that has one, as FFmpeg does: a super index (indx) locates a standard
+	 * index (ix##) for each RIFF list, AVI and the AVIX lists that follow it past about 1 GiB, and each standard index
+	 * locates its chunks. A stream whose OpenDML index cannot be read in full keeps to idx1, which covers only the
+	 * first RIFF list.
+	 */
+	private async readOpenDMLIndexes(): Promise<void> {
+		for (const stream of this.streams) {
+			if (!stream.openDMLIndex) {
+				continue;
+			}
+
+			const chunks: IndexedChunk[] = [];
+			if (await this.readOpenDMLIndex(stream, stream.openDMLIndex, chunks, 0, new Set())) {
+				stream.openDMLChunks = chunks;
+			}
+		}
+	}
+
+	/**
+	 * Appends the chunks an OpenDML index lists, reading the standard indexes a super index locates.
+	 * Returns false when the index is invalid.
+	 */
+	private async readOpenDMLIndex(
+		stream: StreamInfo,
+		indexChunk: ChunkInfo,
+		chunks: IndexedChunk[],
+		depth: number,
+		visitedPositions: Set<number>,
+	): Promise<boolean> {
+		if (depth > MAX_OPENDML_INDEX_DEPTH || visitedPositions.has(indexChunk.position)) {
+			return false;
+		}
+		visitedPositions.add(indexChunk.position);
+
+		const data = indexChunk.size >= AVI_OPENDML_INDEX_HEADER_SIZE ? await this.readChunkData(indexChunk) : null;
+		if (!data) {
+			return false;
+		}
+
+		const header = parseOpenDMLIndexHeader(data);
+		if (header.indexSubType !== 0 || parseStreamChunkId(header.chunkId)?.streamNumber !== stream.index) {
+			return false; // A field index, or another stream's
+		}
+
+		if (header.indexType === AVI_INDEX_OF_INDEXES) {
+			if (AVI_OPENDML_INDEX_HEADER_SIZE + header.entriesInUse * AVI_SUPER_INDEX_ENTRY_SIZE > data.byteLength) {
+				return false;
+			}
+
+			for (let i = 0; i < header.entriesInUse; i++) {
+				// qwOffset locates the standard index's chunk header; dwSize and dwDuration repeat what it holds
+				const offset = getUint64Le(data, AVI_OPENDML_INDEX_HEADER_SIZE + i * AVI_SUPER_INDEX_ENTRY_SIZE);
+				const standardIndexChunk = await this.readChunkHeader(offset);
+				if (
+					!standardIndexChunk
+					|| !(await this.readOpenDMLIndex(stream, standardIndexChunk, chunks, depth + 1, visitedPositions))
+				) {
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		if (header.indexType !== AVI_INDEX_OF_CHUNKS || header.longsPerEntry !== 2) {
+			return false;
+		}
+		if (AVI_OPENDML_INDEX_HEADER_SIZE + header.entriesInUse * AVI_STANDARD_INDEX_ENTRY_SIZE > data.byteLength) {
+			return false;
+		}
+
+		const baseOffset = this.validateOpenDMLBaseOffset(header.baseOffset);
+		if (baseOffset === null) {
+			return false;
+		}
+
+		for (let i = 0; i < header.entriesInUse; i++) {
+			const entryOffset = AVI_OPENDML_INDEX_HEADER_SIZE + i * AVI_STANDARD_INDEX_ENTRY_SIZE;
+			const position = baseOffset + data.getUint32(entryOffset, true);
+			const sizeField = data.getUint32(entryOffset + 4, true);
+			const isKey = (sizeField & AVI_STANDARD_INDEX_DELTA_FRAME) === 0;
+			chunks.push({
+				entry: {
+					ckid: header.chunkId,
+					flags: isKey ? AVIIF_KEYFRAME : 0,
+					offset: position - CHUNK_HEADER_SIZE,
+					size: sizeField & ~AVI_STANDARD_INDEX_DELTA_FRAME,
+				},
+				position,
+			});
+		}
+
+		return true;
+	}
+
+	/**
+	 * Returns a standard index's base offset, or null when it lies past the file's end. Like FFmpeg, takes the low
+	 * 32 bits of a base offset that some muxers write twice over, into both halves.
+	 */
+	private validateOpenDMLBaseOffset(baseOffset: number): number | null {
+		const fileSize = this.reader.fileSizeNonStrict;
+		if (fileSize === null || baseOffset < fileSize) {
+			return baseOffset;
+		}
+
+		const low = baseOffset % 0x100000000;
+		const high = Math.floor(baseOffset / 0x100000000);
+		return high === low && low < fileSize && fileSize <= 0xffffffff ? low : null;
+	}
+
+	/**
+	 * Yields the chunks each stream's index lists, with the position of each chunk's data: its OpenDML index when it
+	 * was read, else its idx1 entries.
+	 */
+	private* getIndexedChunks(): Generator<IndexedChunk> {
 		// idx1 offsets normally count from the movi list's type, but some muxers write file offsets
 		const firstEntry = this.index.find(entry => parseStreamChunkId(entry.ckid) !== null);
 		this.indexOffsetsAreAbsolute = firstEntry !== undefined && firstEntry.offset >= this.moviStart;
 
 		for (const entry of this.index) {
+			const streamNumber = parseStreamChunkId(entry.ckid)?.streamNumber;
+			if (streamNumber !== undefined && this.streams[streamNumber]?.openDMLChunks) {
+				continue;
+			}
+
+			const chunkPosition = this.indexOffsetsAreAbsolute ? entry.offset : this.moviStart + entry.offset;
+			yield { entry, position: chunkPosition + CHUNK_HEADER_SIZE };
+		}
+
+		for (const stream of this.streams) {
+			yield* stream.openDMLChunks ?? [];
+		}
+	}
+
+	private processIndex(): void {
+		for (const { entry, position } of this.getIndexedChunks()) {
 			const parsed = parseStreamChunkId(entry.ckid);
 			if (!parsed) {
 				continue;
@@ -748,6 +903,7 @@ export class AVIDemuxer extends Demuxer {
 
 			stream.packets.push({
 				entry,
+				position,
 				timestamp: (header.start + samplesBefore) * secondsPerSample,
 				duration: sampleCount * secondsPerSample,
 				isKey,
@@ -777,8 +933,7 @@ export class AVIDemuxer extends Demuxer {
 
 	async readPacket(packetInfo: PacketInfo, sequenceNumber: number): Promise<EncodedPacket | null> {
 		const { entry } = packetInfo;
-		const chunkPos = this.indexOffsetsAreAbsolute ? entry.offset : this.moviStart + entry.offset;
-		const slice = await this.reader.requestSlice(chunkPos + 8, entry.size);
+		const slice = await this.reader.requestSlice(packetInfo.position, entry.size);
 		if (!slice) {
 			return null;
 		}
