@@ -45,6 +45,7 @@ import {
 	parseMainHeader, parseStreamHeader, parseBitmapInfoHeader, parseWaveFormatEx, parseIndexEntry,
 	aviVideoFourccToCodec, aviAudioFormatTagToCodec, parseStreamChunkId, AVIIF_KEYFRAME,
 } from './avi-misc';
+import { clearPackedMarker, hasDivXPackedUserData, MPEG4_MAX_NVOP_SIZE, scanMpeg4Chunk } from './avi-mpeg4-packed';
 
 type StreamInfo = {
 	header: AVIStreamHeader;
@@ -70,6 +71,12 @@ type ChunkInfo = {
 	fourcc: string;
 	size: number;
 	position: number;
+};
+
+/** A B-VOP that a packed chunk holds after its reference VOP, which plays in a later chunk's slot. */
+type StoredVop = {
+	packetIndex: number;
+	start: number;
 };
 
 const VIDEO_CHUNK_TYPES = ['db', 'dc'];
@@ -226,7 +233,12 @@ abstract class AviTrackBacking implements InputTrackBacking {
 			)));
 		}
 
-		return res.set(new PacketRetrievalResult(await this.demuxer.readPacket(packetInfo, packetIndex)));
+		return res.set(new PacketRetrievalResult(await this.readPacket(packetIndex)));
+	}
+
+	/** Reads the packet at an index of the stream's chunks. */
+	protected readPacket(packetIndex: number): Promise<EncodedPacket | null> {
+		return this.demuxer.readPacket(this.streamInfo.packets[packetIndex]!, packetIndex);
 	}
 
 	private getPacketIndex(packet: EncodedPacket) {
@@ -313,6 +325,9 @@ abstract class AviTrackBacking implements InputTrackBacking {
 
 class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBacking {
 	decoderConfigPromise: Promise<VideoDecoderConfig | null> | null = null;
+	private packedBitstreamPromise: Promise<boolean> | null = null;
+	/** The B-VOP each packet of a packed bitstream leaves waiting for a later slot, once known, or null for none. */
+	private storedVopsAfterPackets: (StoredVop | null | undefined)[] = [];
 
 	getType() {
 		return 'video' as const;
@@ -370,6 +385,13 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 			// AVC and HEVC extradata is a configuration record when the packets are length-prefixed, and the first
 			// packet carries the parameter sets when they are in Annex B
 			let codecDescription = format.extraData ?? null;
+			// Unpacking clears the packed marker in the extradata too, as FFmpeg's bitstream filter does
+			if (codec === 'mpeg4' && codecDescription && await this.isPackedBitstream()) {
+				const { packedMarkerPosition } = scanMpeg4Chunk(codecDescription);
+				if (packedMarkerPosition >= 0) {
+					codecDescription = clearPackedMarker(codecDescription, packedMarkerPosition);
+				}
+			}
 			if ((codec === 'avc' || codec === 'hevc') && codecDescription && codecDescription[0] !== 1) {
 				codecDescription = null;
 			}
@@ -418,6 +440,130 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 				colorSpace: extractColorSpace(codecInfo),
 			};
 		})();
+	}
+
+	/**
+	 * Whether the stream is MPEG-4 Part 2 in DivX's packed bitstream, which its extradata or first chunk marks with
+	 * DivX user data ending in 'p'. FFmpeg's decoder unpacks only such a stream.
+	 */
+	private isPackedBitstream(): Promise<boolean> {
+		return this.packedBitstreamPromise ??= (async () => {
+			if (this.getCodec() !== 'mpeg4') {
+				return false;
+			}
+
+			const format = this.streamInfo.format as AVIBitmapInfoHeader;
+			if (format.extraData && hasDivXPackedUserData(format.extraData)) {
+				return true;
+			}
+
+			const firstPacket = this.streamInfo.packets.length > 0 ? await super.readPacket(0) : null;
+			return firstPacket !== null && hasDivXPackedUserData(firstPacket.data);
+		})();
+	}
+
+	/** Reads a packet, unpacked from a packed bitstream as FFmpeg's mpeg4_unpack_bframes bitstream filter does. */
+	protected override async readPacket(packetIndex: number): Promise<EncodedPacket | null> {
+		const packet = await super.readPacket(packetIndex);
+		if (!packet || !(await this.isPackedBitstream())) {
+			return packet;
+		}
+
+		const data = await this.unpackChunk(packetIndex, packet.data);
+		if (!data) {
+			return null;
+		}
+
+		return new EncodedPacket(
+			data,
+			packet.type,
+			packet.timestamp,
+			packet.duration,
+			packet.sequenceNumber,
+			data.byteLength,
+		);
+	}
+
+	/**
+	 * Returns the data a packed chunk plays in its slot, and records the B-VOP it leaves waiting. A chunk of two VOPs
+	 * plays its first and leaves the second waiting; the next chunk of one VOP plays the waiting B-VOP instead of
+	 * itself, and itself waits unless it is an N-VOP; any other chunk plays itself, without the packed marker. Chunks
+	 * keep their timestamps, so the stream stays in decode order, one VOP per chunk.
+	 */
+	private async unpackChunk(packetIndex: number, data: Uint8Array): Promise<Uint8Array | null> {
+		const scan = scanMpeg4Chunk(data);
+		if (scan.secondVopPosition >= 0) {
+			this.storedVopsAfterPackets[packetIndex] = { packetIndex, start: scan.secondVopPosition };
+			return data.subarray(0, scan.secondVopPosition);
+		}
+
+		const storedVop = this.streamInfo.packets[packetIndex]!.isKey
+			? null
+			: await this.getStoredVopAfter(packetIndex - 1);
+		if (storedVop === undefined) {
+			return null;
+		}
+
+		if (scan.vopCount === 1 && storedVop) {
+			this.storedVopsAfterPackets[packetIndex] = data.byteLength <= MPEG4_MAX_NVOP_SIZE
+				? null
+				: { packetIndex, start: 0 };
+			const storedPacket = await super.readPacket(storedVop.packetIndex);
+			return storedPacket ? storedPacket.data.subarray(storedVop.start) : null;
+		}
+
+		this.storedVopsAfterPackets[packetIndex] = storedVop;
+		return scan.packedMarkerPosition >= 0 ? clearPackedMarker(data, scan.packedMarkerPosition) : data;
+	}
+
+	/**
+	 * Returns the B-VOP waiting after a packet, reading back to the last chunk that decides it: one of two VOPs, an
+	 * N-VOP, or a key frame of one VOP. Unlike FFmpeg's filter, which would hold a B-VOP whose N-VOP is missing
+	 * across a key frame, a key frame of one VOP drops it, so a seek to a key frame reads no earlier chunk. Undefined
+	 * if a chunk cannot be read.
+	 */
+	private async getStoredVopAfter(packetIndex: number): Promise<StoredVop | null | undefined> {
+		// The chunks of one VOP or none, newest first, whose waiting B-VOP follows from the one before them
+		const undecidedChunks: { packetIndex: number; vopCount: number }[] = [];
+		let storedVop: StoredVop | null = null;
+		for (let index = packetIndex; index >= 0; index--) {
+			const knownStoredVop = this.storedVopsAfterPackets[index];
+			if (knownStoredVop !== undefined) {
+				storedVop = knownStoredVop;
+				break;
+			}
+
+			const packet = await super.readPacket(index);
+			if (!packet) {
+				return undefined;
+			}
+
+			const scan = scanMpeg4Chunk(packet.data);
+			if (scan.secondVopPosition >= 0) {
+				storedVop = { packetIndex: index, start: scan.secondVopPosition };
+				this.storedVopsAfterPackets[index] = storedVop;
+				break;
+			}
+			if (
+				(scan.vopCount === 1 && packet.data.byteLength <= MPEG4_MAX_NVOP_SIZE)
+				|| (scan.vopCount === 1 && this.streamInfo.packets[index]!.isKey)
+			) {
+				this.storedVopsAfterPackets[index] = null;
+				break;
+			}
+
+			undecidedChunks.push({ packetIndex: index, vopCount: scan.vopCount });
+		}
+
+		for (let i = undecidedChunks.length - 1; i >= 0; i--) {
+			const chunk = undecidedChunks[i]!;
+			if (chunk.vopCount === 1) {
+				storedVop = storedVop ? { packetIndex: chunk.packetIndex, start: 0 } : null;
+			}
+			this.storedVopsAfterPackets[chunk.packetIndex] = storedVop;
+		}
+
+		return storedVop;
 	}
 }
 
