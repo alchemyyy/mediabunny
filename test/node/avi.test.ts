@@ -351,3 +351,50 @@ test('AVI variable-bitrate MP3 is timed one frame per chunk, as FFmpeg reads it'
 	}
 	expect(packetIndex).toBeGreaterThan(1);
 });
+
+test('AVI FLAC and Vorbis tracks carry the decoder description their strf extradata holds', async () => {
+	using flacInput = new Input({
+		source: new FilePathSource('test/public/avi/flac-only.avi'),
+		formats: ALL_FORMATS,
+	});
+	const flacTrack = (await flacInput.getAudioTracks())[0]!;
+	const flacConfig = (await flacTrack.getDecoderConfig())!;
+	const flacDescription = new Uint8Array(flacConfig.description as ArrayBuffer);
+	// 'fLaC', then the last metadata block, a 34-byte STREAMINFO
+	expect([...flacDescription.subarray(0, 8)]).toEqual([0x66, 0x4C, 0x61, 0x43, 0x80, 0x00, 0x00, 34]);
+	expect(flacDescription.byteLength).toBe(42);
+	// STREAMINFO's sample rate is the stream's
+	expect((flacDescription[18]! << 12) | (flacDescription[19]! << 4) | (flacDescription[20]! >> 4))
+		.toBe(await flacTrack.getSampleRate());
+
+	using vorbisInput = new Input({
+		source: new FilePathSource('test/public/avi/vorbis-only.avi'),
+		formats: ALL_FORMATS,
+	});
+	const vorbisConfig = (await (await vorbisInput.getAudioTracks())[0]!.getDecoderConfig())!;
+	const vorbisDescription = new Uint8Array(vorbisConfig.description as ArrayBuffer);
+	// Three Xiph-laced headers, the first the 30-byte identification header
+	expect([...vorbisDescription.subarray(0, 2)]).toEqual([2, 30]);
+	expect(new TextDecoder().decode(vorbisDescription.subarray(4, 10))).toBe('vorbis');
+});
+
+test('AVI FLAC chunks are timed one frame each, whatever block alignment the format declares', async () => {
+	using input = new Input({
+		source: new FilePathSource('test/public/avi/flac-only.avi'),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getAudioTracks())[0]!;
+	const duration = await input.computeDuration();
+
+	let packetCount = 0;
+	let lastEnd = 0;
+	for await (const packet of new PacketCursor(track)) {
+		expect(packet.timestamp).toBeCloseTo(lastEnd, 9);
+		lastEnd = packet.timestamp + packet.duration;
+		packetCount++;
+	}
+	expect(packetCount).toBeGreaterThan(1);
+	// FFmpeg's encoder writes 4608-sample frames, and the file lasts its frames
+	expect(lastEnd).toBeCloseTo(packetCount * 4608 / await track.getSampleRate(), 6);
+	expect(duration).toBeCloseTo(lastEnd, 6);
+});
