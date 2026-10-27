@@ -28,6 +28,10 @@ import {
 	extractAvcDecoderConfigurationRecord,
 	extractHevcDecoderConfigurationRecord,
 	extractVp9CodecInfoFromPacket,
+	HevcNalUnitType,
+	extractNalUnitTypeForHevc,
+	iterateNalUnitsInAnnexB,
+	parseHevcSps,
 } from '../codec-data';
 import { Reader, readBytes, readU32Le } from '../reader';
 import { TrackType } from '../output';
@@ -57,6 +61,8 @@ type StreamInfo = {
 	index: number;
 	/** The samples the chunks seen so far take, in units of scale / rate seconds. */
 	sampleCount: number;
+	/** The codec read from the stream's first chunk, for a stream whose header names none. */
+	identifiedCodec?: VideoCodec;
 };
 
 type PacketInfo = {
@@ -70,6 +76,36 @@ type ChunkInfo = {
 	fourcc: string;
 	size: number;
 	position: number;
+};
+
+// The compression of uncompressed RGB, BI_RGB, which FFmpeg's AVI muxer also writes for a codec it has no tag for
+const UNTAGGED_COMPRESSION = '\0\0\0\0';
+// The bytes of a stream's first chunk that must hold the parameter sets that identify its codec
+const IDENTIFYING_PREFIX_BYTE_COUNT = 4096;
+
+/**
+ * Returns whether a chunk starts with the HEVC parameter sets an Annex B key frame carries: a start code, then a VPS,
+ * an SPS that parses, and a PPS. Uncompressed pictures hold no such structure.
+ */
+const startsWithHevcParameterSets = (data: Uint8Array) => {
+	const startsWithStartCode = data[0] === 0 && data[1] === 0
+		&& (data[2] === 1 || (data[2] === 0 && data[3] === 1));
+	if (!startsWithStartCode) {
+		return false;
+	}
+
+	const found = new Set<number>();
+	for (const location of iterateNalUnitsInAnnexB(data)) {
+		const nalUnit = data.subarray(location.offset, location.offset + location.length);
+		const type = extractNalUnitTypeForHevc(nalUnit[0] ?? 0);
+		if (type === HevcNalUnitType.SPS_NUT && !parseHevcSps(nalUnit)) {
+			return false;
+		}
+		found.add(type);
+	}
+
+	return found.has(HevcNalUnitType.VPS_NUT) && found.has(HevcNalUnitType.SPS_NUT)
+		&& found.has(HevcNalUnitType.PPS_NUT);
 };
 
 const VIDEO_CHUNK_TYPES = ['db', 'dc'];
@@ -324,7 +360,7 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 		if (!codec || format.compression.trim() === '') {
 			codec = aviVideoFourccToCodec(this.streamInfo.header.fccHandler);
 		}
-		return codec;
+		return codec ?? this.streamInfo.identifiedCodec ?? null;
 	}
 
 	getCodedWidth(): number {
@@ -534,8 +570,39 @@ export class AVIDemuxer extends Demuxer {
 		// Process index and create packet info
 		this.processIndex();
 
+		await this.identifyUntaggedVideo();
+
 		// Create tracks
 		this.createTracks();
+	}
+
+	/**
+	 * Identifies HEVC in a video stream whose header names no codec, as FFmpeg's AVI muxer writes HEVC unless given a
+	 * tag: its compression is BI_RGB's zero, and its first chunk starts with HEVC parameter sets. FFmpeg itself reads
+	 * such a stream as uncompressed.
+	 */
+	private async identifyUntaggedVideo() {
+		for (const stream of this.streams) {
+			const { format } = stream;
+			const firstPacket = stream.packets[0];
+			if (
+				stream.header.fccType !== 'vids'
+				|| !('compression' in format)
+				|| format.compression !== UNTAGGED_COMPRESSION
+				|| aviVideoFourccToCodec(stream.header.fccHandler)
+				|| !firstPacket
+			) {
+				continue;
+			}
+
+			const { entry } = firstPacket;
+			const chunkPos = this.indexOffsetsAreAbsolute ? entry.offset : this.moviStart + entry.offset;
+			const byteCount = Math.min(entry.size, IDENTIFYING_PREFIX_BYTE_COUNT);
+			const slice = await this.reader.requestSlice(chunkPos + 8, byteCount);
+			if (slice && startsWithHevcParameterSets(readBytes(slice, byteCount))) {
+				stream.identifiedCodec = 'hevc';
+			}
+		}
 	}
 
 	private async parseChunks(): Promise<void> {

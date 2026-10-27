@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { readFileSync } from 'node:fs';
 import { expect, test, beforeAll } from 'vitest';
 import { Input, Output } from '../../src/index.js';
 import { BufferSource, BufferTarget, FilePathSource } from '../../src/index.js';
@@ -350,4 +351,30 @@ test('AVI variable-bitrate MP3 is timed one frame per chunk, as FFmpeg reads it'
 		packetIndex++;
 	}
 	expect(packetIndex).toBeGreaterThan(1);
+});
+
+test('AVI HEVC is identified under its tags, and under the zero tag FFmpeg\'s muxer writes by default', async () => {
+	const untagged = new Uint8Array(readFileSync('test/public/avi/hevc-untagged.avi'));
+	// The video strf chunk's BITMAPINFOHEADER holds the compression 16 bytes in
+	const strfOffset = Buffer.from(untagged).indexOf('strf');
+	const compressionOffset = strfOffset + 8 + 16;
+	expect([...untagged.subarray(compressionOffset, compressionOffset + 4)]).toEqual([0, 0, 0, 0]);
+
+	for (const tag of ['\0\0\0\0', 'HEVC', 'H265', 'hvc1', 'hev1']) {
+		const bytes = untagged.slice();
+		bytes.set(new TextEncoder().encode(tag), compressionOffset);
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+
+		const track = (await input.getVideoTracks())[0]!;
+		expect(await track.getCodec()).toBe('hevc');
+		expect((await track.getDecoderConfig())!.codec).toMatch(/^hev1\.1\.6\.L\d+\.[0-9A-F.]+$/);
+		expect((await new PacketReader(track).getFirst())!.type).toBe('key');
+	}
+
+	// Uncompressed RGB under the same zero tag stays unidentified
+	using rgbInput = new Input({
+		source: new FilePathSource('test/public/avi/rgb-uncompressed.avi'),
+		formats: ALL_FORMATS,
+	});
+	expect(await rgbInput.getVideoTracks()).toHaveLength(0);
 });
