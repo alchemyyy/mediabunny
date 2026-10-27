@@ -120,6 +120,11 @@ import { Bitstream } from '../../shared/bitstream';
 import { Aes128CbcContext } from '../aes';
 import { Logging } from '../logging';
 
+/** The size of a dvc1 box's VC1DecSpecStruc fields ahead of its sequence header and entry point. */
+const DVC1_HEADER_SIZE = 7;
+/** The dvc1 profile value of the VC-1 Advanced profile. */
+const DVC1_ADVANCED_PROFILE = 12;
+
 type InternalTrack = {
 	unsupportedFeatures: UnsupportedTrackFeature[];
 	id: number;
@@ -1150,6 +1155,9 @@ export class IsobmffDemuxer extends Demuxer {
 							if (track.info.codec !== 'mpeg4') {
 								Logging._warn(`Unsupported video codec (mp4v sample entry without MPEG-4 Visual).`);
 							}
+						} else if (codecName === 'vc-1') {
+							// SMPTE RP 2025; the dvc1 box sets the description
+							track.info.codec = 'vc1';
 						} else if (codecName === null) {
 							Logging._warn(`Unknown encrypted video codec due to missing frma box.`);
 						} else {
@@ -1433,6 +1441,28 @@ export class IsobmffDemuxer extends Demuxer {
 				if (spsInfo) {
 					applySpsPixelAspectRatio(track, spsInfo.pixelAspectRatio);
 				}
+			}; break;
+
+			case 'dvc1': {
+				const track = this.currentTrack;
+				if (!track) {
+					break;
+				}
+				assert(track.info);
+
+				// VC1DecSpecStruc: the profile in the high 4 bits, then level, flags, and frame rate, then the
+				// sequence header and entry point. As in FFmpeg, only the Advanced profile's become the description.
+				if (boxInfo.contentSize < DVC1_HEADER_SIZE) {
+					break;
+				}
+
+				const profile = readU8(slice) >> 4;
+				if (profile !== DVC1_ADVANCED_PROFILE) {
+					break;
+				}
+
+				slice.skip(DVC1_HEADER_SIZE - 1);
+				track.info.codecDescription = readBytes(slice, boxInfo.contentSize - DVC1_HEADER_SIZE);
 			}; break;
 
 			case 'hvcC': {
