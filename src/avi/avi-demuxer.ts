@@ -43,7 +43,7 @@ import {
 import {
 	AVIMainHeader, AVIStreamHeader, AVIBitmapInfoHeader, AVIWaveFormatEx, AVIIndexEntry,
 	parseMainHeader, parseStreamHeader, parseBitmapInfoHeader, parseWaveFormatEx, parseIndexEntry,
-	aviVideoFourccToCodec, aviAudioFormatTagToCodec, parseStreamChunkId, AVIIF_KEYFRAME,
+	aviVideoFourccToCodec, aviWaveFormatToCodec, getWaveFormatCodecTag, parseStreamChunkId, AVIIF_KEYFRAME,
 } from './avi-misc';
 
 type StreamInfo = {
@@ -98,10 +98,11 @@ const getTimingSampleSize = (header: AVIStreamHeader, format: AVIBitmapInfoHeade
 		sampleSize = format.blockAlign;
 	}
 
-	const isFramedAac = WAVE_FORMAT_AAC_TAGS.includes(format.formatTag)
+	const codecTag = getWaveFormatCodecTag(format);
+	const isFramedAac = codecTag !== null && WAVE_FORMAT_AAC_TAGS.includes(codecTag)
 		&& AAC_FRAME_SAMPLE_SIZES.includes(sampleSize)
 		&& format.blockAlign === sampleSize;
-	const isFramedMp3 = format.formatTag === WAVE_FORMAT_MPEG_LAYER_3
+	const isFramedMp3 = codecTag === WAVE_FORMAT_MPEG_LAYER_3
 		&& sampleSize === MP3_FRAME_SAMPLE_SIZE
 		&& format.blockAlign === sampleSize;
 	if (isFramedAac || isFramedMp3) {
@@ -429,8 +430,7 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 	}
 
 	override getCodec(): AudioCodec | null {
-		const format = this.streamInfo.format as AVIWaveFormatEx;
-		return aviAudioFormatTagToCodec(format.formatTag, format.bitsPerSample);
+		return aviWaveFormatToCodec(this.streamInfo.format as AVIWaveFormatEx);
 	}
 
 	getNumberOfChannels(): number {

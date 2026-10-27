@@ -66,8 +66,79 @@ export interface AVIWaveFormatEx {
 	blockAlign: number;
 	bitsPerSample: number;
 	cbSize?: number;
+	/** Codec extradata, after the WAVE_FORMAT_EXTENSIBLE fields when the format has them. */
 	extraData?: Uint8Array;
+	/** The WAVE_FORMAT_EXTENSIBLE fields, present when formatTag is WAVE_FORMAT_EXTENSIBLE. */
+	extensible?: AVIWaveFormatExtensible;
 }
+
+export interface AVIWaveFormatExtensible {
+	validBitsPerSample: number;
+	/** The speakers the channels carry, in the order of their bits, as the WAVE channel mask. */
+	channelMask: number;
+	/** The format tag the SubFormat GUID carries, or null when the GUID names a codec instead. */
+	subFormatTag: number | null;
+	/** The codec a SubFormat GUID outside the tag-carrying bases names, or null. */
+	subFormatCodec: AudioCodec | null;
+}
+
+export const WAVE_FORMAT_EXTENSIBLE = 0xFFFE;
+const WAVE_FORMAT_EXTENSIBLE_SIZE = 22;
+
+// The last 12 bytes of the SubFormat GUIDs whose first 4 bytes are a format tag, as FFmpeg's riffdec reads them: the
+// media subtype base, the ambisonic base, and a broken base some muxers write
+const SUBFORMAT_TAG_BASE_GUIDS = [
+	[0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
+	[0x21, 0x07, 0xD3, 0x11, 0x86, 0x44, 0xC8, 0xC1, 0xCA, 0x00, 0x00, 0x00],
+	[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA],
+];
+
+// The SubFormat GUIDs FFmpeg's riff.c maps to a codec Mediabunny knows
+const SUBFORMAT_GUID_TO_CODEC: { guid: number[]; codec: AudioCodec }[] = [
+	{
+		guid: [0x2C, 0x80, 0x6D, 0xE0, 0x46, 0xDB, 0xCF, 0x11, 0xB4, 0xD1, 0x00, 0x80, 0x5F, 0x6C, 0xBB, 0xEA],
+		codec: 'ac3',
+	},
+	{
+		guid: [0xAF, 0x87, 0xFB, 0xA7, 0x02, 0x2D, 0xFB, 0x42, 0xA4, 0xD4, 0x05, 0xCD, 0x93, 0x84, 0x3B, 0xDD],
+		codec: 'eac3',
+	},
+];
+
+const bytesEqual = (bytes: Uint8Array, expected: number[]) =>
+	bytes.length === expected.length && expected.every((value, i) => bytes[i] === value);
+
+const parseWaveFormatExtensible = (data: DataView, offset: number): AVIWaveFormatExtensible => {
+	const subFormat = new Uint8Array(data.buffer, data.byteOffset + offset + 6, 16);
+	const carriesTag = SUBFORMAT_TAG_BASE_GUIDS.some(base => bytesEqual(subFormat.subarray(4), base));
+
+	return {
+		validBitsPerSample: data.getUint16(offset, true),
+		channelMask: data.getUint32(offset + 2, true),
+		subFormatTag: carriesTag ? data.getUint32(offset + 6, true) : null,
+		subFormatCodec: carriesTag
+			? null
+			: SUBFORMAT_GUID_TO_CODEC.find(entry => bytesEqual(subFormat, entry.guid))?.codec ?? null,
+	};
+};
+
+/** Returns the format tag that identifies a format's codec: its SubFormat's for WAVE_FORMAT_EXTENSIBLE. */
+export const getWaveFormatCodecTag = (format: AVIWaveFormatEx): number | null => {
+	if (format.formatTag !== WAVE_FORMAT_EXTENSIBLE) {
+		return format.formatTag;
+	}
+	return format.extensible?.subFormatTag ?? null;
+};
+
+/** Returns the codec a WAVEFORMATEX or WAVE_FORMAT_EXTENSIBLE header declares, or null when Mediabunny lacks it. */
+export const aviWaveFormatToCodec = (format: AVIWaveFormatEx): AudioCodec | null => {
+	const tag = getWaveFormatCodecTag(format);
+	if (tag === null) {
+		return format.extensible?.subFormatCodec ?? null;
+	}
+	// The container sample size, not the valid bits, lays out the samples
+	return aviAudioFormatTagToCodec(tag, format.bitsPerSample);
+};
 
 export interface AVIIndexEntry {
 	ckid: string;
@@ -264,11 +335,19 @@ export function parseWaveFormatEx(data: DataView): AVIWaveFormatEx {
 
 	let cbSize = 0;
 	let extraData: Uint8Array | undefined;
+	let extensible: AVIWaveFormatExtensible | undefined;
 
 	if (data.byteLength >= 18) {
-		cbSize = data.getUint16(16, true);
-		if (cbSize > 0 && data.byteLength >= 18 + cbSize) {
-			extraData = new Uint8Array(data.buffer, data.byteOffset + 18, cbSize);
+		// Like FFmpeg, read only as much of the extension as the chunk holds
+		cbSize = Math.min(data.getUint16(16, true), data.byteLength - 18);
+		let extraDataStart = 18;
+		if (formatTag === WAVE_FORMAT_EXTENSIBLE && cbSize >= WAVE_FORMAT_EXTENSIBLE_SIZE) {
+			extensible = parseWaveFormatExtensible(data, 18);
+			extraDataStart += WAVE_FORMAT_EXTENSIBLE_SIZE;
+		}
+		const extraDataSize = cbSize - (extraDataStart - 18);
+		if (extraDataSize > 0) {
+			extraData = new Uint8Array(data.buffer, data.byteOffset + extraDataStart, extraDataSize);
 		}
 	}
 
@@ -281,6 +360,7 @@ export function parseWaveFormatEx(data: DataView): AVIWaveFormatEx {
 		bitsPerSample,
 		cbSize,
 		extraData,
+		extensible,
 	};
 }
 
