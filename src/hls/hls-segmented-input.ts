@@ -26,6 +26,9 @@ import {
 	base64ToBytes,
 	MaybeRelevantPromise,
 	ResultValue,
+	clamp,
+	isThenable,
+	textDecoder,
 } from '../misc';
 import { readAllLines, readBytes, Reader } from '../reader';
 import { CustomPathedSource, PathedSource, ReadableStreamSource, SourceRef, SourceRequest } from '../source';
@@ -53,6 +56,7 @@ const IV_STRING_REGEX = /^0[xX][0-9a-fA-F]+$/;
 const BASE64_DATA_URI_REGEX = /^data:.*;base64,/i;
 
 export type HlsSegment = Segment & {
+	index: number; // In the segment list, -1 for init segments
 	sequenceNumber: number | null;
 	location: HlsSegmentLocation;
 	encryption: HlsEncryptionInfo | null;
@@ -76,6 +80,9 @@ export type HlsSegmentLocation = {
 	offset: number;
 	length: number | null;
 };
+
+// Way more than any real duration, but small enough to keep all timestamp (and derived sequence number) math finite
+const MAX_DURATION = 1e9; // In seconds
 
 export class HlsSegmentedInput extends SegmentedInput {
 	rootPath: string;
@@ -140,6 +147,18 @@ export class HlsSegmentedInput extends SegmentedInput {
 		if (!lines) {
 			using ref = await this.demuxer.input._getSourceUncached({ path: this.rootPath, isRoot: false });
 			const reader = new Reader(ref.source);
+
+			// Check the start first, so that we don't read some (potentially huge) file in its entirety that isn't even
+			// a playlist
+			let headerSlice = reader.requestSliceRange(0, 0, 64);
+			if (isThenable(headerSlice)) headerSlice = await headerSlice;
+
+			if (headerSlice) {
+				const header = textDecoder.decode(readBytes(headerSlice, headerSlice.length));
+				if (!header.trimStart().startsWith('#EXTM3U')) {
+					throw new Error('Invalid M3U8 file; expected first line to be #EXTM3U.');
+				}
+			}
 
 			const slice = await reader.requestEntireFile();
 			assert(slice);
@@ -254,6 +273,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 					};
 
 					const segment: HlsSegment = {
+						index: this.segments.length,
 						timestamp: accumulatedTime,
 						unixEpochTimestamp: accumulatedUnixTime,
 						firstSegment: currentFirstSegment,
@@ -306,7 +326,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				const commaIndex = extinfContent.indexOf(',');
 				const durationStr = commaIndex === -1 ? extinfContent : extinfContent.slice(0, commaIndex);
 				const duration = Number(durationStr);
-				if (!Number.isFinite(duration) || duration < 0) {
+				if (!Number.isFinite(duration) || duration < 0 || duration > MAX_DURATION) {
 					throw new Error(`Invalid #EXTINF tag duration '${durationStr}'.`);
 				}
 
@@ -344,6 +364,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 					}
 
 					const segment: HlsSegment = {
+						index: -1,
 						timestamp: accumulatedTime,
 						unixEpochTimestamp: accumulatedUnixTime,
 						firstSegment: null,
@@ -457,7 +478,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 				const value = line.slice(TAG_MEDIA_SEQUENCE.length);
 				const number = Number(value);
 
-				if (!Number.isInteger(number) || number < 0) {
+				if (!Number.isSafeInteger(number) || number < 0) {
 					throw new Error(`Invalid EXT-X-MEDIA-SEQUENCE value '${value}'.`);
 				}
 
@@ -525,11 +546,11 @@ export class HlsSegmentedInput extends SegmentedInput {
 				const value = line.slice(TAG_TARGETDURATION.length);
 				const duration = Number(value);
 
-				if (!Number.isFinite(duration) || duration < 0) {
+				if (!Number.isFinite(duration) || duration < 0 || duration > MAX_DURATION) {
 					throw new Error(`Invalid EXT-X-TARGETDURATION value '${value}'.`);
 				}
 
-				this.refreshInterval = duration;
+				this.refreshInterval = clamp(duration, 0.5, 3600); // Clamped for safety
 				targetDuration = duration;
 			} else if (line === TAG_ENDLIST) {
 				this.streamHasEnded = true;
@@ -604,7 +625,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 		segment: Segment,
 		options: SegmentRetrievalOptions,
 	): MaybeRelevantPromise {
-		const index = this.segments.indexOf(segment as HlsSegment);
+		const index = (segment as HlsSegment).index;
 		assert(index !== -1);
 
 		const nextIndex = index + 1;
@@ -638,7 +659,7 @@ export class HlsSegmentedInput extends SegmentedInput {
 	}
 
 	async getPreviousSegment(res: ResultValue<SegmentRetrievalResult>, segment: Segment): MaybeRelevantPromise {
-		const index = this.segments.indexOf(segment as HlsSegment);
+		const index = (segment as HlsSegment).index;
 		assert(index !== -1);
 
 		return res.set(new SegmentRetrievalResult(this.segments[index - 1] ?? null));

@@ -2232,7 +2232,7 @@ export class Conversion {
 			audioSource = source;
 
 			this._registerTrackPump(async (pump) => {
-				let needsPadding: boolean | null = null;
+				let paddingLengthInSamples: number | null = null;
 
 				await using cursor = new AudioSampleCursor(track);
 				await cursor.seekTo(this._startTimestamp);
@@ -2277,17 +2277,16 @@ export class Conversion {
 						timestamp: sourceSample.timestamp + this._timestampOffset,
 					});
 
-					if (needsPadding === null) {
-						needsPadding = finalSample.timestamp > 0 && !this.output.format.supportsTimestampedMediaData;
+					if (paddingLengthInSamples === null) {
+						paddingLengthInSamples = this.output.format.supportsTimestampedMediaData
+							? 0
+							: Math.round(finalSample.timestamp * originalSampleRate);
 					}
 
-					if (needsPadding) {
+					if (paddingLengthInSamples > 0) {
 						// Add one padding sample at the beginning
-						const paddingLength = finalSample.timestamp;
-						const paddingLengthSamples = Math.round(paddingLength * originalSampleRate);
-
 						const bytesPerSample = getBytesPerSample(sample.format);
-						const data = new Uint8Array(bytesPerSample * paddingLengthSamples * originalNumberOfChannels);
+						const data = new Uint8Array(bytesPerSample * paddingLengthInSamples * originalNumberOfChannels);
 						if (sample.format === 'u8' || sample.format === 'u8-planar') {
 							data.fill(2 ** 7); // Fill it with the silent value
 						}
@@ -2305,7 +2304,7 @@ export class Conversion {
 							pump, silentSample, source, outputTrackId, () => lastSampleTimestamp,
 						);
 
-						needsPadding = false;
+						paddingLengthInSamples = 0;
 					}
 
 					await this._registerAudioSample(

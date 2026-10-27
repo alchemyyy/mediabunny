@@ -1312,7 +1312,10 @@ export class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 
 		const inputView = toDataView(packet.data);
 
-		const numberOfFrames = packet.byteLength / this.decoderConfig.numberOfChannels / this.inputSampleSize;
+		// A trailing partial frame (only in malformed files) gets dropped
+		const numberOfFrames = Math.floor(
+			packet.byteLength / this.decoderConfig.numberOfChannels / this.inputSampleSize,
+		);
 
 		const outputBufferSize = numberOfFrames * this.decoderConfig.numberOfChannels * this.outputSampleSize;
 		const outputBuffer = new ArrayBuffer(outputBufferSize);

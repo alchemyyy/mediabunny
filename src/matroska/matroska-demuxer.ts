@@ -112,6 +112,7 @@ type Segment = {
 	muxingApp: string | null;
 	seekEntries: SeekEntry[];
 	tracks: InternalTrack[];
+	idToTrack: Map<number, InternalTrack>;
 	cuePoints: CuePoint[];
 
 	dataStartPos: number;
@@ -123,9 +124,10 @@ type Segment = {
 	 * same cluster in quick succession.
 	 */
 	lastReadCluster: Cluster | null;
+	clusterSummaries: Map<number, ClusterSummary>; // Keyed by cluster position
 
 	metadataTags: MetadataTags;
-	metadataTagsCollected: boolean;
+	metadataTagsPromise: Promise<void> | null;
 };
 
 type SeekEntry = {
@@ -140,6 +142,11 @@ type Cluster = {
 	dataStartPos: number;
 	timestamp: number;
 	trackData: Map<number, ClusterTrackData>;
+};
+
+type ClusterSummary = {
+	elementEndPos: number;
+	trackIds: Set<number>; // The tracks with blocks in the cluster
 };
 
 type ClusterTrackData = {
@@ -274,6 +281,7 @@ const METADATA_ELEMENTS = [
 	{ id: EBMLId.Cues, flag: 'cuesSeen' },
 ] as const;
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
+const MAX_ELEMENT_NESTING_DEPTH = 64;
 
 const MATROSKA_FLAG_INTERLACED_UNDETERMINED = 0;
 const MATROSKA_FLAG_INTERLACED_INTERLACED = 1;
@@ -334,6 +342,8 @@ export class MatroskaDemuxer extends Demuxer {
 	} | null = null;
 
 	isWebM = false;
+	claimedSeekTargets = new Set<number>();
+	elementNestingDepth = 0;
 
 	constructor(input: Input) {
 		super(input);
@@ -367,15 +377,16 @@ export class MatroskaDemuxer extends Demuxer {
 
 		// Load metadata tags from each segment lazily (only once)
 		for (const segment of this.segments) {
-			if (!segment.metadataTagsCollected) {
+			if (!segment.metadataTagsPromise) {
 				if (this.reader.fileSize !== null) {
-					await this.loadSegmentMetadata(segment);
+					segment.metadataTagsPromise = this.loadSegmentMetadata(segment);
 				} else {
 					// The seeking would be too crazy, let's not
+					segment.metadataTagsPromise = Promise.resolve();
 				}
-
-				segment.metadataTagsCollected = true;
 			}
+
+			await segment.metadataTagsPromise;
 		}
 
 		// This is kinda handwavy, and how we handle multiple segments isn't suuuuper well-defined anyway; so we just
@@ -475,6 +486,7 @@ export class MatroskaDemuxer extends Demuxer {
 			duration: -1,
 			seekEntries: [],
 			tracks: [],
+			idToTrack: new Map(),
 			cuePoints: [],
 
 			dataStartPos: segmentDataStart,
@@ -484,9 +496,10 @@ export class MatroskaDemuxer extends Demuxer {
 			clusterSeekStartPos: segmentDataStart,
 
 			lastReadCluster: null,
+			clusterSummaries: new Map(),
 
 			metadataTags: {},
-			metadataTagsCollected: false,
+			metadataTagsPromise: null,
 			muxingApp: null,
 		};
 		this.segments.push(this.currentSegment);
@@ -503,11 +516,12 @@ export class MatroskaDemuxer extends Demuxer {
 			const header = readElementHeader(slice);
 
 			if (!header || (!LEVEL_1_EBML_IDS.includes(header.id) && header.id !== EBMLId.Void)) {
-				// Potential junk. Let's try to resync
+				// Potential junk. Let's try to resync (skipping the current position, which might hold a valid ID
+				// followed by a broken size)
 
 				const nextPos = await resync(
 					this.reader,
-					elementStartPos,
+					elementStartPos + 1,
 					LEVEL_1_EBML_IDS,
 					Math.min(this.currentSegment.elementEndPos ?? Infinity, elementStartPos + MAX_RESYNC_LENGTH),
 				);
@@ -570,16 +584,17 @@ export class MatroskaDemuxer extends Demuxer {
 
 		if (this.reader.fileSize !== null) {
 			// Seek heads can sometimes point to other seek heads, so follow them until there are no unvisited
-			// ones left.
-			while (true) {
-				const seekEntry = this.currentSegment.seekEntries.find(x =>
-					x.id === EBMLId.SeekHead && !visitedSeekHeadPositions.has(x.segmentPosition),
-				);
-				if (!seekEntry) {
-					break;
+			// ones left. Following a seek head appends its entries to the list we're iterating over.
+			for (let i = 0; i < this.currentSegment.seekEntries.length; i++) {
+				const seekEntry = this.currentSegment.seekEntries[i]!;
+				if (seekEntry.id !== EBMLId.SeekHead || visitedSeekHeadPositions.has(seekEntry.segmentPosition)) {
+					continue;
 				}
 
 				visitedSeekHeadPositions.add(seekEntry.segmentPosition);
+				if (!this.claimSeekTarget(segmentDataStart + seekEntry.segmentPosition)) {
+					continue;
+				}
 
 				let slice = this.reader.requestSliceRange(
 					segmentDataStart + seekEntry.segmentPosition,
@@ -615,6 +630,7 @@ export class MatroskaDemuxer extends Demuxer {
 				}
 
 				if (this.currentSegment[target.flag]) continue;
+				if (!this.claimSeekTarget(segmentDataStart + seekEntry.segmentPosition)) continue;
 
 				let slice = this.reader.requestSliceRange(
 					segmentDataStart + seekEntry.segmentPosition,
@@ -656,31 +672,26 @@ export class MatroskaDemuxer extends Demuxer {
 			}
 		}
 
-		// Now, let's distribute the cue points to the tracks
-		const idToTrack = new Map(this.currentSegment.tracks.map(x => [x.id, x]));
-
 		// Assign cue points to their respective tracks
 		for (const cuePoint of this.currentSegment.cuePoints) {
-			const track = idToTrack.get(cuePoint.trackId);
+			const track = this.currentSegment.idToTrack.get(cuePoint.trackId);
 			if (track) {
 				track.cuePoints.push(cuePoint);
 			}
 		}
 
 		for (const track of this.currentSegment.tracks) {
-			// Sort cue points by time
-			track.cuePoints.sort((a, b) => a.time - b.time);
+			// Sort cue points by time and remove multiple cue points for the same time
+			const cuePoints = track.cuePoints;
+			cuePoints.sort((a, b) => a.time - b.time);
 
-			// Remove multiple cue points for the same time
-			for (let i = 0; i < track.cuePoints.length - 1; i++) {
-				const cuePoint1 = track.cuePoints[i]!;
-				const cuePoint2 = track.cuePoints[i + 1]!;
-
-				if (cuePoint1.time === cuePoint2.time) {
-					track.cuePoints.splice(i + 1, 1);
-					i--;
+			let writeIndex = 0;
+			for (const cuePoint of cuePoints) {
+				if (writeIndex === 0 || cuePoint.time !== cuePoints[writeIndex - 1]!.time) {
+					cuePoints[writeIndex++] = cuePoint;
 				}
 			}
+			cuePoints.length = writeIndex;
 		}
 
 		let trackWithMostCuePoints: InternalTrack | null = null;
@@ -749,13 +760,18 @@ export class MatroskaDemuxer extends Demuxer {
 			timestamp: -1,
 			trackData: new Map(),
 		};
-		this.currentCluster = cluster;
-
 		if (dataSlice) {
-			// Read the children of the cluster, stopping early at level 0 or 1 EBML elements. We do this because some
-			// clusters have incorrect sizes that are too large
-			const endPos = this.readContiguousElements(dataSlice, LEVEL_0_AND_1_EBML_IDS);
-			cluster.elementEndPos = endPos;
+			this.currentCluster = cluster;
+
+			try {
+				// Read the children of the cluster, stopping early at level 0 or 1 EBML elements. We do this because
+				// some clusters have incorrect sizes that are too large
+				const endPos = this.readContiguousElements(dataSlice, LEVEL_0_AND_1_EBML_IDS);
+				cluster.elementEndPos = endPos;
+			} finally {
+				this.currentCluster = null;
+				this.currentBlock = null;
+			}
 		}
 
 		for (const [, trackData] of cluster.trackData) {
@@ -804,7 +820,7 @@ export class MatroskaDemuxer extends Demuxer {
 				// Perform lace resolution. Here, we expand each laced block into multiple blocks where each contains
 				// one frame of the lace. We do this after determining block timestamps so we can properly distribute
 				// the block's duration across the laced frames.
-				this.expandLacedBlocks(trackData.blocks, track);
+				trackData.blocks = this.expandLacedBlocks(trackData.blocks, track);
 
 				// Recompute since blocks have changed
 				trackData.presentationTimestamps = trackData.blocks
@@ -824,9 +840,13 @@ export class MatroskaDemuxer extends Demuxer {
 				trackData.startTimestamp,
 				x => x.startTimestamp,
 			);
+			const previousEntry = track.clusterPositionCache[insertionIndex];
+			const nextEntry = track.clusterPositionCache[insertionIndex + 1];
+
+			// Only remember it if the timestamp order matches the cluster position order
 			if (
-				insertionIndex === -1
-				|| track.clusterPositionCache[insertionIndex]!.elementStartPos !== elementStartPos
+				(!previousEntry || previousEntry.elementStartPos < elementStartPos)
+				&& (!nextEntry || nextEntry.elementStartPos > elementStartPos)
 			) {
 				track.clusterPositionCache.splice(insertionIndex + 1, 0, {
 					elementStartPos: cluster.elementStartPos,
@@ -836,13 +856,18 @@ export class MatroskaDemuxer extends Demuxer {
 		}
 
 		segment.lastReadCluster = cluster;
+		segment.clusterSummaries.set(startPos, {
+			elementEndPos: cluster.elementEndPos,
+			trackIds: new Set(cluster.trackData.keys()),
+		});
+
 		return res.set(cluster);
 	}
 
 	getTrackDataInCluster(cluster: Cluster, trackNumber: number) {
 		let trackData = cluster.trackData.get(trackNumber);
 		if (!trackData) {
-			const track = cluster.segment.tracks.find(x => x.id === trackNumber);
+			const track = cluster.segment.idToTrack.get(trackNumber);
 			if (!track) {
 				return null;
 			}
@@ -864,16 +889,19 @@ export class MatroskaDemuxer extends Demuxer {
 	expandLacedBlocks(blocks: ClusterBlock[], track: InternalTrack) {
 		// https://www.matroska.org/technical/notes.html#block-lacing
 
-		for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
-			const originalBlock = blocks[blockIndex]!;
+		const expandedBlocks: ClusterBlock[] = [];
+
+		for (const originalBlock of blocks) {
 			if (originalBlock.lacing === BlockLacing.None) {
+				expandedBlocks.push(originalBlock);
 				continue;
 			}
 
-			// The lacing data itself is never content-encoded; content encoding applies to each laced frame
-			// individually, so the frames are split from the stored data and decoded lazily one by one.
-			// https://www.matroska.org/technical/notes.html#contentcompression
+			// Content encodings apply to each frame, excluding the lacing data, so the frames get decoded lazily later
 			const slice = FileSlice.tempFromBytes(originalBlock.data);
+			if (slice.length === 0) {
+				throw new Error('Invalid laced block: no data.');
+			}
 
 			const frameSizes: number[] = [];
 			const frameCount = readU8(slice) + 1;
@@ -916,7 +944,9 @@ export class MatroskaDemuxer extends Demuxer {
 				case BlockLacing.Ebml: {
 					// EBML lacing: first size absolute, subsequent ones are coded as signed differences from the last
 					const firstResult = readVarInt(slice);
-					assert(firstResult !== null); // Assume it's not an invalid VINT
+					if (firstResult === null) {
+						throw new Error('Invalid EBML lacing: bad frame size.');
+					}
 
 					let currentSize = firstResult;
 					frameSizes.push(currentSize);
@@ -926,7 +956,9 @@ export class MatroskaDemuxer extends Demuxer {
 					for (let i = 1; i < frameCount - 1; i++) {
 						const startPos = slice.bufferPos;
 						const diffResult = readVarInt(slice);
-						assert(diffResult !== null);
+						if (diffResult === null) {
+							throw new Error('Invalid EBML lacing: bad frame size.');
+						}
 
 						const unsignedDiff = diffResult;
 						const width = slice.bufferPos - startPos;
@@ -946,13 +978,14 @@ export class MatroskaDemuxer extends Demuxer {
 				default: assert(false);
 			}
 
-			assert(frameSizes.length === frameCount);
-
-			blocks.splice(blockIndex, 1); // Remove the original block
+			// Every frame must hold actual data; this also catches frame sizes that exceed the block
+			if (frameSizes.length !== frameCount || frameSizes.some(x => x <= 0)) {
+				throw new Error('Invalid block lacing: frame sizes don\'t match the block.');
+			}
 
 			const blockDuration = originalBlock.duration || frameCount * (track.defaultDuration ?? 0);
 
-			// Now, let's insert each frame as its own block
+			// Now, let's replace the block with one block per frame
 			for (let i = 0; i < frameCount; i++) {
 				const frameSize = frameSizes[i]!;
 				const frameData = readBytes(slice, frameSize);
@@ -961,7 +994,7 @@ export class MatroskaDemuxer extends Demuxer {
 				const frameTimestamp = originalBlock.timestamp + (blockDuration * i / frameCount);
 				const frameDuration = blockDuration / frameCount;
 
-				blocks.splice(blockIndex + i, 0, {
+				expandedBlocks.push({
 					timestamp: frameTimestamp,
 					duration: frameDuration,
 					isKeyFrame: originalBlock.isKeyFrame,
@@ -973,10 +1006,9 @@ export class MatroskaDemuxer extends Demuxer {
 					otherAdditionals: originalBlock.otherAdditionals,
 				});
 			}
-
-			blockIndex += frameCount; // Skip the blocks we just added
-			blockIndex--;
 		}
+
+		return expandedBlocks;
 	}
 
 	async loadSegmentMetadata(segment: Segment) {
@@ -986,6 +1018,10 @@ export class MatroskaDemuxer extends Demuxer {
 			} else if (seekEntry.id === EBMLId.Attachments && !segment.attachmentsSeen) {
 				// We need to load the attachments
 			} else {
+				continue;
+			}
+
+			if (!this.claimSeekTarget(segment.dataStartPos + seekEntry.segmentPosition)) {
 				continue;
 			}
 
@@ -1003,16 +1039,19 @@ export class MatroskaDemuxer extends Demuxer {
 			const { size } = header;
 			assertDefinedSize(size);
 
-			assert(!this.currentSegment);
-			this.currentSegment = segment;
-
 			let dataSlice = this.reader.requestSlice(slice.filePos, size);
 			if (isThenable(dataSlice)) dataSlice = await dataSlice;
 			if (dataSlice) {
-				this.readContiguousElements(dataSlice);
-			}
+				// No awaiting while the segment is set, so concurrent calls can't interfere with each other
+				assert(!this.currentSegment);
+				this.currentSegment = segment;
 
-			this.currentSegment = null;
+				try {
+					this.readContiguousElements(dataSlice);
+				} finally {
+					this.currentSegment = null;
+				}
+			}
 
 			// Mark as seen
 			if (seekEntry.id === EBMLId.Tags) {
@@ -1023,17 +1062,36 @@ export class MatroskaDemuxer extends Demuxer {
 		}
 	}
 
-	readContiguousElements(slice: FileSlice, stopIds?: number[]) {
-		while (slice.remainingLength >= MIN_HEADER_SIZE) {
-			const startPos = slice.filePos;
-			const foundElement = this.traverseElement(slice, stopIds);
-
-			if (!foundElement) {
-				return startPos;
-			}
+	claimSeekTarget(position: number) {
+		if (this.claimedSeekTargets.has(position)) {
+			return false;
 		}
 
-		return slice.filePos;
+		this.claimedSeekTargets.add(position);
+		return true;
+	}
+
+	readContiguousElements(slice: FileSlice, stopIds?: number[]) {
+		if (this.elementNestingDepth === MAX_ELEMENT_NESTING_DEPTH) {
+			throw new Error('Invalid file: elements are nested too deeply.');
+		}
+
+		this.elementNestingDepth++;
+
+		try {
+			while (slice.remainingLength >= MIN_HEADER_SIZE) {
+				const startPos = slice.filePos;
+				const foundElement = this.traverseElement(slice, stopIds);
+
+				if (!foundElement) {
+					return startPos;
+				}
+			}
+
+			return slice.filePos;
+		} finally {
+			this.elementNestingDepth--;
+		}
 	}
 
 	traverseElement(slice: FileSlice, stopIds?: number[]): boolean {
@@ -1049,6 +1107,10 @@ export class MatroskaDemuxer extends Demuxer {
 		const { id, size } = header;
 		const dataStartPos = slice.filePos;
 		assertDefinedSize(size);
+
+		if (dataStartPos + size > slice.end) {
+			return false; // The element doesn't fit into its parent
+		}
 
 		switch (id) {
 			case EBMLId.DocType: {
@@ -1083,8 +1145,13 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.TimestampScale: {
 				if (!this.currentSegment) break;
 
-				this.currentSegment.timestampScale = readUnsignedInt(slice, size);
-				this.currentSegment.timestampFactor = 1e9 / this.currentSegment.timestampScale;
+				const timestampScale = readUnsignedInt(slice, size);
+				if (timestampScale === 0) {
+					throw new Error('Invalid TimestampScale element: must not be 0.');
+				}
+
+				this.currentSegment.timestampScale = timestampScale;
+				this.currentSegment.timestampFactor = 1e9 / timestampScale;
 			}; break;
 
 			case EBMLId.Duration: {
@@ -1139,6 +1206,12 @@ export class MatroskaDemuxer extends Demuxer {
 						|| instruction.data.algorithm !== ContentCompAlgo.HeaderStripping;
 				})) {
 					Logging._warn(`Track #${this.currentTrack.id} has an unsupported content encoding; dropping.`);
+					this.currentTrack = null;
+				}
+
+				if (this.currentTrack && this.currentSegment.idToTrack.has(this.currentTrack.id)) {
+					// Blocks can't tell the tracks apart
+					Logging._warn(`Track #${this.currentTrack.id} is defined more than once; dropping.`);
 					this.currentTrack = null;
 				}
 
@@ -1219,6 +1292,7 @@ export class MatroskaDemuxer extends Demuxer {
 						const videoTrack = this.currentTrack as InternalVideoTrack;
 						this.currentTrack.trackBacking = new MatroskaVideoTrackBacking(videoTrack);
 						this.currentSegment.tracks.push(this.currentTrack);
+						this.currentSegment.idToTrack.set(this.currentTrack.id, this.currentTrack);
 					} else if (this.currentTrack.info.type === 'audio') {
 						if (codecIdWithoutSuffix === CODEC_STRING_MAP.aac) {
 							this.currentTrack.info.codec = 'aac';
@@ -1284,6 +1358,7 @@ export class MatroskaDemuxer extends Demuxer {
 						const audioTrack = this.currentTrack as InternalAudioTrack;
 						this.currentTrack.trackBacking = new MatroskaAudioTrackBacking(audioTrack);
 						this.currentSegment.tracks.push(this.currentTrack);
+						this.currentSegment.idToTrack.set(this.currentTrack.id, this.currentTrack);
 					}
 				}
 
@@ -1585,13 +1660,23 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.SamplingFrequency: {
 				if (this.currentTrack?.info?.type !== 'audio') break;
 
-				this.currentTrack.info.sampleRate = readFloat(slice, size);
+				const sampleRate = readFloat(slice, size);
+				if (!(sampleRate > 0) || !Number.isFinite(sampleRate)) {
+					throw new Error('Invalid SamplingFrequency element: must be a positive, finite number.');
+				}
+
+				this.currentTrack.info.sampleRate = sampleRate;
 			}; break;
 
 			case EBMLId.Channels: {
 				if (this.currentTrack?.info?.type !== 'audio') break;
 
-				this.currentTrack.info.numberOfChannels = readUnsignedInt(slice, size);
+				const numberOfChannels = readUnsignedInt(slice, size);
+				if (numberOfChannels === 0) {
+					throw new Error('Invalid Channels element: must not be 0.');
+				}
+
+				this.currentTrack.info.numberOfChannels = numberOfChannels;
 			}; break;
 
 			case EBMLId.BitDepth: {
@@ -1612,8 +1697,7 @@ export class MatroskaDemuxer extends Demuxer {
 			}; break;
 
 			case EBMLId.CueTrackPositions: {
-				if (this.currentCueTime === null) break;
-				assert(this.currentSegment);
+				if (this.currentCueTime === null || !this.currentSegment) break;
 
 				const cuePoint: CuePoint = { time: this.currentCueTime, trackId: -1, clusterPosition: -1 };
 				this.currentSegment.cuePoints.push(cuePoint);
@@ -1648,15 +1732,17 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.SimpleBlock: {
 				if (!this.currentCluster) break;
 
-				const trackNumber = readVarInt(slice);
-				if (trackNumber === null) break;
+				const blockSlice = slice.slice(dataStartPos, size);
+
+				const trackNumber = readVarInt(blockSlice);
+				if (trackNumber === null || blockSlice.remainingLength < 3) break;
 
 				const trackData = this.getTrackDataInCluster(this.currentCluster, trackNumber);
 				if (!trackData) break; // Not a track we care about
 
-				const relativeTimestamp = readI16Be(slice);
+				const relativeTimestamp = readI16Be(blockSlice);
 
-				const flags = readU8(slice);
+				const flags = readU8(blockSlice);
 				const lacing = (flags >> 1) & 0x3 as BlockLacing; // If the block is laced, we'll expand it later
 
 				let isKeyFrame = !!(flags & 0x80);
@@ -1668,7 +1754,7 @@ export class MatroskaDemuxer extends Demuxer {
 					isKeyFrame = true;
 				}
 
-				const blockData = readBytes(slice, size - (slice.filePos - dataStartPos));
+				const blockData = readBytes(blockSlice, blockSlice.remainingLength);
 				const hasDecodingInstructions = trackData.track.decodingInstructions.length > 0;
 
 				trackData.blocks.push({
@@ -1695,18 +1781,20 @@ export class MatroskaDemuxer extends Demuxer {
 			case EBMLId.Block: {
 				if (!this.currentCluster) break;
 
-				const trackNumber = readVarInt(slice);
-				if (trackNumber === null) break;
+				const blockSlice = slice.slice(dataStartPos, size);
+
+				const trackNumber = readVarInt(blockSlice);
+				if (trackNumber === null || blockSlice.remainingLength < 3) break;
 
 				const trackData = this.getTrackDataInCluster(this.currentCluster, trackNumber);
 				if (!trackData) break;
 
-				const relativeTimestamp = readI16Be(slice);
+				const relativeTimestamp = readI16Be(blockSlice);
 
-				const flags = readU8(slice);
+				const flags = readU8(blockSlice);
 				const lacing = (flags >> 1) & 0x3 as BlockLacing; // If the block is laced, we'll expand it later
 
-				const blockData = readBytes(slice, size - (slice.filePos - dataStartPos));
+				const blockData = readBytes(blockSlice, blockSlice.remainingLength);
 				const hasDecodingInstructions = trackData.track.decodingInstructions.length > 0;
 
 				this.currentBlock = {
@@ -1728,21 +1816,24 @@ export class MatroskaDemuxer extends Demuxer {
 			}; break;
 
 			case EBMLId.BlockMore: {
-				if (!this.currentBlock) break;
+				// Nested elements may modify the current block, so hold onto it
+				const block = this.currentBlock;
+				if (!block) break;
 
-				this.currentBlockAdditional = {
+				const blockAdditional = {
 					addId: 1,
-					data: null,
+					data: null as Uint8Array | null,
 				};
+				this.currentBlockAdditional = blockAdditional;
 
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 
-				if (this.currentBlockAdditional.data && this.currentBlockAdditional.addId === 1) {
-					this.currentBlock.mainAdditional = this.currentBlockAdditional.data;
-				} else if (this.currentBlockAdditional.data) {
-					this.currentBlock.otherAdditionals.push({
-						addId: this.currentBlockAdditional.addId,
-						data: this.currentBlockAdditional.data,
+				if (blockAdditional.data && blockAdditional.addId === 1) {
+					block.mainAdditional = blockAdditional.data;
+				} else if (blockAdditional.data) {
+					block.otherAdditionals.push({
+						addId: blockAdditional.addId,
+						data: blockAdditional.data,
 					});
 				}
 				this.currentBlockAdditional = null;
@@ -1823,7 +1914,7 @@ export class MatroskaDemuxer extends Demuxer {
 			}; break;
 
 			case EBMLId.AttachedFile: {
-				if (!this.currentSegment) break;
+				if (!this.currentSegment || this.currentAttachedFile) break; // Nested attached files make no sense
 
 				this.currentAttachedFile = {
 					fileUid: null,
@@ -1906,25 +1997,31 @@ export class MatroskaDemuxer extends Demuxer {
 			}; break;
 
 			case EBMLId.ContentEncodings: {
-				if (!this.currentTrack) break;
+				// Nested elements may modify the current track, so hold onto it
+				const track = this.currentTrack;
+				if (!track) break;
 
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 
 				// "**MUST** start with the `ContentEncoding` with the highest `ContentEncodingOrder`"
-				this.currentTrack.decodingInstructions.sort((a, b) => b.order - a.order);
+				track.decodingInstructions.sort((a, b) => b.order - a.order);
 			}; break;
 
 			case EBMLId.ContentEncoding: {
-				this.currentDecodingInstruction = {
+				const track = this.currentTrack;
+				if (!track) break;
+
+				const instruction: DecodingInstruction = {
 					order: 0,
 					scope: ContentEncodingScope.Block,
 					data: null,
 				};
+				this.currentDecodingInstruction = instruction;
 
 				this.readContiguousElements(slice.slice(dataStartPos, size));
 
-				if (this.currentDecodingInstruction.data) {
-					this.currentTrack!.decodingInstructions.push(this.currentDecodingInstruction);
+				if (instruction.data) {
+					track.decodingInstructions.push(instruction);
 				}
 
 				this.currentDecodingInstruction = null;
@@ -2357,16 +2454,15 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			(cluster) => {
 				if (cluster.elementStartPos === clusterStartPos) {
 					const trackData = cluster.trackData.get(this.internalTrack.id)!;
-					const nextKeyFrameIndex = trackData.blocks.findIndex(
-						(x, i) => x.isKeyFrame && i > blockIndex,
-					);
 
-					if (nextKeyFrameIndex !== -1) {
-						// We can simply take the next key frame in the cluster
-						return {
-							blockIndex: nextKeyFrameIndex,
-							correctBlockFound: true,
-						};
+					for (let i = blockIndex + 1; i < trackData.blocks.length; i++) {
+						if (trackData.blocks[i]!.isKeyFrame) {
+							// We can simply take the next key frame in the cluster
+							return {
+								blockIndex: i,
+								correctBlockFound: true,
+							};
+						}
 					}
 				} else {
 					const trackData = cluster.trackData.get(this.internalTrack.id);
@@ -2480,6 +2576,10 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		// The timestamp for which we know the correct block will not come after it
 		latestTimestamp: number,
 		options: PacketRetrievalOptions,
+		// The position for which we know the correct block will not come after it
+		stopPos = Infinity,
+		// How many times we've retried due to a faulty lookup entry
+		lookupRetryCount = 0,
 	): MaybeRelevantPromise {
 		const { demuxer, segment } = this.internalTrack;
 
@@ -2530,6 +2630,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			cuePoint?.clusterPosition ?? 0,
 			positionCacheEntry?.elementStartPos ?? 0,
 		) || null;
+		const cuePointWins = !!cuePoint && cuePoint.clusterPosition >= (positionCacheEntry?.elementStartPos ?? 0);
 
 		if (lookupEntryPosition !== null && lookupEntryPosition > currentPos) {
 			// Use the lookup entry
@@ -2541,13 +2642,27 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			currentPos = lookupEntryPosition ?? segment.clusterSeekStartPos;
 		}
 
-		while (segment.elementEndPos === null || currentPos <= segment.elementEndPos - MIN_HEADER_SIZE) {
+		const scanStartPos = currentCluster ? currentCluster.elementStartPos : currentPos;
+
+		while (
+			(segment.elementEndPos === null || currentPos <= segment.elementEndPos - MIN_HEADER_SIZE)
+			&& currentPos < stopPos
+		) {
 			if (currentCluster) {
 				const trackData = currentCluster.trackData.get(this.internalTrack.id);
 				if (trackData && trackData.startTimestamp > latestTimestamp) {
 					// We're already past the upper bound, no need to keep searching
 					break;
 				}
+
+				currentCluster = null; // So we don't process it again next iteration
+			}
+
+			const summary = segment.clusterSummaries.get(currentPos);
+			if (summary && !summary.trackIds.has(this.internalTrack.id)) {
+				// We've read this cluster before and know it has nothing for this track, so let's not read it again
+				currentPos = summary.elementEndPos;
+				continue;
 			}
 
 			// Load the header
@@ -2566,7 +2681,7 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 				// try and resync to the next valid element.
 				const nextPos = await resync(
 					demuxer.reader,
-					elementStartPos,
+					elementStartPos + 1,
 					LEVEL_1_EBML_IDS,
 					Math.min(segment.elementEndPos ?? Infinity, elementStartPos + MAX_RESYNC_LENGTH),
 				);
@@ -2643,16 +2758,31 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			currentPos = endPos;
 		}
 
-		// Catch faulty cue points
-		if (cuePoint && (!bestCluster || bestCluster.elementStartPos < cuePoint.clusterPosition)) {
-			// The cue point lied to us! We found a cue point but no cluster there that satisfied the match. In this
-			// case, let's search again but using the cue point before that.
-			const previousCuePoint = this.internalTrack.cuePoints[cuePointIndex - 1];
-			assert(!previousCuePoint || previousCuePoint.time < cuePoint.time);
+		// Handle unsatisfactoy cue points or position cache entries
+		if (lookupEntryPosition !== null && (!bestCluster || bestCluster.elementStartPos < lookupEntryPosition)) {
+			// We found a lookup entry but no cluster from there on that satisfied the match. In this case, let's search
+			// again but using a previous entry of the kind we started from. Each time this happens, we double the
+			// backwards step to perform better (and have more sequential reads) if it takes us a long time to find
+			// the media.
+			//
+			// Note that this doesn't only kick for faulty cue points but also for multi-track files where only one
+			// track has cue points. Since we distribute the cue points to the track with none, they might not
+			// accurately reflect where media can be found.
+			const step = 1 << lookupRetryCount;
+			const previousEntryTimestamp = cuePointWins
+				? this.internalTrack.cuePoints[cuePointIndex - step]?.time
+				: this.internalTrack.clusterPositionCache[positionCacheIndex - step]?.startTimestamp;
+			const newSearchTimestamp = previousEntryTimestamp ?? -Infinity;
 
-			const newSearchTimestamp = previousCuePoint?.time ?? -Infinity;
 			return this.performClusterLookup(
-				res, null, getMatchInCluster, newSearchTimestamp, latestTimestamp, options,
+				res,
+				null,
+				getMatchInCluster,
+				newSearchTimestamp,
+				latestTimestamp,
+				options,
+				scanStartPos, // So we don't read the same clusters again
+				lookupRetryCount + 1,
 			);
 		}
 

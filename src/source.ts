@@ -1659,7 +1659,15 @@ export class CustomSource extends Source {
 					throw new TypeError('options.getSize must return or resolve to a non-negative integer.');
 				}
 
+				if (this._disposed) {
+					throw new InputDisposedError();
+				}
+
 				this._orchestrator.fileSize = size;
+				if (end > size) {
+					return null; // Now that we know the size, it turns out the read doesn't fit
+				}
+
 				return this._orchestrator.read(start, end, minReadPosition, maxReadPosition);
 			});
 		} else {
@@ -1668,6 +1676,10 @@ export class CustomSource extends Source {
 			}
 
 			this._orchestrator.fileSize = result;
+			if (end > result) {
+				return null;
+			}
+
 			return this._orchestrator.read(start, end, minReadPosition, maxReadPosition);
 		}
 	}
@@ -1787,9 +1799,14 @@ export type StreamSourceOptions = CustomSourceOptions;
 type ReadableStreamSourcePendingSlice = {
 	start: number;
 	end: number;
-	bytes: Uint8Array;
+	parts: SlicePart[];
 	resolve: (bytes: ReadResult | null) => void;
 	reject: (error: unknown) => void;
+};
+
+type SlicePart = {
+	start: number;
+	bytes: Uint8Array;
 };
 
 /**
@@ -1900,7 +1917,7 @@ export class ReadableStreamSource extends Source {
 		}
 
 		let lastEnd = start;
-		const bytes = new Uint8Array(end - start);
+		const parts: SlicePart[] = [];
 
 		if (cacheStartIndex !== -1) {
 			// Walk over the cache to see if we can satisfy the request using multiple cache entries
@@ -1919,10 +1936,10 @@ export class ReadableStreamSource extends Source {
 				const cappedEnd = Math.min(end, cacheEntry.end);
 
 				if (cappedStart < cappedEnd) {
-					bytes.set(
-						cacheEntry.bytes.subarray(cappedStart - cacheEntry.start, cappedEnd - cacheEntry.start),
-						cappedStart - start,
-					);
+					parts.push({
+						start: cappedStart,
+						bytes: cacheEntry.bytes.subarray(cappedStart - cacheEntry.start, cappedEnd - cacheEntry.start),
+					});
 
 					lastEnd = cappedEnd;
 				}
@@ -1930,11 +1947,7 @@ export class ReadableStreamSource extends Source {
 		}
 
 		if (lastEnd === end) {
-			return {
-				bytes,
-				view: toDataView(bytes),
-				offset: start,
-			};
+			return assembleSlice(start, end, parts);
 		}
 
 		// We need to pull more data
@@ -1949,7 +1962,7 @@ export class ReadableStreamSource extends Source {
 		this._pendingSlices.push({
 			start,
 			end,
-			bytes,
+			parts,
 			resolve,
 			reject,
 		});
@@ -2013,17 +2026,14 @@ export class ReadableStreamSource extends Source {
 				const cappedEnd = Math.min(endIndex, pendingSlice.end);
 
 				if (cappedStart < cappedEnd) {
-					pendingSlice.bytes.set(
-						value.subarray(cappedStart - startIndex, cappedEnd - startIndex),
-						cappedStart - pendingSlice.start,
-					);
+					pendingSlice.parts.push({
+						start: cappedStart,
+						bytes: value.subarray(cappedStart - startIndex, cappedEnd - startIndex),
+					});
 					if (cappedEnd === pendingSlice.end) {
-						// Pending slice fully filled
-						pendingSlice.resolve({
-							bytes: pendingSlice.bytes,
-							view: toDataView(pendingSlice.bytes),
-							offset: pendingSlice.start,
-						});
+						// Pending slice fully filled. Assembling only at the end protects us from attacks where huge
+						// data ranges are requested, despite those never being fulfillable.
+						pendingSlice.resolve(assembleSlice(pendingSlice.start, pendingSlice.end, pendingSlice.parts));
 						this._pendingSlices.splice(i, 1);
 						i--;
 					}
@@ -2070,6 +2080,19 @@ export class ReadableStreamSource extends Source {
 		void this._reader?.cancel().catch(() => {});
 	}
 }
+
+const assembleSlice = (start: number, end: number, parts: SlicePart[]): ReadResult => {
+	const bytes = new Uint8Array(end - start);
+	for (const part of parts) {
+		bytes.set(part.bytes, part.start - start);
+	}
+
+	return {
+		bytes,
+		view: toDataView(bytes),
+		offset: start,
+	};
+};
 
 type PrefetchProfile = (start: number, end: number, workers: ReadWorker[]) => {
 	start: number;

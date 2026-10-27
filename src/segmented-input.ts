@@ -91,8 +91,6 @@ export abstract class SegmentedInput {
 	firstSegment: Segment | null = null;
 	firstSegmentFirstTimestamps = new WeakMap<Segment, number>();
 
-	firstTimestampCache = new WeakMap<Input, number>();
-
 	constructor(input: Input, path: string, trackDeclarations: SegmentedInputTrackDeclaration[] | null) {
 		this.input = input;
 		this.path = path;
@@ -221,56 +219,24 @@ export abstract class SegmentedInput {
 		})();
 	}
 
-	// This operation is done a lot and can be semi-expensive, so it's good to have a cache for it
-	getFirstTimestampForInput(input: Input): MaybePromise<number> {
-		const existing = this.firstTimestampCache.get(input);
-		if (existing !== undefined) {
-			return existing;
+	async getMediaOffset(res: ResultValue<number>, segment: Segment, input: Input): MaybeRelevantPromise {
+		const format = input._format ?? await input.getFormat();
+		if (!format.supportsTimestampedMediaData) {
+			return res.set(segment.timestamp);
 		}
 
-		return input.getFirstTimestamp().then((firstTimestamp) => {
-			this.firstTimestampCache.set(input, firstTimestamp);
-			return firstTimestamp;
-		});
-	}
-
-	async getMediaOffset(res: ResultValue<number>, segment: Segment, input: Input): MaybeRelevantPromise {
+		// The segments' timestamps are assumed to lie on one shared timeline (until the next discontinuity), which we
+		// align to the playlist using the first segment
 		const firstSegment = segment.firstSegment ?? segment;
 
-		let firstSegmentFirstTimestamp: number;
-		if (this.firstSegmentFirstTimestamps.has(firstSegment)) {
-			firstSegmentFirstTimestamp = this.firstSegmentFirstTimestamps.get(firstSegment)!;
-		} else {
+		let firstSegmentFirstTimestamp = this.firstSegmentFirstTimestamps.get(firstSegment);
+		if (firstSegmentFirstTimestamp === undefined) {
 			const firstInput = this.getInputForSegment(firstSegment);
-			let firstTimestamp = this.getFirstTimestampForInput(firstInput);
-			if (isThenable(firstTimestamp)) firstTimestamp = await firstTimestamp;
-
-			firstSegmentFirstTimestamp = firstTimestamp;
+			firstSegmentFirstTimestamp = await firstInput.getFirstTimestamp();
 			this.firstSegmentFirstTimestamps.set(firstSegment, firstSegmentFirstTimestamp);
 		}
 
-		if (firstSegment === segment) {
-			return res.set(firstSegment.timestamp - firstSegmentFirstTimestamp);
-		}
-
-		let segmentFirstTimestamp = this.getFirstTimestampForInput(input);
-		if (isThenable(segmentFirstTimestamp)) segmentFirstTimestamp = await segmentFirstTimestamp;
-
-		const segmentElapsed = segment.timestamp - firstSegment.timestamp;
-		const inputElapsed = segmentFirstTimestamp - firstSegmentFirstTimestamp;
-		const difference = inputElapsed - segmentElapsed;
-
-		if (Math.abs(difference) <= Math.min(0.25, segmentElapsed)) { // Heuristic
-			// We're close enough
-			return res.set(firstSegment.timestamp - firstSegmentFirstTimestamp);
-		} else {
-			// Ideally, each segment has absolute timestamps that are relative to some outside clock which is
-			// consistent across segments. This is often the case, but not always. Either the container format used is
-			// not timestamped at all (like ADTS), or the segments are just fucky. In this case, use the segment's
-			// relative timestamp to determine where we are, and completely offset out the segment's input start
-			// timestamp.
-			return res.set(segment.timestamp - segmentFirstTimestamp);
-		}
+		return res.set(firstSegment.timestamp - firstSegmentFirstTimestamp);
 	}
 
 	dispose() {
@@ -604,7 +570,14 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 			const promise = nextTrack._backing.getFirstPacket(packetResult, options);
 			if (packetResult.pending) await promise;
 
-			const firstPacket = packetResult.value.packet;
+			let firstPacket = packetResult.value.packet;
+			if (firstPacket && keyframesOnly && firstPacket.type !== 'key') {
+				packetResult.reset();
+				const keyPromise = nextTrack._backing.getNextKeyPacket(packetResult, firstPacket, options);
+				if (packetResult.pending) await keyPromise;
+
+				firstPacket = packetResult.value.packet;
+			}
 
 			if (!firstPacket) {
 				// Segments may contain zero packets for a track, so, move on
@@ -645,7 +618,7 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		if (segmentResult.pending) await segmentPromise;
 
 		// If the segment lookup is provisional, then so is anything we derive from it
-		const provisional = segmentResult.value.provisional;
+		let provisional = segmentResult.value.provisional;
 
 		let currentSegment = segmentResult.value.segment;
 		if (!currentSegment) {
@@ -706,6 +679,81 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 				currentSegment = segmentResult.value.segment;
 				continue;
+			}
+
+			// The playlist may claim the segment to be longer than its media actually is, in which case the timestamp
+			// can lie in the next segment instead. That's only possible if it lies past this segment's media.
+			let lastPacket: EncodedPacket | null = packet;
+			if (keyframesOnly) {
+				packetResult.reset();
+				const lastPacketPromise = track._backing.getPacket(
+					packetResult,
+					offsetTimestamp,
+					{ ...options, metadataOnly: true },
+				);
+				if (packetResult.pending) await lastPacketPromise;
+
+				lastPacket = packetResult.value.packet;
+			}
+			assert(lastPacket);
+
+			if (offsetTimestamp >= lastPacket.timestamp + lastPacket.duration) {
+				segmentResult.reset();
+				const nextSegmentPromise = this.segmentedInput.getNextSegment(segmentResult, currentSegment, {
+					skipLiveWait: options.skipLiveWait,
+				});
+				if (segmentResult.pending) await nextSegmentPromise;
+
+				// A next segment that may still come could hold the timestamp, so the answer may change
+				provisional ||= segmentResult.value.provisional;
+
+				const nextSegment = segmentResult.value.segment;
+				if (nextSegment) {
+					const nextInput = this.segmentedInput.getInputForSegment(nextSegment);
+					let nextTracks = getTracksMaybeSync(nextInput);
+					if (isThenable(nextTracks)) nextTracks = await nextTracks;
+
+					const nextTrack = nextTracks.find(t => (
+						t.type === this.firstInputTrack!.type && t.number === this.firstInputTrack!.number
+					));
+
+					let nextPacket: EncodedPacket | null = null;
+					if (nextTrack) {
+						const metadataOptions = { ...options, metadataOnly: true };
+
+						packetResult.reset();
+						const firstPromise = nextTrack._backing.getFirstPacket(packetResult, metadataOptions);
+						if (packetResult.pending) await firstPromise;
+
+						nextPacket = packetResult.value.packet;
+						if (nextPacket && keyframesOnly && nextPacket.type !== 'key') {
+							packetResult.reset();
+							const keyPromise = nextTrack._backing.getNextKeyPacket(
+								packetResult,
+								nextPacket,
+								metadataOptions,
+							);
+							if (packetResult.pending) await keyPromise;
+
+							nextPacket = packetResult.value.packet;
+						}
+					}
+
+					if (nextPacket) {
+						mediaOffsetResult.reset();
+						const nextMediaOffsetPromise = this.segmentedInput.getMediaOffset(
+							mediaOffsetResult,
+							nextSegment,
+							nextInput,
+						);
+						if (mediaOffsetResult.pending) await nextMediaOffsetPromise;
+
+						if (nextPacket.timestamp + mediaOffsetResult.value <= timestamp) {
+							currentSegment = nextSegment;
+							continue;
+						}
+					}
+				}
 			}
 
 			return this.createAdjustedPacket(res, packet, currentSegment, track, provisional);

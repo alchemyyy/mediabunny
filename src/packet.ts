@@ -647,7 +647,13 @@ export class PacketReader<T extends InputTrack = InputTrack> {
 		timestamp: number,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
+		// The timestamp of the last packet that turned out not to be a key packet, and how far before it we look next
+		let rejectedTimestamp: number | null = null;
+		let step = 0;
+
 		while (true) {
+			let deltaPacket: EncodedPacket | null = null;
+
 			if (cacheTrackInfo) {
 				let cacheResult = this.cache!._getKeyAt(cacheTrackInfo, timestamp, options);
 				if (isThenable(cacheResult)) cacheResult = await cacheResult;
@@ -657,43 +663,51 @@ export class PacketReader<T extends InputTrack = InputTrack> {
 						return res.set(cacheResult);
 					}
 
-					let timeResolution = this._getTimeResolution();
-					if (isThenable(timeResolution)) timeResolution = await timeResolution;
-
 					// Turned out to be a delta packet, so try the key packet before it
-					timestamp = cacheResult.timestamp - 1 / timeResolution;
-					continue;
+					deltaPacket = cacheResult;
 				}
 			}
 
-			const result = new ResultValue<PacketRetrievalResult>();
-			const promise = this.track._backing.getKeyPacket(result, timestamp, options);
-			if (result.pending) await promise;
+			if (!deltaPacket) {
+				const result = new ResultValue<PacketRetrievalResult>();
+				const promise = this.track._backing.getKeyPacket(result, timestamp, options);
+				if (result.pending) await promise;
 
-			const packet = result.value.packet;
-			const cache = result.value.provisional ? null : this.cache;
+				const packet = result.value.packet;
+				const cache = result.value.provisional ? null : this.cache;
 
-			if (packet) {
-				packet._ownerId = this.track._uniqueId;
-			}
+				if (packet) {
+					packet._ownerId = this.track._uniqueId;
+				}
 
-			if (!options.verifyKeyPackets || !packet) {
-				cache?._insertKeyAt(cacheTrackInfo!, timestamp, packet, undefined);
-				return res.set(packet);
-			}
+				if (!options.verifyKeyPackets || !packet) {
+					cache?._insertKeyAt(cacheTrackInfo!, timestamp, packet, undefined);
+					return res.set(packet);
+				}
 
-			const determinedType = await this.track.determinePacketType(packet);
-			cache?._insertKeyAt(cacheTrackInfo!, timestamp, packet, determinedType);
+				const determinedType = await this.track.determinePacketType(packet);
+				cache?._insertKeyAt(cacheTrackInfo!, timestamp, packet, determinedType);
 
-			if (determinedType !== 'delta') {
-				return res.set(packet);
+				if (determinedType !== 'delta') {
+					return res.set(packet);
+				}
+
+				// Try the previous key packet instead (in hopes that it's actually a key packet)
+				deltaPacket = packet;
 			}
 
 			let timeResolution = this._getTimeResolution();
 			if (isThenable(timeResolution)) timeResolution = await timeResolution;
 
-			// Try the previous key packet instead (in hopes that it's actually a key packet)
-			timestamp = packet.timestamp - 1 / timeResolution;
+			if (rejectedTimestamp !== null && deltaPacket.timestamp >= rejectedTimestamp) {
+				// Huge timestamps, the step wasn't enough to move us, try again
+				step *= 2;
+			} else {
+				rejectedTimestamp = deltaPacket.timestamp;
+				step = 1 / timeResolution;
+			}
+
+			timestamp = rejectedTimestamp - step;
 		}
 	}
 
