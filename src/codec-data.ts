@@ -2282,6 +2282,52 @@ export const extractAv1CodecInfoFromPacket = (
 	return null;
 };
 
+/**
+ * Reads the AV1 codec information of an AV1CodecConfigurationRecord, the payload of an ISOBMFF av1C box and the
+ * CodecPrivate of a Matroska V_AV1 track: its 4-byte header, then its config OBUs, whose sequence header supplies the
+ * color information. Returns null when the record is shorter than its header or lacks its marker bit.
+ */
+export const extractAv1CodecInfoFromConfigurationRecord = (record: Uint8Array): Av1CodecInfo | null => {
+	// https://aomediacodec.github.io/av1-isobmff/#av1codecconfigurationbox-syntax
+	if (record.byteLength < 4 || !(record[0]! & 0x80)) {
+		return null;
+	}
+
+	const secondByte = record[1]!;
+	const profile = secondByte >> 5;
+	const level = secondByte & 0b11111;
+
+	const thirdByte = record[2]!;
+	const tier = thirdByte >> 7;
+	const highBitDepth = (thirdByte >> 6) & 1;
+	const twelveBit = (thirdByte >> 5) & 1;
+	const monochrome = (thirdByte >> 4) & 1;
+	const chromaSubsamplingX = (thirdByte >> 3) & 1;
+	const chromaSubsamplingY = (thirdByte >> 2) & 1;
+	const chromaSamplePosition = thirdByte & 0b11;
+
+	// Logic from https://aomediacodec.github.io/av1-spec/av1-spec.pdf
+	const bitDepth = profile === 2 && highBitDepth ? (twelveBit ? 12 : 10) : (highBitDepth ? 10 : 8);
+
+	// The fourth byte holds reserved bits and the initial presentation delay; the config OBUs follow
+	const configObuInfo = extractAv1CodecInfoFromPacket(record.subarray(4));
+
+	return {
+		profile,
+		level,
+		tier,
+		bitDepth,
+		monochrome,
+		chromaSubsamplingX,
+		chromaSubsamplingY,
+		chromaSamplePosition,
+		videoFullRangeFlag: configObuInfo?.videoFullRangeFlag ?? 0,
+		colourPrimaries: configObuInfo?.colourPrimaries ?? 2,
+		transferCharacteristics: configObuInfo?.transferCharacteristics ?? 2,
+		matrixCoefficients: configObuInfo?.matrixCoefficients ?? 2,
+	};
+};
+
 export const av1CodecInfoHasColorInfo = (info: Av1CodecInfo) => {
 	return info.colourPrimaries !== 2
 		|| info.transferCharacteristics !== 2

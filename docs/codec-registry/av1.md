@@ -34,7 +34,7 @@ The full codec string begins with the prefix `'av01.'`, with a variable-length s
 
 ## `VideoDecoderConfig` description
 
-`description` is not used for this codec.
+`description` is optional and, when present, is an AV1CodecConfigurationRecord as specified in Section 2.3 of the [AV1 Codec ISO Media File Format Binding](https://aomediacodec.github.io/av1-isobmff/). Mediabunny's Matroska, WebM, and ISOBMFF demuxers set it to the track's CodecPrivate or `av1C` box contents when the file has one. WebCodecs decoders make no use of it, as AV1 streams carry their sequence headers in band, and muxers derive their own record from the codec string.
 
 ## Quantizer range
 
