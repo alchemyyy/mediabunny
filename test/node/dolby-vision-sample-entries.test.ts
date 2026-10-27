@@ -32,8 +32,8 @@ test.each(SAMPLE_ENTRIES)(
 		const decoderConfig = await track.getDecoderConfig();
 		assert(decoderConfig);
 		expect(decoderConfig.codec).toBe(codecString);
-		// Mediabunny hands the avcC and hvcC records on as the description, and an av1C record to none
-		expect(decoderConfig.description !== undefined).toBe(codec !== 'av1');
+		// Mediabunny hands the avcC, hvcC, and av1C records on as the description
+		expect(decoderConfig.description).toBeDefined();
 
 		// Each file holds four frames, FFprobe counts
 		const packetTypes: string[] = [];
