@@ -769,3 +769,26 @@ test('AVI MPEG-4 Part 2 without the packed marker keeps its chunks as they are',
 	);
 	expect(vopStartCodes).toHaveLength(2);
 });
+
+test('Should keep a video track of a FourCC with no codec, codec-less, with its FourCC as its codec ID', async () => {
+	using input = new Input({
+		source: new FilePathSource('./test/public/avi/msmpeg4v3.avi'),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getVideoTracks();
+	expect(tracks).toHaveLength(1);
+	const track = tracks[0]!;
+	expect(await track.getCodec()).toBe(null);
+	expect(await track.getInternalCodecId()).toBe('MP43');
+	expect(await track.getCodedWidth()).toBe(176);
+	expect(await track.getCodedHeight()).toBe(144);
+	expect(await track.getDecoderConfig()).toBe(null);
+
+	const sink = new PacketReader(track);
+	let count = 0;
+	for (let packet = await sink.getFirst(); packet; packet = await sink.getNext(packet)) {
+		count++;
+	}
+	expect(count).toBe(5);
+});
