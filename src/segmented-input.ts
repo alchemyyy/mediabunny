@@ -762,6 +762,10 @@ class SegmentedInputInputVideoTrackBacking
 		return this.delegate(() => this.firstInputTrack!._backing.canBeTransparent());
 	}
 
+	getFieldOrder() {
+		return this.delegate(() => this.firstInputTrack!._backing.getFieldOrder?.() ?? null);
+	}
+
 	override async getDecoderConfig(): Promise<VideoDecoderConfig | null> {
 		return this.delegate(() => this.firstInputTrack!._backing.getDecoderConfig());
 	}

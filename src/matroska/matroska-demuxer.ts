@@ -35,6 +35,7 @@ import {
 	InputAudioTrackBacking,
 	InputTrackBacking,
 	InputVideoTrackBacking,
+	VideoFieldOrder,
 } from '../input-track';
 import { AttachedFile, DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import {
@@ -103,6 +104,7 @@ type Segment = {
 	timestampScale: number;
 	timestampFactor: number;
 	duration: number;
+	muxingApp: string | null;
 	seekEntries: SeekEntry[];
 	tracks: InternalTrack[];
 	cuePoints: CuePoint[];
@@ -241,6 +243,8 @@ type InternalTrack = {
 			colorSpace: VideoColorSpaceInit;
 			alphaMode: boolean;
 			proresFormat: ProresFourCc | null;
+			flagInterlaced: number;
+			fieldOrder: number;
 		}
 		| {
 			type: 'audio';
@@ -263,6 +267,37 @@ const METADATA_ELEMENTS = [
 	{ id: EBMLId.Cues, flag: 'cuesSeen' },
 ] as const;
 const MAX_RESYNC_LENGTH = 10 * 2 ** 20; // 10 MiB
+
+const MATROSKA_FLAG_INTERLACED_UNDETERMINED = 0;
+const MATROSKA_FLAG_INTERLACED_INTERLACED = 1;
+const MATROSKA_FLAG_INTERLACED_PROGRESSIVE = 2;
+const MATROSKA_FIELD_ORDER_PROGRESSIVE = 0;
+const MATROSKA_FIELD_ORDER_TOP_FIRST = 1;
+const MATROSKA_FIELD_ORDER_UNDETERMINED = 2;
+const MATROSKA_FIELD_ORDER_BOTTOM_FIRST = 6;
+const MATROSKA_FIELD_ORDER_TOP_CODED_BOTTOM_FIRST = 9;
+const MATROSKA_FIELD_ORDER_BOTTOM_CODED_TOP_FIRST = 14;
+
+/**
+ * FFmpeg's Matroska muxer wrote FieldOrder 9 and 14 swapped from libavformat 57.36.100 until 57.52, so files whose
+ * MuxingApp names such a version hold them swapped. This matches the MuxingApp as FFmpeg's demuxer does, with
+ * sscanf(muxingApp, "Lavf57.%d.%d"): each %d skips whitespace and takes an optional sign.
+ */
+const hasSwappedFieldOrders = (muxingApp: string | null) => {
+	const prefix = 'Lavf57.';
+	if (!muxingApp?.startsWith(prefix)) {
+		return false;
+	}
+
+	const match = /^[ \t\n\v\f\r]*([+-]?\d+)\.[ \t\n\v\f\r]*([+-]?\d+)/.exec(muxingApp.slice(prefix.length));
+	if (!match) {
+		return false;
+	}
+
+	const minor = Number(match[1]);
+	const micro = Number(match[2]);
+	return minor >= 36 && minor <= 51 && micro >= 100;
+};
 
 export class MatroskaDemuxer extends Demuxer {
 	reader: Reader;
@@ -445,6 +480,7 @@ export class MatroskaDemuxer extends Demuxer {
 
 			metadataTags: {},
 			metadataTagsCollected: false,
+			muxingApp: null,
 		};
 		this.segments.push(this.currentSegment);
 
@@ -1052,6 +1088,12 @@ export class MatroskaDemuxer extends Demuxer {
 				this.currentSegment.duration = readFloat(slice, size);
 			}; break;
 
+			case EBMLId.MuxingApp: {
+				if (!this.currentSegment) break;
+
+				this.currentSegment.muxingApp = readUnicodeString(slice, size);
+			}; break;
+
 			case EBMLId.TrackEntry: {
 				if (!this.currentSegment) break;
 
@@ -1262,6 +1304,8 @@ export class MatroskaDemuxer extends Demuxer {
 						colorSpace: { ...EMPTY_COLOR_SPACE },
 						alphaMode: false,
 						proresFormat: null,
+						flagInterlaced: MATROSKA_FLAG_INTERLACED_UNDETERMINED, // Default value
+						fieldOrder: MATROSKA_FIELD_ORDER_UNDETERMINED, // Default value
 					};
 				} else if (type === 2) {
 					this.currentTrack.info = {
@@ -1418,6 +1462,18 @@ export class MatroskaDemuxer extends Demuxer {
 				if (this.currentTrack?.info?.type !== 'video') break;
 
 				this.currentTrack.info.alphaMode = readUnsignedInt(slice, size) === 1;
+			}; break;
+
+			case EBMLId.FlagInterlaced: {
+				if (this.currentTrack?.info?.type !== 'video') break;
+
+				this.currentTrack.info.flagInterlaced = readUnsignedInt(slice, size);
+			}; break;
+
+			case EBMLId.FieldOrder: {
+				if (this.currentTrack?.info?.type !== 'video') break;
+
+				this.currentTrack.info.fieldOrder = readUnsignedInt(slice, size);
 			}; break;
 
 			case EBMLId.Colour: {
@@ -2650,6 +2706,29 @@ class MatroskaVideoTrackBacking extends MatroskaTrackBacking implements InputVid
 				|| this.internalTrack.info.proresFormat === 'ap4x'
 			)
 		);
+	}
+
+	getFieldOrder(): VideoFieldOrder | null {
+		const { flagInterlaced, fieldOrder } = this.internalTrack.info;
+
+		if (flagInterlaced === MATROSKA_FLAG_INTERLACED_PROGRESSIVE) {
+			return 'progressive';
+		} else if (flagInterlaced !== MATROSKA_FLAG_INTERLACED_INTERLACED) {
+			return null;
+		}
+
+		const swapped = hasSwappedFieldOrders(this.internalTrack.segment.muxingApp);
+
+		switch (fieldOrder) {
+			case MATROSKA_FIELD_ORDER_PROGRESSIVE: return 'progressive';
+			case MATROSKA_FIELD_ORDER_TOP_FIRST: return 'top-first';
+			case MATROSKA_FIELD_ORDER_BOTTOM_FIRST: return 'bottom-first';
+			case MATROSKA_FIELD_ORDER_TOP_CODED_BOTTOM_FIRST:
+				return swapped ? 'bottom-coded-top-first' : 'top-coded-bottom-first';
+			case MATROSKA_FIELD_ORDER_BOTTOM_CODED_TOP_FIRST:
+				return swapped ? 'top-coded-bottom-first' : 'bottom-coded-top-first';
+			default: return 'interlaced';
+		}
 	}
 
 	async getDecoderConfig(): Promise<VideoDecoderConfig | null> {

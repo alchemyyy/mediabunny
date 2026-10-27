@@ -114,6 +114,26 @@ export type FrameRateMetricsOptions = {
 	targetPacketCount?: number;
 };
 
+/**
+ * How a video track's frames are scanned and, for interlaced frames, the order of their two fields, as the container
+ * declares it:
+ * - `'progressive'`: Each frame is one picture.
+ * - `'interlaced'`: Each frame holds two fields, in an order the container leaves undetermined.
+ * - `'top-first'`: The top field is coded and displayed first.
+ * - `'bottom-first'`: The bottom field is coded and displayed first.
+ * - `'top-coded-bottom-first'`: The top field is coded first, the bottom field displayed first.
+ * - `'bottom-coded-top-first'`: The bottom field is coded first, the top field displayed first.
+ * @group Input files & tracks
+ * @public
+ */
+export type VideoFieldOrder =
+	| 'progressive'
+	| 'interlaced'
+	| 'top-first'
+	| 'bottom-first'
+	| 'top-coded-bottom-first'
+	| 'bottom-coded-top-first';
+
 export interface InputTrackBacking {
 	getType(): TrackType;
 	getId(): number;
@@ -615,6 +635,7 @@ export interface InputVideoTrackBacking extends InputTrackBacking {
 	getTransformationMatrix(): MaybePromise<TransformationMatrix>;
 	getColorSpace(): Promise<VideoColorSpaceInit>;
 	canBeTransparent(): Promise<boolean>;
+	getFieldOrder?(): MaybePromise<VideoFieldOrder | null>;
 	getDecoderConfig(): Promise<VideoDecoderConfig | null>;
 }
 
@@ -859,6 +880,15 @@ export class InputVideoTrack extends InputTrack {
 	/** Checks if this track may contain transparent samples with alpha data. */
 	async canBeTransparent() {
 		return this._backing.canBeTransparent();
+	}
+
+	/**
+	 * Returns how the track's frames are scanned and in which order their fields come, as the container declares it.
+	 * Returns null if the container doesn't declare it or the format doesn't carry it; currently only Matroska and
+	 * WebM files carry it. The bitstream may still say otherwise.
+	 */
+	async getFieldOrder(): Promise<VideoFieldOrder | null> {
+		return (await this._backing.getFieldOrder?.()) ?? null;
 	}
 
 	/**

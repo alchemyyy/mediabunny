@@ -13,6 +13,7 @@ import {
 	InputAudioTrackBacking,
 	InputTrackBacking,
 	InputVideoTrackBacking,
+	VideoFieldOrder,
 } from '../input-track';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import { TrackType } from '../output';
@@ -882,6 +883,11 @@ class HlsInputVideoTrackBacking
 	async canBeTransparent(): Promise<boolean> {
 		await this.hydrate();
 		return this.backingVideoTrack!.canBeTransparent();
+	}
+
+	async getFieldOrder(): Promise<VideoFieldOrder | null> {
+		await this.hydrate();
+		return (await this.backingVideoTrack!.getFieldOrder?.()) ?? null;
 	}
 
 	getMetadataCodecParameterString(): string | null {

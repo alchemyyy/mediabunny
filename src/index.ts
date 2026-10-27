@@ -257,6 +257,7 @@ export {
 	type FrameRateMetrics,
 	type FrameRateMetricsOptions,
 	type PacketStats,
+	type VideoFieldOrder,
 	asc,
 	desc,
 	prefer,
