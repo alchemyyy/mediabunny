@@ -609,12 +609,14 @@ test('AVI HEVC is identified under its tags, and under the zero tag FFmpeg\'s mu
 		expect((await new PacketReader(track).getFirst())!.type).toBe('key');
 	}
 
-	// Uncompressed RGB under the same zero tag stays unidentified
+	// Uncompressed RGB under the same zero tag stays unidentified, a video track without a codec
 	using rgbInput = new Input({
 		source: new FilePathSource('test/public/avi/rgb-uncompressed.avi'),
 		formats: ALL_FORMATS,
 	});
-	expect(await rgbInput.getVideoTracks()).toHaveLength(0);
+	const rgbTracks = await rgbInput.getVideoTracks();
+	expect(rgbTracks).toHaveLength(1);
+	expect(await rgbTracks[0]!.getCodec()).toBeNull();
 });
 
 /** Reads every packet of an input's first track of a type, with its data. */
