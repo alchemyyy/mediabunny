@@ -267,6 +267,7 @@ export {
 	type FrameRateMetricsOptions,
 	type UnsupportedTrackFeature,
 	type PacketStats,
+	type VideoFieldOrder,
 	asc,
 	desc,
 	prefer,
