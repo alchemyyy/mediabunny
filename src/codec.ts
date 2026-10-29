@@ -461,6 +461,15 @@ export const extractVideoCodecString = (trackInfo: {
 			throw new TypeError('AVC decoder description is not provided or is not at least 4 bytes long.');
 		}
 
+		// Some muxers leave the record's profile, compatibility and level bytes zero. A profile_idc of 0 names no
+		// profile, so the string takes them from the record's first SPS, which decoders read them from
+		if (codecDescription[1] === 0) {
+			const sps = deserializeAvcDecoderConfigurationRecord(codecDescription)?.sequenceParameterSets[0];
+			if (sps && sps.byteLength >= 4) {
+				return `avc${trackInfo.avcType}.${bytesToHexString(sps.subarray(1, 4))}`;
+			}
+		}
+
 		return `avc${trackInfo.avcType}.${bytesToHexString(codecDescription.subarray(1, 4))}`;
 	} else if (codec === 'hevc') {
 		let generalProfileSpace: number;
