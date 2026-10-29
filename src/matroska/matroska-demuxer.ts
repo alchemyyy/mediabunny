@@ -430,6 +430,12 @@ export class MatroskaDemuxer extends Demuxer {
 
 					this.readContiguousElements(slice);
 				} else if (id === EBMLId.Segment) { // Segment found!
+					if (size === 0) {
+						// Unfinalized files (e.g. an interrupted mkvmerge) leave a placeholder size of 0. Treat it as
+						// unknown, like FFmpeg does, so the elements that follow are read as part of the segment.
+						size = undefined;
+					}
+
 					await this.readSegment(dataStartPos, size);
 
 					if (size === undefined) {
@@ -448,25 +454,14 @@ export class MatroskaDemuxer extends Demuxer {
 
 					// Clusters are not a top-level element in Matroska, but some files contain a Segment whose size
 					// doesn't contain any of the clusters that follow it. In the case, we apply the following logic: if
-					// we find a top-level cluster, attribute it to the previous segment.
-
-					if (size === undefined) {
-						// Just in case this is one of those weird sizeless clusters, let's do our best and still try to
-						// determine its size.
-						const nextElementPos = await searchForNextElementId(
-							this.reader,
-							dataStartPos,
-							LEVEL_0_AND_1_EBML_IDS,
-							this.reader.fileSize,
-						);
-						size = nextElementPos.pos - dataStartPos;
-					}
-
+					// we find a top-level cluster, the previous segment runs until the end of the file. We stop here
+					// instead of walking every cluster, which would take one read per cluster across the whole file.
 					const lastSegment = last(this.segments);
 					if (lastSegment) {
-						// Extend the previous segment's size
-						lastSegment.elementEndPos = dataStartPos + size;
+						lastSegment.elementEndPos = this.reader.fileSize;
 					}
+
+					break;
 				}
 
 				assertDefinedSize(size);
