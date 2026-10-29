@@ -1362,15 +1362,16 @@ const skipStRefPicSet = (
 		bitstream.readBits(1); // delta_rps_sign
 		readExpGolomb(bitstream); // abs_delta_rps_minus1
 
-		// The number of iterations is NumDeltaPocs[RefRpsIdx] + 1
+		// The number of iterations is NumDeltaPocs[RefRpsIdx] + 1, and each iteration whose picture is used by the
+		// current picture or kept for later ones (use_delta_flag, inferred to be 1 when absent) adds a picture
 		const numDelta = NumDeltaPocs[RefRpsIdx] ?? 0;
 		for (let j = 0; j <= numDelta; j++) {
 			const used_by_curr_pic_flag = bitstream.readBits(1);
-			if (!used_by_curr_pic_flag) {
-				bitstream.readBits(1); // use_delta_flag
+			const use_delta_flag = used_by_curr_pic_flag ? 1 : bitstream.readBits(1);
+			if (used_by_curr_pic_flag || use_delta_flag) {
+				NumDeltaPocsThis++;
 			}
 		}
-		NumDeltaPocsThis = NumDeltaPocs[RefRpsIdx]!;
 	} else {
 		const num_negative_pics = readExpGolomb(bitstream);
 		const num_positive_pics = readExpGolomb(bitstream);
