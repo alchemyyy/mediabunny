@@ -12,9 +12,9 @@ import {
 } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { EncodedAudioPacketSource } from '../../src/media-source.js';
-import { EncodedPacket } from '../../src/packet.js';
+import { EncodedPacket, PacketReader } from '../../src/packet.js';
 import { Input } from '../../src/input.js';
-import { BufferSource, FilePathSource } from '../../src/source.js';
+import { BufferSource, CustomSource, FilePathSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { AttachedFile, MetadataTags } from '../../src/metadata.js';
 import { VERSIONED_NAME } from '../../src/version.js';
@@ -796,4 +796,63 @@ test('Write WAV with ID3 tags', async () => {
 		expect(readTags.raw['TPOS']).toBe(`${songMetadata.discNumber}/${songMetadata.discsTotal}`);
 		expect(readTags.raw['TDRC']).toBeDefined();
 	}
+});
+
+test.each([
+	{ appendOnly: false }, // The SeekHead also points at the Attachments
+	{ appendOnly: true }, // No SeekHead
+])('Matroska attachments are read only for metadata tags (appendOnly=$appendOnly)', async ({ appendOnly }) => {
+	const output = new Output({
+		format: new MkvOutputFormat({ appendOnly }),
+		target: new BufferTarget(),
+	});
+
+	const fontData = new Uint8Array(4 * 2 ** 20);
+	for (let i = 0; i < fontData.length; i++) {
+		fontData[i] = i & 0xff;
+	}
+
+	output.setMetadataTags({
+		title: 'Fonts',
+		raw: {
+			123: new AttachedFile(fontData, 'font/ttf', 'big.ttf'),
+		},
+	});
+
+	const dummyTrack = createDummyAudioTrack('opus', output);
+
+	await output.start();
+	await dummyTrack.addPacket();
+	await output.finalize();
+
+	const buffer = new Uint8Array(output.target.buffer!);
+	let bytesRead = 0;
+
+	using input = new Input({
+		source: new CustomSource({
+			getSize: () => buffer.byteLength,
+			read: (start, end) => {
+				bytesRead += end - start;
+				return buffer.subarray(start, end);
+			},
+		}),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryAudioTrack();
+	expect(track).not.toBeNull();
+	const packet = await new PacketReader(track!).getFirst();
+	expect(packet).not.toBeNull();
+	expect(packet!.data.byteLength).toBe(2000);
+
+	// None of the attachment's megabytes were needed for the tracks or the first packet
+	expect(bytesRead).toBeLessThan(2 ** 20);
+
+	const readTags = await input.getMetadataTags();
+	expect(readTags.title).toBe('Fonts');
+	const file = readTags.raw!['123'];
+	expect(file).toBeInstanceOf(AttachedFile);
+	expect((file as AttachedFile).name).toBe('big.ttf');
+	expect(Buffer.compare((file as AttachedFile).data, fontData)).toBe(0);
+	expect(bytesRead).toBeGreaterThan(fontData.length);
 });
