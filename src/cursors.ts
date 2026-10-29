@@ -831,16 +831,37 @@ export abstract class SampleCursor<
 			await this._stopPump();
 		}
 
-		if (!this._pumpTarget || targetPacket.sequenceNumber > this._pumpTarget.sequenceNumber) {
-			this._pumpTarget = targetPacket;
-		}
-		this._lastTarget = targetPacket;
+		let startTarget = targetPacket;
 
 		if (needsNewPump) {
 			// Set the cursor to the right spot
-			const result = this._packetCursor.seekToKey(targetPacket.timestamp);
-			if (isThenable(result)) await result;
+			let startKey = this._packetCursor.seekToKey(targetPacket.timestamp);
+			if (isThenable(startKey)) startKey = await startKey;
 
+			if (!startKey) {
+				// The target presents before every key packet (leading pictures of a track cut mid-group, or of an
+				// open group ahead of the first IDR picture), so decoding starts at the first key packet it can start
+				// at, and the request resolves to that packet's sample
+				let firstKey = this._packetReader.getFirstKey({ ...this._retrievalOptions, verifyKeyPackets: true });
+				if (isThenable(firstKey)) firstKey = await firstKey;
+				this._ensureNotClosed();
+
+				if (!firstKey) {
+					throw new Error('The track has no key packet that decoding can start at.');
+				}
+
+				startTarget = firstKey;
+				const result = this._packetCursor.seekToKey(firstKey.timestamp);
+				if (isThenable(result)) await result;
+			}
+		}
+
+		if (!this._pumpTarget || startTarget.sequenceNumber > this._pumpTarget.sequenceNumber) {
+			this._pumpTarget = startTarget;
+		}
+		this._lastTarget = startTarget;
+
+		if (needsNewPump) {
 			// Start the new pump
 			void this._runPump();
 		}
@@ -857,7 +878,7 @@ export abstract class SampleCursor<
 		// Add the request to the queue
 		const request = promiseWithResolvers<TransformedSample | null>();
 		const pendingRequest: PendingRequest<TransformedSample> = {
-			timestamp: targetPacket.timestamp,
+			timestamp: startTarget.timestamp,
 			promise: request.promise,
 			resolve: request.resolve,
 			reject: request.reject,
