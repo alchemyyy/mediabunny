@@ -473,7 +473,8 @@ export const deserializeAvcDecoderConfigurationRecord = (data: Uint8Array): AvcD
 			sequenceParameterSetExt: null,
 		};
 
-		// Check if there are extended profile fields
+		// Check if there are extended profile fields. Some muxers leave junk after the PPS instead, so they are read
+		// only when their reserved bits are set and their SPS extensions fit; any other tail is ignored.
 		if (
 			(
 				avcProfileIndication === 100
@@ -482,19 +483,18 @@ export const deserializeAvcDecoderConfigurationRecord = (data: Uint8Array): AvcD
 				|| avcProfileIndication === 144
 			)
 			&& offset + 4 <= data.length
+			&& (data[offset]! & 0xFC) === 0xFC
+			&& (data[offset + 1]! & 0xF8) === 0xF8
+			&& (data[offset + 2]! & 0xF8) === 0xF8
 		) {
 			const chromaFormat = view.getUint8(offset++) & 0x03;
 			const bitDepthLumaMinus8 = view.getUint8(offset++) & 0x07;
 			const bitDepthChromaMinus8 = view.getUint8(offset++) & 0x07;
 			const numOfSequenceParameterSetExt = view.getUint8(offset++);
 
-			record.chromaFormat = chromaFormat;
-			record.bitDepthLumaMinus8 = bitDepthLumaMinus8;
-			record.bitDepthChromaMinus8 = bitDepthChromaMinus8;
-
 			// Read SPS Ext
 			const sequenceParameterSetExt: Uint8Array[] = [];
-			for (let i = 0; i < numOfSequenceParameterSetExt; i++) {
+			for (let i = 0; i < numOfSequenceParameterSetExt && offset + 2 <= data.length; i++) {
 				const length = view.getUint16(offset, false);
 				offset += 2;
 
@@ -502,7 +502,12 @@ export const deserializeAvcDecoderConfigurationRecord = (data: Uint8Array): AvcD
 				offset += length;
 			}
 
-			record.sequenceParameterSetExt = sequenceParameterSetExt;
+			if (sequenceParameterSetExt.length === numOfSequenceParameterSetExt && offset <= data.length) {
+				record.chromaFormat = chromaFormat;
+				record.bitDepthLumaMinus8 = bitDepthLumaMinus8;
+				record.bitDepthChromaMinus8 = bitDepthChromaMinus8;
+				record.sequenceParameterSetExt = sequenceParameterSetExt;
+			}
 		}
 
 		return record;
