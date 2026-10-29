@@ -2768,11 +2768,24 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 			// Note that this doesn't only kick for faulty cue points but also for multi-track files where only one
 			// track has cue points. Since we distribute the cue points to the track with none, they might not
 			// accurately reflect where media can be found.
+			//
+			// The entry of the other kind can lie closer, though. The position cache only holds the clusters read so
+			// far, so its previous entry may lie far back, or there may be none, while the cue point it won over lies
+			// before where this lookup started too. So the retry starts from whichever of the two comes later, and a
+			// step past the first entry stops at it; only when no entry comes before the search timestamp, which every
+			// retry must move back from, do we scan the segment from its start.
 			const step = 1 << lookupRetryCount;
-			const previousEntryTimestamp = cuePointWins
-				? this.internalTrack.cuePoints[cuePointIndex - step]?.time
-				: this.internalTrack.clusterPositionCache[positionCacheIndex - step]?.startTimestamp;
-			const newSearchTimestamp = previousEntryTimestamp ?? -Infinity;
+			const entryIndex = cuePointWins ? cuePointIndex : positionCacheIndex;
+			const previousEntryIndex = entryIndex > 0 ? Math.max(entryIndex - step, 0) : -1;
+			const candidateTimestamps = cuePointWins
+				? [this.internalTrack.cuePoints[previousEntryIndex]?.time, positionCacheEntry?.startTimestamp]
+				: [this.internalTrack.clusterPositionCache[previousEntryIndex]?.startTimestamp, cuePoint?.time];
+			let newSearchTimestamp = -Infinity;
+			for (const candidateTimestamp of candidateTimestamps) {
+				if (candidateTimestamp !== undefined && candidateTimestamp < searchTimestamp) {
+					newSearchTimestamp = Math.max(newSearchTimestamp, candidateTimestamp);
+				}
+			}
 
 			return this.performClusterLookup(
 				res,
