@@ -26,7 +26,7 @@ export const enum MpegTsStreamType {
 	PRIVATE_DATA = 0x06,
 	AVC = 0x1b,
 	HEVC = 0x24,
-	// SMPTE RP 227: VC-1, marked by a 'VC-1' registration descriptor, or within a Blu-ray program
+	// SMPTE RP 227: VC-1, read as such with or without the 'VC-1' registration descriptor
 	VC1 = 0xea,
 }
 

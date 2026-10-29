@@ -125,10 +125,6 @@ const HDPR_FORMAT_IDENTIFIER = 0x48445052;
 
 // 'DTS1', 'DTS2' and 'DTS3' all share this prefix
 const DTS_FORMAT_IDENTIFIER_PREFIX = 0x44545300;
-
-// The 'VC-1' format identifier, which SMPTE RP 227 requires of a VC-1 elementary stream
-const VC1_FORMAT_IDENTIFIER = 0x56432d31;
-
 const MPEG_VIDEO_AND_VC1_REORDER_SIZE = 1;
 
 // Stream types that only mean DTS within a Blu-ray-derived program
@@ -405,7 +401,6 @@ export class MpegTsDemuxer extends Demuxer {
 						let hasAc3Descriptor = false;
 						let hasEac3Descriptor = false;
 						let hasDtsDescriptor = false;
-						let hasVc1Registration = false;
 						while (bitstream.pos < esInfoEndPos) {
 							const descriptorTag = bitstream.readBits(8);
 							const descriptorLength = bitstream.readBits(8);
@@ -422,7 +417,6 @@ export class MpegTsDemuxer extends Demuxer {
 								// which we work out from the bitstream anyway
 								const formatIdentifier = bitstream.readBits(32);
 								hasDtsDescriptor ||= (formatIdentifier & 0xffffff00) === DTS_FORMAT_IDENTIFIER_PREFIX;
-								hasVc1Registration ||= formatIdentifier === VC1_FORMAT_IDENTIFIER;
 							}
 
 							bitstream.pos = descriptorEndPos;
@@ -435,13 +429,9 @@ export class MpegTsDemuxer extends Demuxer {
 							? MpegTsStreamType.DTS
 							: streamType;
 
-						// 0xea is VC-1 only with the elementary stream's 'VC-1' registration descriptor, or in a
-						// Blu-ray program, which omits it
-						const isUnregisteredVc1 = effectiveStreamType === MpegTsStreamType.VC1
-							&& !hasVc1Registration
-							&& !isBluRayProgram;
-
-						switch (isUnregisteredVc1 ? null : effectiveStreamType) {
+						// 0xea is always VC-1, as in FFmpeg's ISO stream type table: SMPTE RP 227 asks for a 'VC-1'
+						// registration descriptor, but Blu-ray programs and some muxers omit it
+						switch (effectiveStreamType) {
 							case MpegTsStreamType.AVC:
 							case MpegTsStreamType.HEVC:
 							case MpegTsStreamType.MPEG1_VIDEO:
