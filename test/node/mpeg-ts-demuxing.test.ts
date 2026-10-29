@@ -1082,3 +1082,109 @@ test('M2TS with VC-1 video', async () => {
 	expect(packets[1]!.data.slice(0, 4)).toEqual(new Uint8Array([0, 0, 1, 0x0d])); // Frame
 	expect(packets.map(packet => packet.type)).toEqual(packets.map((packet, i) => i === 0 ? 'key' : 'delta'));
 });
+
+const mpegTsCrc32 = (data: Uint8Array) => {
+	let crc = 0xffffffff;
+	for (const byte of data) {
+		crc ^= byte << 24;
+		for (let i = 0; i < 8; i++) {
+			crc = crc & 0x80000000 ? (crc << 1) ^ 0x04c11db7 : crc << 1;
+		}
+	}
+	return crc >>> 0;
+};
+
+// Rewrites each PMT without its registration descriptors, recomputing section_length, program_info_length,
+// ES_info_length, and the CRC
+const removeRegistrationDescriptors = (bytes: Uint8Array, packetSize: number) => {
+	const output = bytes.slice();
+	const syncOffset = packetSize - 188;
+	const withoutRegistrations = (descriptors: Uint8Array) => {
+		const kept: number[] = [];
+		for (let i = 0; i < descriptors.length; i += 2 + descriptors[i + 1]!) {
+			if (descriptors[i] !== 0x05) {
+				kept.push(...descriptors.subarray(i, i + 2 + descriptors[i + 1]!));
+			}
+		}
+		return kept;
+	};
+
+	let rewrittenCount = 0;
+	for (let packetStart = syncOffset; packetStart < output.length; packetStart += packetSize) {
+		const packet = output.subarray(packetStart, packetStart + 188);
+		if (!(packet[1]! & 0x40) || !(packet[3]! & 0x10)) {
+			continue;
+		}
+		const payloadStart = 4 + (packet[3]! & 0x20 ? 1 + packet[4]! : 0);
+		const sectionStart = payloadStart + 1 + packet[payloadStart]!;
+		if (packet[sectionStart] !== 0x02) {
+			continue;
+		}
+		const sectionEnd = sectionStart + 3 + (((packet[sectionStart + 1]! & 0x0f) << 8) | packet[sectionStart + 2]!);
+		const programInfoLength = ((packet[sectionStart + 10]! & 0x0f) << 8) | packet[sectionStart + 11]!;
+		const programInfo = withoutRegistrations(
+			packet.subarray(sectionStart + 12, sectionStart + 12 + programInfoLength),
+		);
+		const section = [
+			...packet.subarray(sectionStart, sectionStart + 10),
+			0xf0 | (programInfo.length >> 8), programInfo.length & 0xff, ...programInfo,
+		];
+		for (let entry = sectionStart + 12 + programInfoLength; entry < sectionEnd - 4;) {
+			const esInfoLength = ((packet[entry + 3]! & 0x0f) << 8) | packet[entry + 4]!;
+			const esInfo = withoutRegistrations(packet.subarray(entry + 5, entry + 5 + esInfoLength));
+			section.push(
+				...packet.subarray(entry, entry + 3),
+				0xf0 | (esInfo.length >> 8),
+				esInfo.length & 0xff,
+				...esInfo,
+			);
+			entry += 5 + esInfoLength;
+		}
+		const sectionLength = section.length + 4 - 3;
+		section[1] = (section[1]! & 0xf0) | (sectionLength >> 8);
+		section[2] = sectionLength & 0xff;
+		const crc = mpegTsCrc32(new Uint8Array(section));
+		section.push(crc >>> 24, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff);
+		packet.fill(0xff, sectionStart);
+		packet.set(section, sectionStart);
+		rewrittenCount++;
+	}
+
+	expect(rewrittenCount).toBeGreaterThan(0);
+	return output;
+};
+
+test('MPEG-TS with VC-1 video and no VC-1 registration descriptor, as FFmpeg reads it', async () => {
+	const bytes = new Uint8Array(fs.readFileSync(path.join(__dirname, '../public/vc1.m2ts')));
+	// Without the program's 'HDMV' and the stream's 'VC-1' registration, nothing marks the program as Blu-ray or
+	// the stream as VC-1 but its stream type
+	const unregistered = removeRegistrationDescriptors(bytes, 192);
+	expect(Buffer.from(unregistered).includes('HDMV')).toBe(false);
+	expect(Buffer.from(unregistered).includes('VC-1')).toBe(false);
+
+	const readTrack = async (source: Uint8Array) => {
+		using input = new Input({ source: new BufferSource(source), formats: ALL_FORMATS });
+		const videoTrack = await input.getPrimaryVideoTrack();
+		assert(videoTrack);
+		return {
+			codec: await videoTrack.getCodec(),
+			internalCodecId: await videoTrack.getInternalCodecId(),
+			codedWidth: await videoTrack.getCodedWidth(),
+			codedHeight: await videoTrack.getCodedHeight(),
+			decoderConfig: await videoTrack.getDecoderConfig(),
+			packets: (await readVideoPackets(videoTrack)).map(packet => ({
+				timestamp: packet.timestamp,
+				duration: packet.duration,
+				type: packet.type,
+				data: packet.data,
+			})),
+		};
+	};
+
+	const registeredTrack = await readTrack(bytes);
+	const unregisteredTrack = await readTrack(unregistered);
+	expect(unregisteredTrack.codec).toBe('vc1');
+	expect(unregisteredTrack.internalCodecId).toBe(MpegTsStreamType.VC1);
+	expect(unregisteredTrack.packets).toHaveLength(12);
+	expect(unregisteredTrack).toEqual(registeredTrack);
+});
