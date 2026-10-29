@@ -23,6 +23,7 @@ import {
 	toDataView,
 	toUint8Array,
 	isChromium,
+	getChromiumVersion,
 	popcount,
 	setUint24,
 	writeExpGolomb,
@@ -2765,11 +2766,33 @@ export const determineVideoPacketType = (
 ): PacketType | null => {
 	switch (codec) {
 		case 'avc': {
+			// In addition to IDR, Recovery Point SEI also counts as a valid H.264 keyframe by current consensus.
+			// See https://github.com/w3c/webcodecs/issues/650 for the relevant discussion. WebKit and Firefox have
+			// always supported them. Chromium's VideoDecoder accepts one whose recovery_frame_cnt is 0, whatever its
+			// exact_match_flag, since version 145 (https://issues.chromium.org/issues/424836493; the parsing is off
+			// in 144), and refuses it before.
+			const acceptsRecoveryPoints = !isChromium() || (getChromiumVersion() ?? 0) >= 145;
+			let hasChromiumRecoveryPoint = false;
+
 			for (const loc of iterateAvcNalUnits(packetData, decoderConfig)) {
 				const nalTypeByte = packetData[loc.offset]!;
 				const type = extractNalUnitTypeForAvc(nalTypeByte);
 
 				if (type >= AvcNalUnitType.NON_IDR_SLICE && type <= AvcNalUnitType.SLICE_DPC) {
+					// Chromium takes a recovery point on any picture, but only an I picture (whose first slice is an
+					// I slice) is taken here, since decoding cannot start at anything else
+					if (hasChromiumRecoveryPoint && type <= AvcNalUnitType.SLICE_DPA) {
+						const bitstream = new Bitstream(removeEmulationPreventionBytes(
+							packetData.subarray(loc.offset, Math.min(loc.offset + 16, loc.offset + loc.length)),
+						));
+						bitstream.skipBits(8); // NALU header
+						readExpGolomb(bitstream); // first_mb_in_slice
+						const sliceType = readExpGolomb(bitstream);
+						if (sliceType % 5 === 2) {
+							return 'key';
+						}
+					}
+
 					return 'delta';
 				}
 
@@ -2777,10 +2800,7 @@ export const determineVideoPacketType = (
 					return 'key';
 				}
 
-				// In addition to IDR, Recovery Point SEI also counts as a valid H.264 keyframe by current consensus.
-				// See https://github.com/w3c/webcodecs/issues/650 for the relevant discussion. WebKit and Firefox have
-				// always supported them, but Chromium hasn't.
-				if (type === AvcNalUnitType.SEI && !isChromium()) {
+				if (type === AvcNalUnitType.SEI && acceptsRecoveryPoints) {
 					const nalUnit = packetData.subarray(loc.offset, loc.offset + loc.length);
 					const bytes = removeEmulationPreventionBytes(nalUnit);
 					let pos = 1; // Skip NALU header
@@ -2825,7 +2845,9 @@ export const determineVideoPacketType = (
 
 							const exactMatchFlag = bitstream.readBits(1);
 
-							if (recoveryFrameCount === 0 && exactMatchFlag === 1) {
+							if (recoveryFrameCount === 0 && isChromium()) {
+								hasChromiumRecoveryPoint = true;
+							} else if (recoveryFrameCount === 0 && exactMatchFlag === 1) {
 								// https://github.com/w3c/webcodecs/pull/910
 								// "recovery_frame_cnt == 0 and exact_match_flag=1 in the SEI recovery payload"
 								return 'key';
