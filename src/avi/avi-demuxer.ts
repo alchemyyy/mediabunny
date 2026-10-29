@@ -54,6 +54,7 @@ import {
 import { clearPackedMarker, hasDivXPackedUserData, MPEG4_MAX_NVOP_SIZE, scanMpeg4Chunk } from './avi-mpeg4-packed';
 import { AvcPictureOrderReader, HevcPictureOrderReader, PictureOrderReader } from './avi-picture-order';
 import { AviPresentationTimes } from './avi-presentation-times';
+import { AviAudioFrame, AviAudioFramer, getAviSyncFrameParser } from './avi-audio-frames';
 
 type StreamInfo = {
 	header: AVIStreamHeader;
@@ -671,6 +672,8 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 
 class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBacking {
 	decoderConfig: AudioDecoderConfig | null = null;
+	/** Splits MPEG audio and AC-3 chunks into syncframes; null for a format whose chunks are its packets. */
+	private framer: AviAudioFramer | null | undefined;
 
 	getType() {
 		return 'audio' as const;
@@ -719,6 +722,95 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 			sampleRate: this.getSampleRate(),
 			description: codecDescription ?? undefined,
 		};
+	}
+
+	private getFramer() {
+		if (this.framer === undefined) {
+			this.framer = this.demuxer.createAudioFramer(this.streamInfo);
+		}
+		return this.framer;
+	}
+
+	/** Creates a packet of one syncframe; its sequence number is its offset in the stream's data. */
+	private async createFramePacket(
+		res: ResultValue<PacketRetrievalResult>,
+		framer: AviAudioFramer,
+		frame: AviAudioFrame | null,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
+		if (!frame) {
+			return res.set(new PacketRetrievalResult(null));
+		}
+
+		const data = options.metadataOnly ? PLACEHOLDER_DATA : await framer.readFrame(frame);
+		if (!data) {
+			return res.set(new PacketRetrievalResult(null));
+		}
+
+		return res.set(new PacketRetrievalResult(new EncodedPacket(
+			data,
+			'key',
+			frame.timestamp,
+			frame.duration,
+			frame.offset,
+			frame.size,
+		)));
+	}
+
+	override async getFirstPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
+		const framer = this.getFramer();
+		if (!framer) {
+			return super.getFirstPacket(res, options);
+		}
+
+		return this.createFramePacket(res, framer, await framer.getFirstFrame(), options);
+	}
+
+	override async getPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		timestamp: number,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
+		const framer = this.getFramer();
+		if (!framer) {
+			return super.getPacket(res, timestamp, options);
+		}
+
+		return this.createFramePacket(res, framer, await framer.getFrameAt(timestamp), options);
+	}
+
+	override async getNextPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		packet: EncodedPacket,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
+		const framer = this.getFramer();
+		if (!framer) {
+			return super.getNextPacket(res, packet, options);
+		}
+
+		return this.createFramePacket(res, framer, await framer.getNextFrame(packet.sequenceNumber), options);
+	}
+
+	override async getKeyPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		timestamp: number,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
+		return this.getFramer() ? this.getPacket(res, timestamp, options) : super.getKeyPacket(res, timestamp, options);
+	}
+
+	override async getNextKeyPacket(
+		res: ResultValue<PacketRetrievalResult>,
+		packet: EncodedPacket,
+		options: PacketRetrievalOptions,
+	): MaybeRelevantPromise {
+		return this.getFramer()
+			? this.getNextPacket(res, packet, options)
+			: super.getNextKeyPacket(res, packet, options);
 	}
 }
 
@@ -1222,6 +1314,26 @@ export class AVIDemuxer extends Demuxer {
 				return slice && readBytes(slice, byteCount);
 			},
 		);
+	}
+
+	/**
+	 * Creates the framer of an audio stream whose chunks need not hold whole frames, MPEG audio or AC-3, timed by
+	 * bytes when its chunks are; null for any other stream.
+	 */
+	createAudioFramer(stream: StreamInfo) {
+		const { header, format } = stream;
+		const parser = 'formatTag' in format ? getAviSyncFrameParser(format) : null;
+		if (!parser) {
+			return null;
+		}
+
+		const secondsPerByte = header.sampleSize > 0 && header.rate > 0 && header.scale > 0
+			? header.scale / (header.rate * header.sampleSize)
+			: null;
+		return new AviAudioFramer(parser, stream.packets, secondsPerByte, async (position, length) => {
+			const slice = await this.reader.requestSlice(position, length);
+			return slice && readBytes(slice, length);
+		});
 	}
 
 	async readPacket(packetInfo: PacketInfo, sequenceNumber: number): Promise<EncodedPacket | null> {
