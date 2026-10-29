@@ -163,6 +163,8 @@ export type AviAudioFrame = {
 // The chunks whose frames are kept, enough for reading on from a few positions at once
 const FRAME_CACHE_CHUNK_COUNT = 16;
 const ID3_HEADER_SIZE = 10;
+// The bytes at a stream's start that must hold a frame for the stream to be split into frames
+const FRAME_PROBE_BYTE_COUNT = 64 * 1024;
 
 /**
  * Splits an AVI audio stream into one packet per syncframe, as FFmpeg's demuxer runs a parser on AVI audio: a muxer
@@ -186,6 +188,7 @@ export class AviAudioFramer {
 	private size = 0;
 	private framesByChunk = new Map<number, Promise<AviAudioFrame[]>>();
 	private dataStartPromise: Promise<number> | null = null;
+	private hasFramesPromise: Promise<boolean> | null = null;
 
 	constructor(
 		private parser: SyncFrameParser,
@@ -198,6 +201,27 @@ export class AviAudioFramer {
 			this.chunkOffsets.push(this.size);
 			this.size += chunk.entry.size;
 		}
+	}
+
+	/**
+	 * Returns whether a frame starts in the stream's first 64 KiB after a leading ID3 tag. A stream without one, such
+	 * as free-format MPEG audio, whose headers give no frame size, keeps its chunks as its packets, which a bounded
+	 * read decides.
+	 */
+	hasFrames(): Promise<boolean> {
+		return this.hasFramesPromise ??= (async () => {
+			const probeEnd = await this.getDataStart() + FRAME_PROBE_BYTE_COUNT;
+			for (let chunkIndex = 0; chunkIndex < this.chunks.length; chunkIndex++) {
+				if (this.chunkOffsets[chunkIndex]! >= probeEnd) {
+					break;
+				}
+				if ((await this.getChunkFrames(chunkIndex)).length > 0) {
+					return true;
+				}
+			}
+
+			return false;
+		})();
 	}
 
 	async getFirstFrame(): Promise<AviAudioFrame | null> {
