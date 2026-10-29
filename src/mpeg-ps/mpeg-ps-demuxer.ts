@@ -644,6 +644,13 @@ export class MpegPsDemuxer extends Demuxer {
 		offset: number;
 	} | null = null;
 
+	/**
+	 * Per stream, the position from which the file holds none of its PES packets, or none with a PTS, as a search that
+	 * read to the end found.
+	 */
+	pesPacketEnds = new Map<number, number>();
+	timestampedPesPacketEnds = new Map<number, number>();
+
 	constructor(input: Input) {
 		super(input);
 
@@ -956,7 +963,8 @@ export class MpegPsDemuxer extends Demuxer {
 
 	/**
 	 * Returns the first PES packet of a stream at or after a position, or only one with a PTS; null when none comes
-	 * before the end position.
+	 * before the end position. A search that reads to the end of the file records where the stream's packets ran out,
+	 * and later searches stop there.
 	 */
 	async findPesPacket(
 		streamKey: number,
@@ -964,9 +972,21 @@ export class MpegPsDemuxer extends Demuxer {
 		timestampedOnly: boolean,
 		endPos = Infinity,
 	): Promise<ProgramStreamPesPacket | null> {
-		while (pos < endPos) {
+		const packetEnds = timestampedOnly ? this.timestampedPesPacketEnds : this.pesPacketEnds;
+		const boundedEndPos = Math.min(
+			endPos,
+			packetEnds.get(streamKey) ?? Infinity,
+			this.pesPacketEnds.get(streamKey) ?? Infinity,
+		);
+		const startPos = pos;
+
+		while (pos < boundedEndPos) {
 			const unit = await this.readUnit(pos);
-			if (!unit || unit.pos >= endPos) {
+			if (!unit) {
+				packetEnds.set(streamKey, Math.min(packetEnds.get(streamKey) ?? Infinity, startPos));
+				return null;
+			}
+			if (unit.pos >= boundedEndPos) {
 				return null;
 			}
 
@@ -1319,13 +1339,18 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 		);
 		let window = demuxer.seekChunkSize;
 
+		// Each try looks for its starting PES packet only before where the previous one started looking
+		let searchedPos = Infinity;
+
 		while (true) {
 			let startPesPacket: TimestampedPesPacket | null = firstPesPacket;
 			if (startPos > firstPesPacket.sectionStartPos) {
 				const packHeaderPos = await demuxer.findPackHeader(startPos);
-				startPesPacket = packHeaderPos !== null
-					? await demuxer.findPesPacket(stream.pid, packHeaderPos, true) as TimestampedPesPacket | null
+				startPesPacket = packHeaderPos !== null && packHeaderPos < searchedPos
+					? await demuxer.findPesPacket(stream.pid, packHeaderPos, true, searchedPos) as
+						TimestampedPesPacket | null
 					: null;
+				searchedPos = Math.min(searchedPos, packHeaderPos ?? Infinity);
 			}
 
 			if (startPesPacket) {

@@ -4,7 +4,7 @@
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import {
 	ALL_FORMATS,
 	BufferSource,
@@ -523,4 +523,41 @@ test('Should leave out a program stream track whose packets cannot be read', asy
 	const tracks = await input.getTracks();
 	expect(tracks.map(track => track.type)).toEqual(['video']);
 	expect(await readAllPackets(tracks[0]!)).toHaveLength(24);
+});
+
+test('Should stop looking for a stream\'s packets where they ran out', async () => {
+	// The AC-3 packets after the first second turned into padding, so the audio ends a third of the way in
+	const bytes = readMedia('mpeg2-ac3.vob');
+	const audioEnd = Math.floor(bytes.length / 3);
+	let lastAudioEnd = 0;
+	let unitsAfterAudio = 0;
+	forEachUnit(bytes, (offset, code) => {
+		if (code === 0xbd && offset >= audioEnd) {
+			bytes[offset + 3] = 0xbe;
+		} else if (code === 0xbd) {
+			lastAudioEnd = getUnitEnd(bytes, offset);
+		}
+		if (offset >= audioEnd) {
+			unitsAfterAudio++;
+		}
+	});
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const audioTrack = (await input.getPrimaryAudioTrack())!;
+	const demuxer = await input._demuxerPromise as MpegPsDemuxer;
+	demuxer.seekChunkSize = 2048;
+	const packets = await readAllPackets(audioTrack);
+	const lastPacket = packets.at(-1)!;
+	expect(lastPacket.sequenceNumber).toBeLessThan(lastAudioEnd);
+
+	const reader = new PacketReader(audioTrack);
+	const readUnit = vi.spyOn(demuxer, 'readUnit');
+	for (let i = 0; i < 2; i++) {
+		readUnit.mockClear();
+		// Past the stream's end, a lookup steps back in doubling windows from a pack near the end of the file
+		expect((await reader.getAt(2.9))?.sequenceNumber).toBe(lastPacket.sequenceNumber);
+		expect((await reader.getNext(lastPacket))).toBeNull();
+		// Each window is searched up to the previous one only, and the read to the end of the file happens once
+		expect(readUnit.mock.calls.length).toBeLessThan((i === 0 ? 2 : 1) * unitsAfterAudio);
+	}
 });
