@@ -672,8 +672,11 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 
 class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBacking {
 	decoderConfig: AudioDecoderConfig | null = null;
-	/** Splits MPEG audio and AC-3 chunks into syncframes; null for a format whose chunks are its packets. */
-	private framer: AviAudioFramer | null | undefined;
+	/**
+	 * Splits MPEG audio and AC-3 chunks into syncframes; null for a format whose chunks are its packets, or a stream
+	 * whose start holds no frame.
+	 */
+	private framerPromise: Promise<AviAudioFramer | null> | null = null;
 
 	getType() {
 		return 'audio' as const;
@@ -725,10 +728,10 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 	}
 
 	private getFramer() {
-		if (this.framer === undefined) {
-			this.framer = this.demuxer.createAudioFramer(this.streamInfo);
-		}
-		return this.framer;
+		return this.framerPromise ??= (async () => {
+			const framer = this.demuxer.createAudioFramer(this.streamInfo);
+			return framer && await framer.hasFrames() ? framer : null;
+		})();
 	}
 
 	/** Creates a packet of one syncframe; its sequence number is its offset in the stream's data. */
@@ -761,7 +764,7 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 		res: ResultValue<PacketRetrievalResult>,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		const framer = this.getFramer();
+		const framer = await this.getFramer();
 		if (!framer) {
 			return super.getFirstPacket(res, options);
 		}
@@ -774,7 +777,7 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 		timestamp: number,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		const framer = this.getFramer();
+		const framer = await this.getFramer();
 		if (!framer) {
 			return super.getPacket(res, timestamp, options);
 		}
@@ -787,7 +790,7 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 		packet: EncodedPacket,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		const framer = this.getFramer();
+		const framer = await this.getFramer();
 		if (!framer) {
 			return super.getNextPacket(res, packet, options);
 		}
@@ -800,7 +803,9 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 		timestamp: number,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		return this.getFramer() ? this.getPacket(res, timestamp, options) : super.getKeyPacket(res, timestamp, options);
+		return await this.getFramer()
+			? this.getPacket(res, timestamp, options)
+			: super.getKeyPacket(res, timestamp, options);
 	}
 
 	override async getNextKeyPacket(
@@ -808,7 +813,7 @@ class AviAudioTrackBacking extends AviTrackBacking implements InputAudioTrackBac
 		packet: EncodedPacket,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		return this.getFramer()
+		return await this.getFramer()
 			? this.getNextPacket(res, packet, options)
 			: super.getNextKeyPacket(res, packet, options);
 	}

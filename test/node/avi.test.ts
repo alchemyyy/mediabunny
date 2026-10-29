@@ -1062,3 +1062,29 @@ test('AVI E-AC-3 dependent substream frames join the packet of the independent f
 	expect(packets.map(packet => Math.round(packet.timestamp * 12000)))
 		.toEqual([0, 768, 1536, 2304, 3072, ...[...Array(12).keys()].map(index => (index + 10) * 384)]);
 });
+
+test('AVI MPEG audio whose start holds no frame, as free-format MPEG audio, keeps its chunks as packets', async () => {
+	// mp3-only.avi with every frame header made free-format (bitrate index 0), whose headers give no frame size
+	const bytes = new Uint8Array(readFileSync('test/public/avi/mp3-only.avi'));
+	const chunks = getAudioChunks(bytes);
+	for (const { position } of chunks) {
+		expect(bytes[position]).toBe(0xFF);
+		bytes[position + 2]! &= 0x0F;
+	}
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	const track = (await input.getAudioTracks())[0]!;
+	const packets = await readAllPackets(input, 'audio');
+	expect(packets.map(packet => [...packet.data]))
+		.toEqual(chunks.map(({ position, size }) => [...bytes.subarray(position, position + size)]));
+	const frameDuration = 1152 / await track.getSampleRate();
+	for (const [index, packet] of packets.entries()) {
+		expect(packet.timestamp).toBeCloseTo(index * frameDuration, 9);
+	}
+
+	const reader = new PacketReader(track);
+	expect([...(await reader.getAt(2.5 * frameDuration))!.data]).toEqual([...packets[2]!.data]);
+});
