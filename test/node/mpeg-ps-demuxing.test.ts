@@ -4,7 +4,7 @@
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import {
 	ALL_FORMATS,
 	BufferSource,
@@ -163,17 +163,23 @@ const hashPackets = (packets: EncodedPacket[]) => createHash('md5')
 	.update(packets.map(packet => createHash('md5').update(packet.data).digest('hex')).join(''))
 	.digest('hex');
 
-/** Calls back with the offset and start code of each pack header and PES packet of an MPEG-2 program stream. */
+/** Calls back with the offset and start code of each pack header and PES packet of a program stream. */
 const forEachUnit = (bytes: Uint8Array, callback: (offset: number, code: number) => void) => {
 	let offset = 0;
 	while (offset + 6 <= bytes.length) {
 		const code = bytes[offset + 3]!;
 		callback(offset, code);
-		offset += code === 0xba
-			? 14 + (bytes[offset + 13]! & 0x07)
-			: 6 + ((bytes[offset + 4]! << 8) | bytes[offset + 5]!);
+		if (code !== 0xba) {
+			offset += 6 + ((bytes[offset + 4]! << 8) | bytes[offset + 5]!);
+		} else if ((bytes[offset + 4]! & 0xf0) === 0x20) {
+			offset += 12; // An MPEG-1 pack header
+		} else {
+			offset += 14 + (bytes[offset + 13]! & 0x07);
+		}
 	}
 };
+
+const getUnitEnd = (bytes: Uint8Array, offset: number) => offset + 6 + ((bytes[offset + 4]! << 8) | bytes[offset + 5]!);
 
 const hasPts = (bytes: Uint8Array, offset: number) => (bytes[offset + 7]! & 0x80) !== 0;
 
@@ -467,5 +473,91 @@ test('Should read MPEG program stream timestamps across their wraparound', async
 		const reader = new PacketReader(track);
 		const lastKey = originalPackets.filter(packet => packet.type === 'key').at(-1)!;
 		expect((await reader.getKeyAt(lastKey.timestamp - 2))?.sequenceNumber).toBe(lastKey.sequenceNumber);
+	}
+});
+
+test('Should detect a program stream whose first pack holds MPEG audio frames as MPEG-PS, not MP3', async () => {
+	// The first audio packet moved ahead of the first video packet, so the first 4 KB hold consecutive MP2 frames, as
+	// an MPEG-1 system stream may start
+	const bytes = readMedia('mpeg1-mp2.mpg');
+	let firstVideoOffset = -1;
+	let audioOffset = -1;
+	forEachUnit(bytes, (offset, code) => {
+		if (code === 0xe0 && firstVideoOffset === -1) {
+			firstVideoOffset = offset;
+		} else if (code === 0xc0 && audioOffset === -1) {
+			audioOffset = offset;
+		}
+	});
+	expect(audioOffset).toBeGreaterThan(firstVideoOffset);
+	const audioEnd = getUnitEnd(bytes, audioOffset);
+	const edited = new Uint8Array([
+		...bytes.subarray(0, firstVideoOffset),
+		...bytes.subarray(audioOffset, audioEnd),
+		...bytes.subarray(firstVideoOffset, audioOffset),
+		...bytes.subarray(audioEnd),
+	]);
+
+	using input = new Input({ source: new BufferSource(edited), formats: ALL_FORMATS });
+	expect(await input.getFormat()).toBe(MPEG_PS);
+	// Its tracks come in the order of their first packets
+	expect((await input.getTracks()).map(track => track.type)).toEqual(['audio', 'video']);
+});
+
+test('Should leave out a program stream track whose packets cannot be read', async () => {
+	// MP2 PES packets emptied of their frames, as audio of another codec in an MPEG audio stream ID would read
+	const bytes = readMedia('mpeg1-mp2.mpg');
+	forEachUnit(bytes, (offset, code) => {
+		if (code === 0xc0) {
+			let dataOffset = offset + 6;
+			while (bytes[dataOffset] === 0xff) {
+				dataOffset++;
+			}
+			const marker = bytes[dataOffset]! >> 4;
+			dataOffset += marker === 0b0010 ? 5 : marker === 0b0011 ? 10 : 1;
+			bytes.fill(0, dataOffset, getUnitEnd(bytes, offset));
+		}
+	});
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tracks = await input.getTracks();
+	expect(tracks.map(track => track.type)).toEqual(['video']);
+	expect(await readAllPackets(tracks[0]!)).toHaveLength(24);
+});
+
+test('Should stop looking for a stream\'s packets where they ran out', async () => {
+	// The AC-3 packets after the first second turned into padding, so the audio ends a third of the way in
+	const bytes = readMedia('mpeg2-ac3.vob');
+	const audioEnd = Math.floor(bytes.length / 3);
+	let lastAudioEnd = 0;
+	let unitsAfterAudio = 0;
+	forEachUnit(bytes, (offset, code) => {
+		if (code === 0xbd && offset >= audioEnd) {
+			bytes[offset + 3] = 0xbe;
+		} else if (code === 0xbd) {
+			lastAudioEnd = getUnitEnd(bytes, offset);
+		}
+		if (offset >= audioEnd) {
+			unitsAfterAudio++;
+		}
+	});
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const audioTrack = (await input.getPrimaryAudioTrack())!;
+	const demuxer = await input._demuxerPromise as MpegPsDemuxer;
+	demuxer.seekChunkSize = 2048;
+	const packets = await readAllPackets(audioTrack);
+	const lastPacket = packets.at(-1)!;
+	expect(lastPacket.sequenceNumber).toBeLessThan(lastAudioEnd);
+
+	const reader = new PacketReader(audioTrack);
+	const readUnit = vi.spyOn(demuxer, 'readUnit');
+	for (let i = 0; i < 2; i++) {
+		readUnit.mockClear();
+		// Past the stream's end, a lookup steps back in doubling windows from a pack near the end of the file
+		expect((await reader.getAt(2.9))?.sequenceNumber).toBe(lastPacket.sequenceNumber);
+		expect((await reader.getNext(lastPacket))).toBeNull();
+		// Each window is searched up to the previous one only, and the read to the end of the file happens once
+		expect(readUnit.mock.calls.length).toBeLessThan((i === 0 ? 2 : 1) * unitsAfterAudio);
 	}
 });
