@@ -1037,7 +1037,9 @@ export const MPEG_PS = /* #__PURE__ */ new MpegPsInputFormat();
  * @public
  */
 export const ALL_FORMATS: InputFormat[] = [
-	HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, AIFF, OGG, FLAC, MP3, ADTS, MPEG_TS, MPEG_PS, AVI, ASF,
+	// A program stream begins with a pack header, ahead of MP3's and ADTS's scans for consecutive frames, which
+	// the MPEG audio in its first packs could pass
+	HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, AIFF, OGG, FLAC, MPEG_PS, MP3, ADTS, MPEG_TS, AVI, ASF,
 ];
 
 /**

@@ -163,17 +163,23 @@ const hashPackets = (packets: EncodedPacket[]) => createHash('md5')
 	.update(packets.map(packet => createHash('md5').update(packet.data).digest('hex')).join(''))
 	.digest('hex');
 
-/** Calls back with the offset and start code of each pack header and PES packet of an MPEG-2 program stream. */
+/** Calls back with the offset and start code of each pack header and PES packet of a program stream. */
 const forEachUnit = (bytes: Uint8Array, callback: (offset: number, code: number) => void) => {
 	let offset = 0;
 	while (offset + 6 <= bytes.length) {
 		const code = bytes[offset + 3]!;
 		callback(offset, code);
-		offset += code === 0xba
-			? 14 + (bytes[offset + 13]! & 0x07)
-			: 6 + ((bytes[offset + 4]! << 8) | bytes[offset + 5]!);
+		if (code !== 0xba) {
+			offset += 6 + ((bytes[offset + 4]! << 8) | bytes[offset + 5]!);
+		} else if ((bytes[offset + 4]! & 0xf0) === 0x20) {
+			offset += 12; // An MPEG-1 pack header
+		} else {
+			offset += 14 + (bytes[offset + 13]! & 0x07);
+		}
 	}
 };
+
+const getUnitEnd = (bytes: Uint8Array, offset: number) => offset + 6 + ((bytes[offset + 4]! << 8) | bytes[offset + 5]!);
 
 const hasPts = (bytes: Uint8Array, offset: number) => (bytes[offset + 7]! & 0x80) !== 0;
 
@@ -468,4 +474,32 @@ test('Should read MPEG program stream timestamps across their wraparound', async
 		const lastKey = originalPackets.filter(packet => packet.type === 'key').at(-1)!;
 		expect((await reader.getKeyAt(lastKey.timestamp - 2))?.sequenceNumber).toBe(lastKey.sequenceNumber);
 	}
+});
+
+test('Should detect a program stream whose first pack holds MPEG audio frames as MPEG-PS, not MP3', async () => {
+	// The first audio packet moved ahead of the first video packet, so the first 4 KB hold consecutive MP2 frames, as
+	// an MPEG-1 system stream may start
+	const bytes = readMedia('mpeg1-mp2.mpg');
+	let firstVideoOffset = -1;
+	let audioOffset = -1;
+	forEachUnit(bytes, (offset, code) => {
+		if (code === 0xe0 && firstVideoOffset === -1) {
+			firstVideoOffset = offset;
+		} else if (code === 0xc0 && audioOffset === -1) {
+			audioOffset = offset;
+		}
+	});
+	expect(audioOffset).toBeGreaterThan(firstVideoOffset);
+	const audioEnd = getUnitEnd(bytes, audioOffset);
+	const edited = new Uint8Array([
+		...bytes.subarray(0, firstVideoOffset),
+		...bytes.subarray(audioOffset, audioEnd),
+		...bytes.subarray(firstVideoOffset, audioOffset),
+		...bytes.subarray(audioEnd),
+	]);
+
+	using input = new Input({ source: new BufferSource(edited), formats: ALL_FORMATS });
+	expect(await input.getFormat()).toBe(MPEG_PS);
+	// Its tracks come in the order of their first packets
+	expect((await input.getTracks()).map(track => track.type)).toEqual(['audio', 'video']);
 });
