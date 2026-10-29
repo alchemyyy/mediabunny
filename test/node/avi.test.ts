@@ -11,6 +11,8 @@ import { EncodedVideoPacketSource, EncodedAudioPacketSource, PacketCursor, Packe
 import { EncodedPacket } from '../../src/index.js';
 import { registerMpeg4Decoder, registerMpeg4Encoder } from '../../packages/mpeg4/src/index.js';
 import { aviWaveFormatToCodec, parseWaveFormatEx } from '../../src/avi/avi-misc.js';
+import { AC3_FRAME_SIZES } from '../../src/codec-data.js';
+import { readMp3FrameHeader } from '../../shared/mp3-misc.js';
 
 beforeAll(() => {
 	registerMpeg4Decoder();
@@ -834,4 +836,229 @@ test('Should keep an audio stream of an unmapped format tag, codec-less, with it
 		packets.push({ timestamp: packet.timestamp, size: packet.data.byteLength });
 	}
 	expect(packets).toEqual([0, 1, 2, 3, 4].map(index => ({ timestamp: index * 2048 / 44100, size: 371 })));
+});
+
+/** Returns the size of the MPEG audio frame, or the AC-3 or E-AC-3 syncframe, that data starts with, or null. */
+const getSyncFrameSize = (data: Uint8Array) => {
+	if (data[0] === 0x0B && data[1] === 0x77) {
+		return data[5]! >> 3 <= 10
+			? AC3_FRAME_SIZES[3 * (data[4]! & 0x3F) + (data[4]! >> 6)]!
+			: ((((data[2]! & 0x7) << 8) | data[3]!) + 1) * 2;
+	}
+
+	const word = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0);
+	return readMp3FrameHeader(word, null).header?.totalSize ?? null;
+};
+
+/** Returns the file positions and sizes of an AVI's non-empty audio chunks, as its idx1 lists them. */
+const getAudioChunks = (bytes: Uint8Array) => {
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const moviStart = Buffer.from(bytes).indexOf('movi');
+	const indexStart = Buffer.from(bytes).lastIndexOf('idx1') + 8;
+	const indexEnd = indexStart + view.getUint32(indexStart - 4, true);
+	const chunks: { position: number; size: number }[] = [];
+	for (let entry = indexStart; entry + 16 <= indexEnd; entry += 16) {
+		const size = view.getUint32(entry + 12, true);
+		if (latin1.decode(bytes.subarray(entry + 2, entry + 4)) === 'wb' && size > 0) {
+			chunks.push({ position: moviStart + view.getUint32(entry + 8, true) + 8, size });
+		}
+	}
+
+	return chunks;
+};
+
+// Audio as VirtualDub-style muxers write it, timed by bytes (scale 1, rate the byte rate, sample size 1, block
+// alignment 1): a large first chunk, then chunks of about 1.4 frames with a two-frame chunk now and then, so no chunk
+// but the first starts on a frame. FFmpeg's parser splits such chunks into frames, and ffprobe -show_packets gives
+// frame i the time i frame durations, its offset in the stream over the byte rate
+const BYTE_STREAM_VECTORS = [
+	// MPEG-1 Layer III, 128 kbit/s at 48 kHz, CRC on, 384-byte frames
+	{ file: 'mp3-cbr-byte-stream.avi', codec: 'mp3', frameSize: 384, frameDuration: 0.024, frameCount: 60 },
+	// MPEG-1 Layer II under its own tag, which maps to no codec, 192 kbit/s, 576-byte frames
+	{ file: 'mp2-cbr-byte-stream.avi', codec: null, frameSize: 576, frameDuration: 0.024, frameCount: 21 },
+	// AC-3, 192 kbit/s at 48 kHz, 768-byte frames
+	{ file: 'ac3-cbr-byte-stream.avi', codec: 'ac3', frameSize: 768, frameDuration: 0.032, frameCount: 32 },
+	// E-AC-3 through WAVE_FORMAT_EXTENSIBLE, 96 kbit/s, 384-byte frames
+	{ file: 'eac3-extensible-byte-stream.avi', codec: 'eac3', frameSize: 384, frameDuration: 0.032, frameCount: 22 },
+];
+
+test('AVI MPEG audio and AC-3 timed by bytes are split into one packet per frame, timed as by FFmpeg', async () => {
+	for (const { file, codec, frameSize, frameDuration, frameCount } of BYTE_STREAM_VECTORS) {
+		using input = new Input({
+			source: new FilePathSource(`test/public/avi/${file}`),
+			formats: ALL_FORMATS,
+		});
+		expect(await (await input.getAudioTracks())[0]!.getCodec()).toBe(codec);
+
+		const packets = await readAllPackets(input, 'audio');
+		expect(packets).toHaveLength(frameCount);
+		for (const [index, packet] of packets.entries()) {
+			expect(getSyncFrameSize(packet.data)).toBe(frameSize);
+			expect(packet.byteLength).toBe(frameSize);
+			expect(packet.type).toBe('key');
+			expect(packet.timestamp).toBeCloseTo(index * frameDuration, 9);
+			expect(packet.duration).toBeCloseTo(frameDuration, 9);
+		}
+	}
+});
+
+test('AVI audio frames are the same whichever is read first, by timestamp or as the next packet', async () => {
+	for (const { file } of BYTE_STREAM_VECTORS) {
+		using sequentialInput = new Input({
+			source: new FilePathSource(`test/public/avi/${file}`),
+			formats: ALL_FORMATS,
+		});
+		const sequentialPackets = describePackets(await readAllPackets(sequentialInput, 'audio'));
+
+		// Last to first, each from a fresh input: midway through a frame, whose chunk starts in an earlier frame
+		for (let index = sequentialPackets.length - 1; index >= 0; index--) {
+			using input = new Input({
+				source: new FilePathSource(`test/public/avi/${file}`),
+				formats: ALL_FORMATS,
+			});
+			const reader = new PacketReader((await input.getAudioTracks())[0]!);
+			const expected = sequentialPackets[index]!;
+			const midway = expected.timestamp + expected.duration / 2;
+
+			const packet = (await reader.getAt(midway))!;
+			expect(describePackets([packet])).toEqual([expected]);
+			expect(describePackets([(await reader.getKeyAt(midway))!])).toEqual([expected]);
+			const nextPacket = await reader.getNext(packet);
+			expect(nextPacket && describePackets([nextPacket])[0]).toEqual(sequentialPackets[index + 1] ?? null);
+		}
+
+		const reader = new PacketReader((await sequentialInput.getAudioTracks())[0]!);
+		expect(await reader.getAt(-0.001)).toBeNull();
+	}
+});
+
+test('AVI MPEG audio timed per chunk drops zero-filled chunks, each frame keeping its chunk\'s slot', async () => {
+	// FFmpeg's VBR MP3 layout, one frame per chunk at scale 1152 over rate 48000 and a block alignment of 1152, behind
+	// zero-filled chunks of one and two block alignments, which take three slots. ffprobe gives every frame but the
+	// first its chunk's slot; FFmpeg's parser glues the zeros to the first frame, so that packet takes the zeros' slot
+	using input = new Input({
+		source: new FilePathSource('test/public/avi/mp3-vbr-zero-chunks.avi'),
+		formats: ALL_FORMATS,
+	});
+	const packets = await readAllPackets(input, 'audio');
+	expect(packets).toHaveLength(32);
+	for (const [index, packet] of packets.entries()) {
+		expect(getSyncFrameSize(packet.data)).toBe(packet.byteLength);
+		expect(packet.timestamp).toBeCloseTo((index + 3) * 0.024, 9);
+		expect(packet.duration).toBeCloseTo(0.024, 9);
+	}
+});
+
+test('AVI MPEG audio chunks that hold one frame each stay one packet each', async () => {
+	// FFmpeg's muxer writes one frame per chunk
+	for (const file of ['h264-mp3-vbr.avi', 'mp3-only.avi']) {
+		const bytes = new Uint8Array(readFileSync(`test/public/avi/${file}`));
+		using input = new Input({
+			source: new BufferSource(bytes),
+			formats: ALL_FORMATS,
+		});
+		const packets = await readAllPackets(input, 'audio');
+		const frameDuration = 1152 / await (await input.getAudioTracks())[0]!.getSampleRate();
+
+		expect(packets.map(packet => [...packet.data])).toEqual(
+			getAudioChunks(bytes).map(({ position, size }) => [...bytes.subarray(position, position + size)]),
+		);
+		for (const [index, packet] of packets.entries()) {
+			expect(packet.timestamp).toBeCloseTo(index * frameDuration, 9);
+		}
+	}
+});
+
+test('AVI MPEG audio drops a leading ID3v2 tag, whatever frames the tag holds', async () => {
+	const bytes = new Uint8Array(readFileSync('test/public/avi/mp3-cbr-byte-stream.avi'));
+	const start = getAudioChunks(bytes)[0]!.position;
+	// An ID3v2.4 tag in place of the first three frames, which holds a copy of the next two frames
+	const tagSize = 3 * 384;
+	const copiedFrames = bytes.slice(start + tagSize, start + tagSize + 2 * 384);
+	bytes.fill(0, start, start + tagSize);
+	bytes.set([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, (tagSize - 10) >> 7, (tagSize - 10) & 0x7F], start);
+	bytes.set(copiedFrames, start + 10);
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	const packets = await readAllPackets(input, 'audio');
+	expect(packets).toHaveLength(57);
+	expect([...packets[0]!.data]).toEqual([...copiedFrames.subarray(0, 384)]);
+	expect(packets[0]!.timestamp).toBeCloseTo(3 * 0.024, 9);
+});
+
+test('AVI AC-3 drops bytes outside frames, and the sync words in them whose frame no sync word follows', async () => {
+	const bytes = new Uint8Array(readFileSync('test/public/avi/ac3-cbr-byte-stream.avi'));
+	const start = getAudioChunks(bytes)[0]!.position;
+	// The fourth frame made junk that holds a byte-swapped sync word, and a copy of the first frame's header at an odd
+	// offset, whose frame would end inside the fifth frame
+	const junkStart = start + 3 * 768;
+	bytes.fill(0x55, junkStart, junkStart + 768);
+	bytes.set([0x77, 0x0B], junkStart + 10);
+	bytes.set(bytes.slice(start, start + 6), junkStart + 101);
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	const packets = await readAllPackets(input, 'audio');
+	expect(packets.map(packet => Math.round(packet.timestamp / 0.032)))
+		.toEqual([...Array(32).keys()].filter(index => index !== 3));
+	for (const packet of packets) {
+		expect(getSyncFrameSize(packet.data)).toBe(768);
+		expect(packet.byteLength).toBe(768);
+	}
+
+	// A frame read by timestamp resyncs to the same frames
+	const reader = new PacketReader((await input.getAudioTracks())[0]!);
+	expect([...(await reader.getAt(3.5 * 0.032))!.data]).toEqual([...packets[2]!.data]);
+	expect([...(await reader.getAt(4.5 * 0.032))!.data]).toEqual([...packets[3]!.data]);
+});
+
+test('AVI MPEG audio drops a frame cut short, inside which the next frame starts', async () => {
+	const bytes = new Uint8Array(readFileSync('test/public/avi/mp3-cbr-byte-stream.avi'));
+	using originalInput = new Input({
+		source: new BufferSource(bytes.slice()),
+		formats: ALL_FORMATS,
+	});
+	const originalPackets = await readAllPackets(originalInput, 'audio');
+	const start = getAudioChunks(bytes)[0]!.position;
+	// Frames 6 to 19, the last whole frames of the 8000-byte first chunk, moved 4 bytes back over the end of frame 5,
+	// which leaves 4 stray bytes before frame 20, as a muxer that drops bytes writes them
+	bytes.copyWithin(start + 6 * 384 - 4, start + 6 * 384, start + 20 * 384);
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	const packets = await readAllPackets(input, 'audio');
+	const frameIndices = [...Array(60).keys()].filter(index => index !== 5);
+	expect(packets.map(packet => [...packet.data]))
+		.toEqual(frameIndices.map(index => [...originalPackets[index]!.data]));
+	// Timed by their offsets
+	expect(packets.map(packet => Math.round(packet.timestamp * 16000))).toEqual(frameIndices.map(index =>
+		index * 384 - (index >= 6 && index < 20 ? 4 : 0),
+	));
+});
+
+test('AVI E-AC-3 dependent substream frames join the packet of the independent frame before them', async () => {
+	const bytes = new Uint8Array(readFileSync('test/public/avi/eac3-extensible-byte-stream.avi'));
+	const start = getAudioChunks(bytes)[0]!.position;
+	// Frames 1, 3, 5, 7, and 9, all in the first chunk, made dependent substreams (strmtyp 1)
+	for (const frameIndex of [1, 3, 5, 7, 9]) {
+		const position = start + frameIndex * 384 + 2;
+		bytes[position] = (bytes[position]! & 0x3F) | 0x40;
+	}
+
+	using input = new Input({
+		source: new BufferSource(bytes),
+		formats: ALL_FORMATS,
+	});
+	const packets = await readAllPackets(input, 'audio');
+	expect(packets.map(packet => packet.byteLength))
+		.toEqual([...Array<number>(5).fill(768), ...Array<number>(12).fill(384)]);
+	expect(packets.map(packet => Math.round(packet.timestamp * 12000)))
+		.toEqual([0, 768, 1536, 2304, 3072, ...[...Array(12).keys()].map(index => (index + 10) * 384)]);
 });
