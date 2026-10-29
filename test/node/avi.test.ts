@@ -808,3 +808,30 @@ test('Should keep a video track of a FourCC with no codec, codec-less, with its 
 	}
 	expect(count).toBe(5);
 });
+
+test('Should keep an audio stream of an unmapped format tag, codec-less, with its tag as its codec ID', async () => {
+	// wmav2-only.avi is FFmpeg's WMA v2 at 44.1 kHz, whose muxer writes a sample size of one 371-byte block, each
+	// block 2048 frames, as scale 2048 over rate 44100
+	using input = new Input({
+		source: new FilePathSource('./test/public/avi/wmav2-only.avi'),
+		formats: ALL_FORMATS,
+	});
+
+	const tracks = await input.getAudioTracks();
+	expect(tracks).toHaveLength(1);
+	const track = tracks[0]!;
+	expect(await track.getCodec()).toBe(null);
+	// WAVE_FORMAT_WMAUDIO2
+	expect(await track.getInternalCodecId()).toBe('353');
+	expect(await track.getNumberOfChannels()).toBe(2);
+	expect(await track.getSampleRate()).toBe(44100);
+	expect(await track.getDecoderConfig()).toBe(null);
+
+	// FFmpeg's demuxer times each block as one sample
+	const sink = new PacketReader(track);
+	const packets: { timestamp: number; size: number }[] = [];
+	for (let packet = await sink.getFirst(); packet; packet = await sink.getNext(packet)) {
+		packets.push({ timestamp: packet.timestamp, size: packet.data.byteLength });
+	}
+	expect(packets).toEqual([0, 1, 2, 3, 4].map(index => ({ timestamp: index * 2048 / 44100, size: 371 })));
+});

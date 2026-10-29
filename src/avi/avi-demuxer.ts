@@ -1182,18 +1182,16 @@ export class AVIDemuxer extends Demuxer {
 		for (const stream of this.streams) {
 			const { header, format } = stream;
 
+			// A stream whose FourCC or format tag names no codec stays, codec-less, as Matroska keeps its unknown
+			// tracks, so a caller can still read it by its internal codec ID: the FourCC, or the format tag
 			if (header.fccType === 'vids' && 'compression' in format) {
-				// A video track whose FourCC names no codec stays, codec-less, as Matroska keeps its unknown tracks,
-				// so a caller can still read it by its internal codec ID, the FourCC
 				const backing = new AviVideoTrackBacking(this, stream);
 				stream.backing = backing;
 				this.trackBackings.push(backing);
 			} else if (header.fccType === 'auds' && 'formatTag' in format) {
 				const backing = new AviAudioTrackBacking(this, stream);
-				if (backing.getCodec()) {
-					stream.backing = backing;
-					this.trackBackings.push(backing);
-				}
+				stream.backing = backing;
+				this.trackBackings.push(backing);
 			}
 		}
 	}
