@@ -183,7 +183,7 @@ const FLAC_STREAMINFO_BLOCK_HEADER = [0x80, 0x00, 0x00, FLAC_STREAMINFO_SIZE]; /
  * AudioSpecificConfig, FLAC's STREAMINFO, made into the 'fLaC' stream header WebCodecs expects, and Vorbis's three
  * headers in Xiph lacing, which is WebCodecs's form already.
  */
-const getAudioCodecDescription = (codec: AudioCodec, extraData: Uint8Array | undefined): Uint8Array | null => {
+export const getAudioCodecDescription = (codec: AudioCodec, extraData: Uint8Array | undefined): Uint8Array | null => {
 	if (!extraData) {
 		return null;
 	}
