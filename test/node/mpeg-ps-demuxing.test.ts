@@ -503,3 +503,24 @@ test('Should detect a program stream whose first pack holds MPEG audio frames as
 	// Its tracks come in the order of their first packets
 	expect((await input.getTracks()).map(track => track.type)).toEqual(['audio', 'video']);
 });
+
+test('Should leave out a program stream track whose packets cannot be read', async () => {
+	// MP2 PES packets emptied of their frames, as audio of another codec in an MPEG audio stream ID would read
+	const bytes = readMedia('mpeg1-mp2.mpg');
+	forEachUnit(bytes, (offset, code) => {
+		if (code === 0xc0) {
+			let dataOffset = offset + 6;
+			while (bytes[dataOffset] === 0xff) {
+				dataOffset++;
+			}
+			const marker = bytes[dataOffset]! >> 4;
+			dataOffset += marker === 0b0010 ? 5 : marker === 0b0011 ? 10 : 1;
+			bytes.fill(0, dataOffset, getUnitEnd(bytes, offset));
+		}
+	});
+
+	using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+	const tracks = await input.getTracks();
+	expect(tracks.map(track => track.type)).toEqual(['video']);
+	expect(await readAllPackets(tracks[0]!)).toHaveLength(24);
+});

@@ -13,7 +13,7 @@ import {
 	MPEG_VIDEO_SEQUENCE_HEADER_START_CODE,
 } from '../codec-data';
 import { Demuxer } from '../demuxer';
-import { Input } from '../input';
+import { Input, InputDisposedError } from '../input';
 import { InputAudioTrackBacking, InputTrackBacking, InputVideoTrackBacking } from '../input-track';
 import { Logging } from '../logging';
 import { TrackType } from '../output';
@@ -825,7 +825,20 @@ export class MpegPsDemuxer extends Demuxer {
 		}
 
 		const context = new MpegPsPacketReadingContext(stream, firstPesPacket);
-		await initializeElementaryStream(stream, context);
+		try {
+			await initializeElementaryStream(stream, context);
+		} catch (error) {
+			if (error instanceof InputDisposedError) {
+				throw error;
+			}
+
+			// A stream whose packets can't be read, such as other audio in an MPEG audio stream ID, is left out
+			Logging._warn(
+				`Note: MPEG program stream 0x${stream.pid.toString(16)} could not be read and is skipped.`,
+				error,
+			);
+			return;
+		}
 
 		// Contexts starting anywhere in the stream time pictures by its first sequence header until one comes
 		stream.videoTiming = { ...context.videoTiming };
