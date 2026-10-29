@@ -314,6 +314,9 @@ const hasSwappedFieldOrders = (muxingApp: string | null) => {
 	return minor >= 36 && minor <= 51 && micro >= 100;
 };
 
+/** Tags elements before the first cluster larger than this are read lazily, like Attachments. */
+const MAX_INLINE_TAGS_SIZE = 2 ** 20; // 1 MiB
+
 export class MatroskaDemuxer extends Demuxer {
 	reader: Reader;
 
@@ -555,20 +558,36 @@ export class MatroskaDemuxer extends Demuxer {
 					this.readContiguousElements(slice);
 				}
 			} else if (id === EBMLId.Tags || id === EBMLId.Attachments) {
-				// Metadata found at the beginning of the segment, great, let's parse it
-				if (id === EBMLId.Tags) {
-					this.currentSegment.tagsSeen = true;
-				} else {
-					this.currentSegment.attachmentsSeen = true;
-				}
-
 				assertDefinedSize(size);
 
-				let slice = this.reader.requestSlice(dataStartPos, size);
-				if (isThenable(slice)) slice = await slice;
+				// Attachments (often fonts, up to hundreds of megabytes) and oversized Tags are not needed for
+				// playback, so record their position and let loadSegmentMetadata read them only when the metadata
+				// tags are requested. That lazy loader needs a known file size, so read them inline otherwise.
+				const defer = this.reader.fileSize !== null
+					&& (id === EBMLId.Attachments || size > MAX_INLINE_TAGS_SIZE);
 
-				if (slice) {
-					this.readContiguousElements(slice);
+				if (defer) {
+					const segmentPosition = elementStartPos - segmentDataStart;
+					const alreadyKnown = this.currentSegment.seekEntries.some(
+						x => x.id === id && x.segmentPosition === segmentPosition,
+					);
+					if (!alreadyKnown) {
+						this.currentSegment.seekEntries.push({ id, segmentPosition });
+					}
+				} else {
+					// Metadata found at the beginning of the segment, great, let's parse it
+					if (id === EBMLId.Tags) {
+						this.currentSegment.tagsSeen = true;
+					} else {
+						this.currentSegment.attachmentsSeen = true;
+					}
+
+					let slice = this.reader.requestSlice(dataStartPos, size);
+					if (isThenable(slice)) slice = await slice;
+
+					if (slice) {
+						this.readContiguousElements(slice);
+					}
 				}
 			} else if (id === EBMLId.Cluster) {
 				this.currentSegment.clusterSeekStartPos = elementStartPos;
