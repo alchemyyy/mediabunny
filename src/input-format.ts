@@ -34,6 +34,8 @@ import { readAscii, readBytes, readU32Be, readU64Be } from './reader';
 import { AVIDemuxer } from './avi/avi-demuxer';
 import { AsfDemuxer } from './asf/asf-demuxer';
 import { ASF_HEADER_OBJECT, guidEquals } from './asf/asf-misc';
+import { MpegPsDemuxer } from './mpeg-ps/mpeg-ps-demuxer';
+import { isPackHeaderStart } from './mpeg-ps/mpeg-ps-misc';
 import { FlacDemuxer } from './flac/flac-demuxer';
 import { MpegTsDemuxer } from './mpeg-ts/mpeg-ts-demuxer';
 import { TS_PACKET_SIZE } from './mpeg-ts/mpeg-ts-misc';
@@ -985,13 +987,57 @@ export class AsfInputFormat extends InputFormat {
 export const ASF = /* #__PURE__ */ new AsfInputFormat();
 
 /**
+ * MPEG program stream file format, the container of .mpg and .mpeg files, both MPEG-1 system streams and MPEG-2
+ * program streams, and of DVD-Video's .vob files.
+ *
+ * Do not instantiate this class; use the {@link MPEG_PS} singleton instead.
+ *
+ * @group Input formats
+ * @public
+ */
+export class MpegPsInputFormat extends InputFormat {
+	/** @internal */
+	async _canReadInput(input: Input) {
+		let slice = input._reader.requestSlice(0, 5);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) return false;
+
+		return isPackHeaderStart(readBytes(slice, 5));
+	}
+
+	/** @internal */
+	_createDemuxer(input: Input) {
+		return new MpegPsDemuxer(input);
+	}
+
+	get name() {
+		return 'MPEG Program Stream';
+	}
+
+	get mimeType() {
+		return 'video/MP2P';
+	}
+
+	get supportsTimestampedMediaData() {
+		return true;
+	}
+}
+
+/**
+ * MPEG program stream input format singleton.
+ * @group Input formats
+ * @public
+ */
+export const MPEG_PS = /* #__PURE__ */ new MpegPsInputFormat();
+
+/**
  * List of all input format singletons. If you don't need to support all input formats, you should specify the
  * formats individually for better tree shaking.
  * @group Input formats
  * @public
  */
 export const ALL_FORMATS: InputFormat[] = [
-	HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, AIFF, OGG, FLAC, MP3, ADTS, MPEG_TS, AVI, ASF,
+	HLS, MP4, QTFF, MATROSKA, WEBM, WAVE, AIFF, OGG, FLAC, MP3, ADTS, MPEG_TS, MPEG_PS, AVI, ASF,
 ];
 
 /**
