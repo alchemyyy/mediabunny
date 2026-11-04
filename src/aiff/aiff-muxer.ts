@@ -248,6 +248,10 @@ export class AiffMuxer extends Muxer {
 					// Not representable as a native AIFF text chunk; use the 'id3' metadata format for these.
 				}; break;
 
+				case 'creationTime': {
+					// Not supported in AIFF
+				}; break;
+
 				case 'raw': {
 					// Handled below
 				}; break;

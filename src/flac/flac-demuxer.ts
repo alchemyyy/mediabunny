@@ -359,7 +359,7 @@ export class FlacDemuxer extends Demuxer {
 
 		let slice = this.reader.requestSliceRange(
 			startPos,
-			maximumHeaderLength,
+			minimumHeaderLength,
 			maximumSliceLength,
 		);
 		if (isThenable(slice)) slice = await slice;

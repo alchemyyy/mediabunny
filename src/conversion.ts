@@ -10,6 +10,7 @@ import {
 	AUDIO_CODECS,
 	AudioCodec,
 	MediaCodec,
+	getMinimumAudioPacketSize,
 	NON_PCM_AUDIO_CODECS,
 	VIDEO_CODECS,
 	VideoCodec,
@@ -60,6 +61,7 @@ import {
 } from './sample';
 import { MetadataTags, validateMetadataTags } from './metadata';
 import { NullTarget } from './target';
+import { PacketOrderValidator } from './muxer';
 
 /**
  * The options for media file conversion.
@@ -142,7 +144,7 @@ export type ConversionOptions = {
 	 * should be written to the output file. If a function is passed, it will be passed the tags of the input file as
 	 * its first argument, allowing you to modify, augment or extend them.
 	 *
-	 * If no function is set, the input's metadata tags will be copied to the output.
+	 * If no function is set, the input's metadata tags will be copied to the output (excluding `creationTime`).
 	 */
 	tags?: MetadataTags | ((inputTags: MetadataTags) => MaybePromise<MetadataTags>);
 
@@ -251,8 +253,8 @@ export type ConversionVideoOptions = {
 	 */
 	keyFrameInterval?: number;
 	/**
-	 * A hint that configures the hardware acceleration method used when transcoding. This is best left on
-	 * `'no-preference'`, the default.
+	 * A hint that configures the hardware acceleration method used when transcoding, which applies to both decoding and
+	 * encoding. This is best left on `'no-preference'`, the default.
 	 */
 	hardwareAcceleration?: 'no-preference' | 'prefer-hardware' | 'prefer-software';
 	/** When `true`, video will always be re-encoded instead of directly copying over the encoded packets. */
@@ -291,6 +293,13 @@ export type ConversionVideoOptions = {
 	 * matches the input track pairability graph.
 	 */
 	group?: OutputTrackGroup | OutputTrackGroup[];
+	/**
+	 * Sets {@link BaseTrackMetadata.maximumPacketCount} for the output track. Only relevant when the output format
+	 * requires it (see {@link OutputFormat.requiresMaximumPacketCount}), in which case it is otherwise estimated
+	 * automatically. Set this field when the estimate doesn't work for you, for example when `process` returns more
+	 * than one frame per input frame. Required for live input tracks when no trim end is set.
+	 */
+	maximumPacketCount?: number;
 };
 
 /**
@@ -354,6 +363,13 @@ export type ConversionAudioOptions = {
 	 * matches the input track pairability graph.
 	 */
 	group?: OutputTrackGroup | OutputTrackGroup[];
+	/**
+	 * Sets {@link BaseTrackMetadata.maximumPacketCount} for the output track. Only relevant when the output format
+	 * requires it (see {@link OutputFormat.requiresMaximumPacketCount}), in which case it is otherwise estimated
+	 * automatically. Set this field when the estimate doesn't work for you, for example when using a custom encoder
+	 * that produces unusually short packets. Required for live input tracks when no trim end is set.
+	 */
+	maximumPacketCount?: number;
 };
 
 /**
@@ -523,6 +539,12 @@ const validateVideoOptions = (videoOptions: ConversionVideoOptions) => {
 			'options.video.group, when provided, must be an OutputTrackGroup or an array of OutputTrackGroups.',
 		);
 	}
+	if (
+		videoOptions?.maximumPacketCount !== undefined
+		&& (!Number.isInteger(videoOptions.maximumPacketCount) || videoOptions.maximumPacketCount < 0)
+	) {
+		throw new TypeError('options.video.maximumPacketCount, when provided, must be a non-negative integer.');
+	}
 };
 
 const validateAudioOptions = (audioOptions: ConversionAudioOptions) => {
@@ -595,10 +617,17 @@ const validateAudioOptions = (audioOptions: ConversionAudioOptions) => {
 			'options.audio.group, when provided, must be an OutputTrackGroup or an array of OutputTrackGroups.',
 		);
 	}
+	if (
+		audioOptions?.maximumPacketCount !== undefined
+		&& (!Number.isInteger(audioOptions.maximumPacketCount) || audioOptions.maximumPacketCount < 0)
+	) {
+		throw new TypeError('options.audio.maximumPacketCount, when provided, must be a non-negative integer.');
+	}
 };
 
 const FALLBACK_NUMBER_OF_CHANNELS = 2;
 const FALLBACK_SAMPLE_RATE = 48000;
+const PACKET_STATS_PACKET_COUNT = 256;
 
 /**
  * An input track that was discarded (excluded) from a {@link Conversion} alongside the discard reason.
@@ -623,6 +652,8 @@ export type DiscardedTrack = {
 	 * you requested a codec that cannot be contained within the output format.
 	 * - `'cannot_copy'`: {@link ConversionCopyOptions.mode} was set to `'forced'` but the track could not be copied
 	 * with the given copy configuration because it would require a transcode instead.
+	 * - `'unknown_maximum_packet_count'`: The output format requires a maximum packet count, but it can't be estimated
+	 * because the track is live and no trim end is set. Set it manually using the `maximumPacketCount` track option.
 	 */
 	reason:
 		| 'discarded_by_user'
@@ -631,7 +662,8 @@ export type DiscardedTrack = {
 		| 'unknown_source_codec'
 		| 'undecodable_source_codec'
 		| 'no_encodable_target_codec'
-		| 'cannot_copy';
+		| 'cannot_copy'
+		| 'unknown_maximum_packet_count';
 	/** The options that were provided for this track, or `{}` if none were provided. */
 	trackOptions: ConversionVideoOptions | ConversionAudioOptions;
 };
@@ -699,6 +731,8 @@ export class Conversion {
 	_copyTimestampPossible = new Map<InputTrack, boolean>();
 	/** @internal */
 	_copyStartPackets = new Map<InputTrack, EncodedPacket | null>();
+	/** @internal */
+	_trackDurations = new Map<InputTrack, Promise<number>>();
 
 	/** @internal */
 	_nextOutputTrackId = 0;
@@ -1122,7 +1156,8 @@ export class Conversion {
 		// remains the responsibility of whoever owns the output.
 
 		if (!this._composable) {
-			const inputTags = await this.input.getMetadataTags();
+			const inputTags = { ...await this.input.getMetadataTags() };
+			delete inputTags.creationTime; // Makes no sense to inherit this one
 			let outputTags: MetadataTags;
 
 			if (this._options.tags) {
@@ -1348,13 +1383,7 @@ export class Conversion {
 			if (this.onProgress) {
 				// Compute duration using only the utilized tracks
 				const uniqueUtilizedTracks = new Set(this.utilizedTracks);
-				const durationPromises = [...uniqueUtilizedTracks].map(async (track) => {
-					if (await track.isLive()) {
-						return Infinity; // Upper bound (assuming no universe heat death)
-					}
-
-					return (await track.getDurationFromMetadata()) ?? (await track.computeDuration());
-				});
+				const durationPromises = [...uniqueUtilizedTracks].map(track => this._getTrackDuration(track));
 				const duration = Math.max(0, ...await Promise.all(durationPromises));
 
 				this._computeProgress = true;
@@ -1455,6 +1484,20 @@ export class Conversion {
 			this.discardedTracks.push({
 				track,
 				reason: 'unknown_source_codec',
+				trackOptions,
+			});
+			return;
+		}
+
+		if (
+			this.output.format.requiresMaximumPacketCount
+			&& trackOptions.maximumPacketCount === undefined
+			&& this._endTimestamp === Infinity
+			&& await track.isLive()
+		) {
+			this.discardedTracks.push({
+				track,
+				reason: 'unknown_maximum_packet_count',
 				trackOptions,
 			});
 			return;
@@ -1637,7 +1680,9 @@ export class Conversion {
 				const reader = new PacketReader(track);
 				const decoderConfig = await track.getDecoderConfig();
 				const meta: EncodedVideoChunkMetadata = { decoderConfig: decoderConfig ?? undefined };
-				let maxTimestamp: number | null = null;
+				const packetOrderValidator = new PacketOrderValidator();
+				let droppingGop = false;
+				let warnedAboutDroppedPackets = false;
 
 				if (copyStartPacket) {
 					await cursor.seekToKey(copyStartPacket.timestamp);
@@ -1692,14 +1737,33 @@ export class Conversion {
 					packetStartTimestamp += this._timestampOffset;
 					packetEndTimestamp += this._timestampOffset;
 
-					// The muxer rejects key packets with a timestamp smaller than the largest timestamp of the
-					// previous GOP. Some files in the wild actually violate this, so we demote such packets to delta
-					// packets to keep them in the previous GOP and keep the rule satisfied
+					if (packet.type === 'key') {
+						droppingGop = false; // Key packets reset it
+					}
+					if (droppingGop) {
+						continue;
+					}
+
+					// Check the packets against the same validator used by muxers. If a key packet validates it,
+					// we demote it to a delta packet and try again. If the packet still doesn't pass, we simply drop
+					// it entirely.
 					let packetType = packet.type;
-					if (packetType === 'key' && maxTimestamp !== null && packetStartTimestamp < maxTimestamp) {
+					if (packetType === 'key' && !packetOrderValidator.check(packetStartTimestamp, 'key')) {
 						packetType = 'delta';
 					}
-					maxTimestamp = Math.max(maxTimestamp ?? -Infinity, packetStartTimestamp);
+
+					if (!packetOrderValidator.digest(packetStartTimestamp, packetType)) {
+						droppingGop = packet.type === 'key';
+
+						if (!warnedAboutDroppedPackets) {
+							Logging._warn(
+								'Some video packets had to be dropped in order to produce correct output timestamps.',
+							);
+							warnedAboutDroppedPackets = true;
+						}
+
+						continue;
+					}
 
 					const modifiedPacket = packet.clone({
 						timestamp: packetStartTimestamp,
@@ -1802,7 +1866,10 @@ export class Conversion {
 				await tempOutput.start();
 
 				// Let's just use the first sample to test
-				const cursor = new VideoSampleCursor(track, { closeSamples: false });
+				const cursor = new VideoSampleCursor(track, {
+					closeSamples: false,
+					hardwareAcceleration: trackOptions.hardwareAcceleration,
+				});
 				using firstSample = await cursor.seekToFirst();
 				await cursor.close();
 
@@ -1858,7 +1925,9 @@ export class Conversion {
 			videoSource = source;
 
 			this._registerTrackPump(async (pump) => {
-				await using cursor = new VideoSampleCursor(track);
+				await using cursor = new VideoSampleCursor(track, {
+					hardwareAcceleration: trackOptions.hardwareAcceleration,
+				});
 				await cursor.seekTo(this._startTimestamp);
 
 				for await (const sample of cursor) {
@@ -1917,6 +1986,18 @@ export class Conversion {
 		const averageBitrate = needsTranscode ? null : await track.getAverageBitrate();
 		const canBeTransparent = alpha === 'keep' && await track.canBeTransparent();
 
+		let maximumPacketCount = trackOptions.maximumPacketCount;
+		if (this.output.format.requiresMaximumPacketCount && maximumPacketCount === undefined) {
+			// Frames map 1:1 to packets, so the input's packet rate is a good stand-in unless the frame rate is changed
+			const packetRate = trackOptions.frameRate
+				?? (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+			const startTimestamp = needsTranscode
+				? this._startTimestamp
+				: copyStartPacket?.timestamp ?? this._startTimestamp;
+
+			maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
+		}
+
 		this.output.addVideoTrack(videoSource, {
 			frameRate: trackOptions.frameRate,
 			// TODO: This condition can be removed when all demuxers properly homogenize to BCP47 in v2
@@ -1932,6 +2013,7 @@ export class Conversion {
 			group: ownGroup ?? trackOptions.group,
 			bitrate: bitrate ?? undefined,
 			averageBitrate: averageBitrate ?? undefined,
+			maximumPacketCount,
 		});
 
 		this.utilizedTracks.push(track);
@@ -1951,6 +2033,20 @@ export class Conversion {
 			return;
 		}
 
+		if (
+			this.output.format.requiresMaximumPacketCount
+			&& trackOptions.maximumPacketCount === undefined
+			&& this._endTimestamp === Infinity
+			&& await track.isLive()
+		) {
+			this.discardedTracks.push({
+				track,
+				reason: 'unknown_maximum_packet_count',
+				trackOptions,
+			});
+			return;
+		}
+
 		let audioSource: AudioSource;
 
 		const originalNumberOfChannels = await track.getNumberOfChannels();
@@ -1958,6 +2054,7 @@ export class Conversion {
 
 		let numberOfChannels = trackOptions.numberOfChannels ?? originalNumberOfChannels;
 		let sampleRate = trackOptions.sampleRate ?? originalSampleRate;
+		let outputCodec: AudioCodec | null = null;
 
 		let audioCodecs = this.output.format.getSupportedAudioCodecs();
 
@@ -1978,8 +2075,8 @@ export class Conversion {
 		if (!needsTranscode) {
 			// Check if we can copy it
 			const reader = new PacketReader(track);
-			let startPacket = await reader.getKeyAt(this._startTimestamp)
-				?? await reader.getFirstKey();
+			let startPacket = await reader.getKeyAt(this._startTimestamp, { verifyKeyPackets: true })
+				?? await reader.getFirstKey({ verifyKeyPackets: true });
 
 			if (
 				startPacket
@@ -1995,19 +2092,18 @@ export class Conversion {
 					)
 				)
 			) {
-				startPacket = await reader.getNextKey(startPacket);
+				startPacket = await reader.getNextKey(startPacket, { verifyKeyPackets: true });
 			}
 
-			const hasDecoderWarmup = (NON_PCM_AUDIO_CODECS as readonly AudioCodec[]).includes(sourceCodec)
-				&& sourceCodec !== 'flac';
-			if (startPacket && this._copyBoundaryPolicy === 'expand' && hasDecoderWarmup) {
-				// Go one packet back
-				const previousPacket = await reader.getKeyAt(
-					startPacket.timestamp - 1 / (await track.getTimeResolution()),
-				);
-				if (previousPacket) {
-					startPacket = previousPacket;
-				}
+			const preRollDuration = await track.getPreRollDuration();
+			assert(preRollDuration !== null); // Because the codec is known
+
+			if (startPacket && this._copyBoundaryPolicy === 'expand' && preRollDuration > 0) {
+				// Reach back far enough for the decoder to have converged by the start, or as far as the track goes
+				startPacket = await reader.getKeyAt(
+					startPacket.timestamp - preRollDuration,
+					{ verifyKeyPackets: true },
+				) ?? await reader.getFirstKey({ verifyKeyPackets: true });
 			}
 
 			copyStartPacket = startPacket;
@@ -2089,7 +2185,9 @@ export class Conversion {
 				const cursor = new PacketCursor(track);
 				const decoderConfig = await track.getDecoderConfig();
 				const meta: EncodedAudioChunkMetadata = { decoderConfig: decoderConfig ?? undefined };
-				let maxTimestamp: number | null = null;
+				const packetOrderValidator = new PacketOrderValidator();
+				let droppingGop = false;
+				let warnedAboutDroppedPackets = false;
 
 				if (copyStartPacket) {
 					await cursor.seekToKey(copyStartPacket.timestamp);
@@ -2113,11 +2211,26 @@ export class Conversion {
 
 					const packetTimestamp = packet.timestamp + this._timestampOffset;
 
-					// Drop packets that would violate the GOP timestamp monotonicity rule
-					if (maxTimestamp !== null && packetTimestamp < maxTimestamp) {
+					if (packet.type === 'key') {
+						droppingGop = false;
+					}
+					if (droppingGop) {
 						continue;
 					}
-					maxTimestamp = packetTimestamp;
+
+					// If packets violate the ordering rule (and would throw in the muxer), drop 'em
+					if (!packetOrderValidator.digest(packetTimestamp, packet.type)) {
+						droppingGop = packet.type === 'key';
+
+						if (!warnedAboutDroppedPackets) {
+							Logging._warn(
+								'Some audio packets had to be dropped in order to produce correct output timestamps.',
+							);
+							warnedAboutDroppedPackets = true;
+						}
+
+						continue;
+					}
 
 					const modifiedPacket = packet.clone({
 						timestamp: packetTimestamp,
@@ -2149,8 +2262,6 @@ export class Conversion {
 				});
 				return;
 			}
-
-			let codecOfChoice: AudioCodec | null = null;
 
 			if (trackOptions.codec) {
 				audioCodecs = audioCodecs.filter(codec => codec === trackOptions.codec);
@@ -2189,15 +2300,15 @@ export class Conversion {
 					.find(codec => (NON_PCM_AUDIO_CODECS as readonly string[]).includes(codec));
 				if (nonPcmCodec) {
 					// We are able to encode using a non-PCM codec, but it'll require resampling
-					codecOfChoice = nonPcmCodec;
+					outputCodec = nonPcmCodec;
 					numberOfChannels = FALLBACK_NUMBER_OF_CHANNELS;
 					sampleRate = FALLBACK_SAMPLE_RATE;
 				}
 			} else {
-				codecOfChoice = encodableCodecs[0] ?? null;
+				outputCodec = encodableCodecs[0] ?? null;
 			}
 
-			if (codecOfChoice === null) {
+			if (outputCodec === null) {
 				this.discardedTracks.push({
 					track,
 					reason: 'no_encodable_target_codec',
@@ -2207,7 +2318,7 @@ export class Conversion {
 			}
 
 			const encodingConfig: AudioEncodingConfig = {
-				codec: codecOfChoice,
+				codec: outputCodec,
 				quality,
 				transform: {
 					sampleFormat: trackOptions.sampleFormat,
@@ -2332,6 +2443,23 @@ export class Conversion {
 		const bitrate = needsTranscode ? null : await track.getBitrate();
 		const averageBitrate = needsTranscode ? null : await track.getAverageBitrate();
 
+		let maximumPacketCount = trackOptions.maximumPacketCount;
+		if (this.output.format.requiresMaximumPacketCount && maximumPacketCount === undefined) {
+			let packetRate: number;
+			if (needsTranscode) {
+				assert(outputCodec);
+				packetRate = sampleRate / getMinimumAudioPacketSize(outputCodec, sampleRate);
+			} else {
+				packetRate = (await track.computePacketStats(PACKET_STATS_PACKET_COUNT)).averagePacketRate;
+			}
+
+			const startTimestamp = needsTranscode
+				? this._startTimestamp
+				: copyStartPacket?.timestamp ?? this._startTimestamp;
+
+			maximumPacketCount = await this._estimateMaximumPacketCount(track, startTimestamp, packetRate);
+		}
+
 		this.output.addAudioTrack(audioSource, {
 			// TODO: This condition can be removed when all demuxers properly homogenize to BCP47 in v2
 			languageCode: isIso639Dash2LanguageCode(audioTrackLanguageCode)
@@ -2342,11 +2470,38 @@ export class Conversion {
 			group: ownGroup ?? trackOptions.group,
 			bitrate: bitrate ?? undefined,
 			averageBitrate: averageBitrate ?? undefined,
+			maximumPacketCount,
 		});
 
 		this.utilizedTracks.push(track);
 		this._outputTrackIds.push(outputTrackId);
 		this._outputOwnTrackGroups.push(ownGroup);
+	}
+
+	/** @internal */
+	async _estimateMaximumPacketCount(track: InputTrack, startTimestamp: number, packetRate: number) {
+		const endTimestamp = Math.min(await this._getTrackDuration(track), this._endTimestamp);
+		const duration = Math.max(endTimestamp - startTimestamp, 0);
+
+		// Let's give this a generous margin
+		return Math.ceil(1.5 * packetRate * duration) + 64;
+	}
+
+	/** @internal */
+	_getTrackDuration(track: InputTrack) {
+		let promise = this._trackDurations.get(track);
+		if (!promise) {
+			promise = (async () => {
+				if (await track.isLive()) {
+					return Infinity; // Upper bound (assuming no universe heat death)
+				}
+
+				return (await track.getDurationFromMetadata()) ?? (await track.computeDuration());
+			})();
+			this._trackDurations.set(track, promise);
+		}
+
+		return promise;
 	}
 
 	/** @internal */

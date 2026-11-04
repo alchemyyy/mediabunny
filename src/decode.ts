@@ -15,6 +15,7 @@ import {
 	guessDescriptionForVideo,
 	inferCodecFromCodecString,
 	MediaCodec,
+	OPUS_SAMPLE_RATE,
 	parsePcmCodec,
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
@@ -33,6 +34,7 @@ import {
 	iterateAvcNalUnits,
 	iterateHevcNalUnits,
 	parseAvcSps,
+	parseOpusIdentificationHeader,
 	sanitizeHevcPacketForChromium,
 	serializeAvcDecoderConfigurationRecord,
 } from './codec-data';
@@ -46,6 +48,7 @@ import {
 	getUint24,
 	insertSorted,
 	isAllowSharedBufferSource,
+	isAndroid,
 	isChromium,
 	isWebKit,
 	last,
@@ -106,6 +109,10 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 	alphaRaslSkipped = false; // For HEVC stuff
 	finalFrames: { frame: VideoFrame | null }[] = [];
 	mergeAlphaPromises: Promise<void>[] = [];
+	flushing = false;
+
+	// Needed for a Chromium for Android workaround
+	frameCopyContext: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
 
 	onDequeue: (() => unknown) | null = null;
 
@@ -217,7 +224,7 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			this.decoder = new VideoDecoder({
 				output: (frame) => {
 					try {
-						colorHandler(frame);
+						colorHandler(this.copyFrameIfNeeded(frame));
 					} catch (error) {
 						this.onError(error);
 					}
@@ -401,7 +408,7 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			this.alphaDecoder = new VideoDecoder({
 				output: (frame) => {
 					try {
-						alphaHandler(frame);
+						alphaHandler(this.copyFrameIfNeeded(frame));
 					} catch (error) {
 						this.onError(error);
 					}
@@ -577,15 +584,75 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		}
 	}
 
+	/**
+	 * This is a workaround for https://issues.chromium.org/issues/579043455. It circumvents the problem by instantly
+	 * drawing a frame to a new region of GPU memory (a canvas), which we know for certain won't get messed up by
+	 * other draws.
+	 * Also see: https://github.com/Vanilagy/mediabunny/issues/573
+	 */
+	copyFrameIfNeeded(frame: VideoFrame) {
+		if (!isChromium() || !isAndroid()) {
+			return frame;
+		}
+
+		const visibleRect = frame.visibleRect!;
+		const width = visibleRect.width;
+		const height = visibleRect.height;
+
+		if (!this.frameCopyContext) {
+			let context: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
+			if (typeof OffscreenCanvas !== 'undefined') {
+				context = new OffscreenCanvas(width, height).getContext('2d', { alpha: false });
+			} else {
+				context = document.createElement('canvas').getContext('2d', { alpha: false });
+			}
+
+			if (!context) {
+				throw new Error('The \'2d\' canvas context is required to decode video on Chromium for Android.');
+			}
+
+			this.frameCopyContext = context;
+		}
+
+		const canvas = this.frameCopyContext.canvas;
+		if (canvas.width !== width || canvas.height !== height) {
+			canvas.width = width;
+			canvas.height = height;
+		}
+
+		// The copy doesn't apply VideoFrame rotation or flip; v2 carries those on the VideoSample instead
+		this.frameCopyContext.drawImage(frame, 0, 0, width, height);
+		if (this.flushing) {
+			// The draw only runs on the GPU later, so a codec reset could beat it and leave us copying a stale picture.
+			// Reading back a pixel forces the draw to complete right now.
+			this.frameCopyContext.getImageData(0, 0, 1, 1);
+		}
+
+		const copy = new VideoFrame(canvas, {
+			timestamp: frame.timestamp,
+			duration: frame.duration ?? undefined,
+			displayWidth: frame.displayWidth,
+			displayHeight: frame.displayHeight,
+		});
+		frame.close();
+
+		return copy;
+	}
+
 	async flush() {
 		if (this.customDecoder) {
 			await this.customDecoderCallSerializer.call(() => this.customDecoder!.flush());
 		} else {
 			assert(this.decoder);
-			await Promise.all([
-				this.decoder.flush(),
-				this.alphaDecoder?.flush(),
-			]);
+			this.flushing = true;
+			try {
+				await Promise.all([
+					this.decoder.flush(),
+					this.alphaDecoder?.flush(),
+				]);
+			} finally {
+				this.flushing = false;
+			}
 			await Promise.all(this.mergeAlphaPromises);
 
 			this.colorQueue.forEach(x => x.close());
@@ -1008,11 +1075,16 @@ export class AudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 	) {
 		super(onSample, onError);
 
+		// WebCodecs implementations discard the pre-skip (correct) but don't advance the timestamp (incorrect)
+		const opusPreSkip = codec === 'opus' && decoderConfig.description
+			? parseOpusIdentificationHeader(toUint8Array(decoderConfig.description)).preSkip / OPUS_SAMPLE_RATE
+			: 0;
+
 		const sampleHandler = (sample: AudioSample) => {
 			let sampleTimestamp = sample.timestamp;
 
 			if (this.expectedFirstTimestamp !== null && this.currentTimestamp === null) {
-				this.timestampOffset = this.expectedFirstTimestamp - sampleTimestamp;
+				this.timestampOffset = this.expectedFirstTimestamp + opusPreSkip - sampleTimestamp;
 			}
 
 			sampleTimestamp += this.timestampOffset;

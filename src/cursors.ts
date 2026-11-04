@@ -306,11 +306,22 @@ export abstract class SampleCursor<
 	private _packetCursor: PacketCursor;
 	/** @internal */
 	_decoder: DecoderWrapper<Sample> | null = null;
+	/**
+	 * How far ahead of a target, in seconds, decoding must start for the decoder to have converged at the target.
+	 * @internal
+	 */
+	_preRollDuration = 0;
 	private _currentSample: Sample | null = null;
 	/** Updated when _currentSample is updated, but reset when a new pump is started. */
 	private _currentSampleTimestamp: number | null = null;
 	/** The queue of samples that have been decoded and are now waiting. */
 	private _sampleQueue: Sample[] = [];
+	/**
+	 * The most recently decoded audio sample that answered no request and isn't queued. Decoded audio is contiguous,
+	 * so once decoding has reached the end of the track, it answers a request for a time past the end of every sample:
+	 * it's the last sample starting at or before that time.
+	 */
+	private _unclaimedSample: Sample | null = null;
 	private _pendingRequests: PendingRequest<TransformedSample>[] = [];
 	private _lastPendingRequest: PendingRequest<TransformedSample> | null = null;
 	/** Whether the next sample is the first sample. */
@@ -419,6 +430,8 @@ export abstract class SampleCursor<
 		return this._getSample(result => this._seekToPacket(
 			result,
 			this._packetReader.getAt(timestamp, this._retrievalOptions),
+			undefined,
+			timestamp,
 		));
 	}
 
@@ -627,6 +640,7 @@ export abstract class SampleCursor<
 				} else {
 					// Let's save it for later
 					this._sampleQueue.push(sample);
+					this._dropUnclaimedSample();
 				}
 			} else {
 				// If requests are pending, the sample queue must be empty; samples are queued only when there is
@@ -639,7 +653,7 @@ export abstract class SampleCursor<
 				// Let's hand the sample to all matching requests
 				for (let i = 0; i < this._pendingRequests.length; i++) {
 					const request = this._pendingRequests[i]!;
-					if (request.timestamp > sample.timestamp) {
+					if (!this._sampleReaches(sample, request.timestamp)) {
 						break;
 					}
 
@@ -658,8 +672,10 @@ export abstract class SampleCursor<
 					}
 				}
 
-				if (!given) {
-					sample.close();
+				if (given) {
+					this._dropUnclaimedSample();
+				} else {
+					this._discardSample(sample);
 				}
 			}
 
@@ -703,10 +719,58 @@ export abstract class SampleCursor<
 		}
 	}
 
+	/**
+	 * Whether a sample reaches the given request timestamp, that is, whether it's the answer to a request for it when
+	 * none of the samples before it was. A video sample does when it starts at or after the timestamp. An audio sample
+	 * does when it ends after the timestamp: decoded audio is contiguous, so that's the last sample starting at or
+	 * before it, even when the decoder's sample boundaries don't line up with the packet timestamps (pre-roll and
+	 * pre-skip shift them, and containers round packet timestamps).
+	 */
+	private _sampleReaches(sample: Sample, timestamp: number) {
+		if (this.track.type === 'audio') {
+			return sample.timestamp + sample.duration - timestamp > 1e-10; // Give it a little epsilon
+		}
+
+		return sample.timestamp >= timestamp;
+	}
+
+	/** Keeps a decoded audio sample that answered no request as the unclaimed sample; closes any other. */
+	private _discardSample(sample: Sample) {
+		if (this.track.type === 'audio') {
+			this._unclaimedSample?.close();
+			this._unclaimedSample = sample;
+		} else {
+			sample.close();
+		}
+	}
+
+	/** Closes the unclaimed sample, for when a later sample was decoded or decoding didn't reach the end. */
+	private _dropUnclaimedSample() {
+		this._unclaimedSample?.close();
+		this._unclaimedSample = null;
+	}
+
+	/** Takes the unclaimed sample if it starts at or before the given request timestamp. */
+	private _takeUnclaimedSample(timestamp: number) {
+		const sample = this._unclaimedSample;
+		if (!sample || sample.timestamp - timestamp > 1e-10) {
+			return null;
+		}
+
+		this._unclaimedSample = null;
+		return sample;
+	}
+
+	/**
+	 * Seeks to the sample of the given target packet. `queryTimestamp` is the timestamp the target packet was looked up
+	 * with, if any; audio requests are matched against it, since decoded audio samples needn't start at packet
+	 * timestamps.
+	 */
 	private async _seekToPacket(
 		res: ResultValue<TransformedSample | null>,
 		targetPacketPromise: MaybePromise<EncodedPacket | null>,
 		lock?: AsyncMutexLock,
+		queryTimestamp?: number,
 	): MaybeRelevantPromise {
 		this._lazyPump++;
 
@@ -740,10 +804,40 @@ export abstract class SampleCursor<
 			return res.set(null);
 		}
 
-		if (this._currentSample?.timestamp === targetPacket.timestamp && !this._currentSample.closed) {
-			// We can reuse the current sample, the timestamp is the same
+		const isAudio = this.track.type === 'audio';
+		const requestTimestamp = isAudio && queryTimestamp !== undefined
+			? Math.max(queryTimestamp, targetPacket.timestamp)
+			: targetPacket.timestamp;
+
+		const currentSample = this._currentSample;
+		if (
+			currentSample
+			&& !currentSample.closed
+			&& (
+				isAudio
+					? currentSample.timestamp - requestTimestamp <= 1e-10
+					&& this._sampleReaches(currentSample, requestTimestamp)
+					: currentSample.timestamp === targetPacket.timestamp
+			)
+		) {
+			// We can reuse the current sample, it's the one for the target
 			return res.set(this._transformSample());
 		}
+
+		const verifiedOptions = { ...this._retrievalOptions, verifyKeyPackets: true };
+		/** The key packet decoding must start at for the target, if it has been looked up. */
+		let startKey: EncodedPacket | null | undefined = undefined;
+		const getStartKey = async () => {
+			if (startKey === undefined) {
+				const result = this._packetReader.getKeyAt(
+					targetPacket.timestamp - this._preRollDuration,
+					verifiedOptions,
+				);
+				startKey = isThenable(result) ? await result : result;
+			}
+
+			return startKey;
+		};
 
 		let needsNewPump: boolean;
 
@@ -772,10 +866,11 @@ export abstract class SampleCursor<
 					const nextSample = this._sampleQueue.shift()!;
 					this._pumpGate.open();
 
-					if (targetPacket.timestamp <= nextSample.timestamp) {
+					if (this._sampleReaches(nextSample, requestTimestamp)) {
+						this._dropUnclaimedSample();
 						return nextSample;
 					} else {
-						nextSample.close();
+						this._discardSample(nextSample);
 					}
 				}
 			};
@@ -793,13 +888,17 @@ export abstract class SampleCursor<
 			} else {
 				if (this._packetCursor.current) {
 					// We need to see if the target packet is ahead of the decoder, GOP-wise
-					let nextKey = this._packetReader.getNextKey(
-						this._packetCursor.current,
-						{ ...this._retrievalOptions, verifyKeyPackets: true },
-					);
+					let nextKey = this._packetReader.getNextKey(this._packetCursor.current, verifiedOptions);
 					if (isThenable(nextKey)) nextKey = await nextKey;
 
-					needsNewPump = !!nextKey && targetPacket.sequenceNumber >= nextKey.sequenceNumber;
+					let startSequenceNumber = targetPacket.sequenceNumber;
+					if (this._preRollDuration > 0) {
+						// Decoding for the target must start at its pre-roll key packet. Without a key packet that far
+						// back, it starts at the first key packet, which the decoder has passed already.
+						startSequenceNumber = (await getStartKey())?.sequenceNumber ?? -Infinity;
+					}
+
+					needsNewPump = !!nextKey && startSequenceNumber >= nextKey.sequenceNumber;
 				} else {
 					needsNewPump = true;
 				}
@@ -813,8 +912,30 @@ export abstract class SampleCursor<
 			}
 
 			if (!this._pumpRunning) {
+				// The pump decoded everything to the end. Decoded audio is contiguous, so a time past the end of every
+				// sample belongs to the last one decoded: the unclaimed sample, or without one, the current sample.
+				if (isAudio) {
+					let lastSample = this._takeUnclaimedSample(requestTimestamp);
+
+					const currentSample = this._currentSample;
+					if (
+						!lastSample
+						&& !this._unclaimedSample
+						&& currentSample
+						&& !currentSample.closed
+						&& currentSample.timestamp - requestTimestamp <= 1e-10
+					) {
+						lastSample = currentSample;
+					}
+
+					if (lastSample) {
+						this._setCurrentRaw(lastSample);
+						return res.set(this._transformSample());
+					}
+				}
+
 				if (targetPacket.timestamp > lastTimestamp) {
-					// The pump decoded everything to the end and nothing satisfied the request; nothing ever will
+					// Nothing satisfied the request; nothing ever will
 					this._setCurrentRaw(null);
 					return res.set(null);
 				}
@@ -834,15 +955,13 @@ export abstract class SampleCursor<
 		let startTarget = targetPacket;
 
 		if (needsNewPump) {
-			// Set the cursor to the right spot
-			let startKey = this._packetCursor.seekToKey(targetPacket.timestamp);
-			if (isThenable(startKey)) startKey = await startKey;
+			// Decoding starts at the key packet at or before the target minus the decoder's pre-roll, so that the
+			// decoder has converged by the time it reaches the target
+			let start = await getStartKey();
+			this._ensureNotClosed();
 
-			if (!startKey) {
-				// The target presents before every key packet (leading pictures of a track cut mid-group, or of an
-				// open group ahead of the first IDR picture), so decoding starts at the first key packet it can start
-				// at, and the request resolves to that packet's sample
-				let firstKey = this._packetReader.getFirstKey({ ...this._retrievalOptions, verifyKeyPackets: true });
+			if (!start) {
+				let firstKey = this._packetReader.getFirstKey(verifiedOptions);
 				if (isThenable(firstKey)) firstKey = await firstKey;
 				this._ensureNotClosed();
 
@@ -850,10 +969,21 @@ export abstract class SampleCursor<
 					throw new Error('The track has no key packet that decoding can start at.');
 				}
 
-				startTarget = firstKey;
-				const result = this._packetCursor.seekToKey(firstKey.timestamp);
-				if (isThenable(result)) await result;
+				// If the target is at or after the first key packet, the track doesn't reach back far enough for the
+				// full pre-roll, so starting at the first key packet is the best we can do
+				if (firstKey.timestamp > targetPacket.timestamp) {
+					// The target presents before every key packet (leading pictures of a track cut mid-group, or of an
+					// open group ahead of the first IDR picture), so decoding starts at the first key packet it can
+					// start at, and the request resolves to that packet's sample
+					startTarget = firstKey;
+				}
+
+				start = firstKey;
 			}
+
+			// Set the cursor to the right spot
+			const result = this._packetCursor.seekToKey(start.timestamp);
+			if (isThenable(result)) await result;
 		}
 
 		if (!this._pumpTarget || startTarget.sequenceNumber > this._pumpTarget.sequenceNumber) {
@@ -878,7 +1008,7 @@ export abstract class SampleCursor<
 		// Add the request to the queue
 		const request = promiseWithResolvers<TransformedSample | null>();
 		const pendingRequest: PendingRequest<TransformedSample> = {
-			timestamp: startTarget.timestamp,
+			timestamp: startTarget === targetPacket ? requestTimestamp : startTarget.timestamp,
 			promise: request.promise,
 			resolve: request.resolve,
 			reject: request.reject,
@@ -1058,6 +1188,7 @@ export abstract class SampleCursor<
 			sample.close();
 		}
 		this._sampleQueue.length = 0;
+		this._dropUnclaimedSample();
 
 		try {
 			this._pumpRunning = true;
@@ -1130,6 +1261,29 @@ export abstract class SampleCursor<
 				// We're closed with no pending requests, don't bother flushing what's left
 			}
 
+			// Decoded audio is contiguous, so once decoding has reached the end of the track, a request for a time past
+			// the end of every sample is answered by the last one, which starts at or before that time
+			const lastSample = this._packetCursor.current ? null : this._unclaimedSample;
+			if (lastSample) {
+				for (let i = 0; i < this._pendingRequests.length; i++) {
+					const request = this._pendingRequests[i]!;
+					if (lastSample.timestamp - request.timestamp > 1e-10) {
+						continue;
+					}
+
+					this._unclaimedSample = null;
+					this._setCurrentRaw(lastSample);
+					request.resolve(this._transformSample());
+
+					// A successor has no sample left to resolve to
+					if (request.successor) {
+						this._pendingRequests[i] = request.successor;
+					} else {
+						this._pendingRequests.splice(i--, 1);
+					}
+				}
+			}
+
 			// Resolve whatever requests remain with null. The reason this is correct: assume there are still pending
 			// requests. Then the above flush() call ensured that all possible samples that we can get from the decoder
 			// we have received. If some of the pending requests are still unsatisfied after seeing all samples we
@@ -1183,6 +1337,8 @@ export abstract class SampleCursor<
 		this._sampleQueue.length = 0;
 
 		await this._pumpStopped.wait();
+		// Decoding was cut short, so the unclaimed sample needn't be the track's last
+		this._dropUnclaimedSample();
 	}
 
 	private async _closeInternal(doLock = true) {
@@ -1206,6 +1362,7 @@ export abstract class SampleCursor<
 			sample.close();
 		}
 		this._sampleQueue.length = 0;
+		this._dropUnclaimedSample();
 
 		this._setCurrentRaw(null);
 		this._decoder?.close();
@@ -1400,6 +1557,10 @@ export class AudioSampleCursor<TransformedSample = AudioSample> extends SampleCu
 		const codec = await this.track.getCodec();
 		const decoderConfig = await this.track.getDecoderConfig();
 		assert(codec && decoderConfig);
+
+		const preRollDuration = await this.track.getPreRollDuration();
+		assert(preRollDuration !== null); // The codec is known
+		this._preRollDuration = preRollDuration;
 
 		let decoder: AudioDecoderWrapper | PcmAudioDecoderWrapper;
 		if ((PCM_AUDIO_CODECS as readonly string[]).includes(decoderConfig.codec)) {

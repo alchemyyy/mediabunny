@@ -603,15 +603,11 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 			durationInSamples = clamp(endTimestampInSamples - additional.timestampInSamples, 0, durationInSamples);
 		}
 
-		// Clamp both ends so that a packet partially before zero doesn't overlap with the following packet
-		const startTimestampInSamples = Math.max(additional.timestampInSamples, 0);
-		const endTimestampInSamples = Math.max(additional.timestampInSamples + durationInSamples, 0);
-
 		const encodedPacket = new EncodedPacket(
 			options.metadataOnly ? PLACEHOLDER_DATA : packet.data,
 			'key',
-			startTimestampInSamples / this.internalSampleRate,
-			(endTimestampInSamples - startTimestampInSamples) / this.internalSampleRate,
+			additional.timestampInSamples / this.internalSampleRate,
+			durationInSamples / this.internalSampleRate,
 			packet.endPage.headerStartPos + packet.endSegmentIndex,
 			packet.data.byteLength,
 		);
@@ -650,6 +646,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		// these packets and compare.
 		let firstEndPage: Page | null = null;
 		let totalDurationInSamples = 0;
+		let firstPacketDurationInSamples: number | null = null;
 		let vorbisLastBlocksize: number | null = null;
 		const packetResult = new ResultValue<Packet | null>();
 
@@ -674,6 +671,7 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 				vorbisLastBlocksize,
 			);
 			totalDurationInSamples += durationInSamples;
+			firstPacketDurationInSamples ??= durationInSamples;
 			vorbisLastBlocksize = vorbisBlockSize;
 
 			positionResult.reset();
@@ -686,10 +684,15 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		if (!firstEndPage) {
 			return res.set(this.firstTimestampInSamples = defaultTimestampInSamples);
 		}
+		assert(firstPacketDurationInSamples !== null);
 
-		// A smaller granule position is only legal on the final page, where it signals end trimming
+		// A smaller granule position is only legal on the final page, where it signals end trimming. The Vorbis priming
+		// packet decodes to nothing though, so it's allowed to precede the granule position's origin.
+		const minStartInSamples = this.bitstream.codecInfo.codec === 'vorbis'
+			? -firstPacketDurationInSamples
+			: 0;
 		this.firstTimestampInSamples = defaultTimestampInSamples
-			+ Math.max(firstEndPage.granulePosition - totalDurationInSamples, 0);
+			+ Math.max(firstEndPage.granulePosition - totalDurationInSamples, minStartInSamples);
 		return res.set(this.firstTimestampInSamples);
 	}
 
@@ -778,11 +781,11 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 		if (firstTimestampResult.pending) await firstTimestampPromise;
 
 		const firstTimestampInSamples = firstTimestampResult.value;
-		if (timestampInSamples === Math.max(firstTimestampInSamples, 0)) {
+		if (timestampInSamples === firstTimestampInSamples) {
 			// Fast path for the first timestamp - avoids binary search when playing back from the start
 			return this.getFirstPacket(res, options);
 		}
-		if (timestampInSamples < Math.max(firstTimestampInSamples, 0)) {
+		if (timestampInSamples < firstTimestampInSamples) {
 			// There's nothing here
 			return res.set(new PacketRetrievalResult(null));
 		}
@@ -1090,9 +1093,9 @@ class OggAudioTrackBacking implements InputAudioTrackBacking {
 					currentTimestampIsCorrect
 					&& (
 						// Next timestamp will be too late
-						Math.max(currentTimestampInSamples, 0) > timestampInSamples
+						currentTimestampInSamples > timestampInSamples
 						// This timestamp already matches
-						|| Math.max(encodedPacketMetadata.timestampInSamples, 0) === timestampInSamples
+						|| encodedPacketMetadata.timestampInSamples === timestampInSamples
 					)
 				) {
 					break;

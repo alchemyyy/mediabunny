@@ -11,11 +11,11 @@ import { EncodedPacket, PacketReader } from '../../src/packet.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
-const testBasicPacketReading = async (track: InputTrack) => {
+const testBasicPacketReading = async (track: InputTrack, firstTimestamp = 0) => {
 	const reader = new PacketReader(track);
 	const first = await reader.getFirst();
 	expect(first).not.toBe(null);
-	expect(first!.timestamp).toBe(0);
+	expect(first!.timestamp).toBe(firstTimestamp);
 
 	const next = await reader.getNext(first!);
 	expect(next).not.toBe(null);
@@ -298,7 +298,8 @@ test('Ogg demuxing', async () => {
 	expect(await audioTrack.getNumberOfChannels()).toBeGreaterThan(0);
 	expect(await audioTrack.getSampleRate()).toBeGreaterThan(0);
 
-	await testBasicPacketReading(audioTrack);
+	// The first Vorbis packet, of 128 frames, only primes the decoder, so it presents before 0
+	await testBasicPacketReading(audioTrack, -128 / 44100);
 
 	const duration = await audioTrack.computeDuration();
 	expect(duration).toBeCloseTo(57.31360544217687);

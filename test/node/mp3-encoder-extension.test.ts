@@ -126,5 +126,5 @@ test('MP3 with huge timestamps', async () => {
 	const firstPacket = await reader.getFirst();
 	assert(firstPacket);
 
-	expect(firstPacket.timestamp).toBe(timestamp);
+	expect(firstPacket.timestamp).toBeCloseTo(timestamp - 1105 / sampleRate, 6);
 });

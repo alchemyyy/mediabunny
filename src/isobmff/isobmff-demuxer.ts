@@ -89,7 +89,13 @@ import {
 	colorSpaceIsComplete,
 } from '../misc';
 import { EncodedPacket, PacketRetrievalOptions, PacketRetrievalResult, PLACEHOLDER_DATA } from '../packet';
-import { buildIsobmffMimeType, parsePsshBoxContents, psshBoxesAreEqual, PsshBox } from './isobmff-misc';
+import {
+	buildIsobmffMimeType,
+	parsePsshBoxContents,
+	psshBoxesAreEqual,
+	PsshBox,
+	TIMESTAMP_OFFSET,
+} from './isobmff-misc';
 import {
 	MAX_BOX_HEADER_SIZE,
 	MIN_BOX_HEADER_SIZE,
@@ -126,6 +132,8 @@ const DVC1_HEADER_SIZE = 7;
 /** The dvc1 profile value of the VC-1 Advanced profile. */
 const DVC1_ADVANCED_PROFILE = 12;
 
+const TRUEHD_CHANNEL_ASSIGNMENT_COUNTS = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
+
 type InternalTrack = {
 	unsupportedFeatures: UnsupportedTrackFeature[];
 	id: number;
@@ -151,6 +159,7 @@ type InternalTrack = {
 		moofOffset: number;
 		startTimestamp: number;
 		endTimestamp: number;
+		hasKeyFrame: boolean;
 	}[];
 	/** The segment durations of all edit list entries leading up to the main one (from which the offset is taken.) */
 	editListPreviousSegmentDurations: number;
@@ -901,6 +910,7 @@ export class IsobmffDemuxer extends Demuxer {
 					moofOffset: fragment.moofOffset,
 					startTimestamp: trackData.startTimestamp,
 					endTimestamp: trackData.endTimestamp,
+					hasKeyFrame: trackData.firstKeyFrameTimestamp !== null,
 				});
 			}
 
@@ -984,14 +994,23 @@ export class IsobmffDemuxer extends Demuxer {
 				const version = readU8(slice);
 				slice.skip(3); // Flags
 
+				let creationTime: number;
 				if (version === 1) {
-					slice.skip(8 + 8);
+					creationTime = readU64Be(slice);
+					slice.skip(8); // Modification time
 					this.movieTimescale = readU32Be(slice);
 					this.movieDurationInTimescale = readU64Be(slice);
 				} else {
-					slice.skip(4 + 4);
+					creationTime = readU32Be(slice);
+					slice.skip(4); // Modification time
 					this.movieTimescale = readU32Be(slice);
 					this.movieDurationInTimescale = readU32Be(slice);
+				}
+
+				if (creationTime !== 0) {
+					this.metadataTags.creationTime = new Date(1000 * (creationTime - TIMESTAMP_OFFSET));
+				} else {
+					// Assume this means the creation time isn't set (I doubt the file was created in 1904)
 				}
 
 				if (this.movieTimescale === 0) {
@@ -1390,6 +1409,8 @@ export class IsobmffDemuxer extends Demuxer {
 						} else if ((DTS_FOURCCS as readonly string[]).includes(codecName!)) {
 							track.info.codec = 'dts';
 							track.info.dtsFormat = codecName as DtsFourCc;
+						} else if (codecName === 'mlpa') {
+							track.info.codec = 'truehd';
 						} else if (codecName === 'twos') {
 							if (sampleSize === 8) {
 								track.info.codec = 'pcm-s8';
@@ -1994,6 +2015,37 @@ export class IsobmffDemuxer extends Demuxer {
 				if (config.numberOfChannels !== null) {
 					track.info.numberOfChannels = config.numberOfChannels;
 				}
+			}; break;
+
+			case 'dmlp': { // MLPSpecificBox
+				const track = this.currentTrack;
+				if (!track || track.info?.type !== 'audio') {
+					break;
+				}
+
+				const formatInfo = readU32Be(slice);
+
+				const rateBits = formatInfo >>> 28;
+				if (rateBits === 0xf) {
+					Logging._warn('Invalid dmlp box contents, ignoring.');
+					break;
+				}
+
+				track.info.sampleRate = (rateBits & 0x8 ? 44100 : 48000) << (rateBits & 0x7);
+
+				// Prefer the 8-channel presentation's assignment, falling back to the 6-channel one
+				const sixChannelAssignment = (formatInfo >>> 15) & 0x1f;
+				const eightChannelAssignment = formatInfo & 0x1fff;
+				const channelAssignment = eightChannelAssignment || sixChannelAssignment;
+
+				let numberOfChannels = 0;
+				for (let i = 0; i < TRUEHD_CHANNEL_ASSIGNMENT_COUNTS.length; i++) {
+					if (channelAssignment & (1 << i)) {
+						numberOfChannels += TRUEHD_CHANNEL_ASSIGNMENT_COUNTS[i]!;
+					}
+				}
+
+				track.info.numberOfChannels = numberOfChannels;
 			}; break;
 
 			case 'stts': {
@@ -3348,6 +3400,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			timestampInTimescale,
 			timestampInTimescale,
 			options,
+			true,
 		);
 	}
 
@@ -3545,28 +3598,22 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		// The timestamp for which we know the correct sample will not come after it
 		latestTimestamp: number,
 		options: PacketRetrievalOptions,
-		// The position for which we know the correct sample will not come after it
-		stopPos = Infinity,
-		// How many times we've retried due to a faulty lookup table entry
-		lookupRetryCount = 0,
+		// Whether the match must be a key frame, so that position cache entries without one can be skipped
+		requireKeyFrame = false,
 	): MaybeRelevantPromise {
-		const demuxer = this.internalTrack.demuxer;
+		const { demuxer, fragmentLookupTable, fragmentPositionCache } = this.internalTrack;
 
-		let currentPos = startOffset ?? 0;
-		let currentFragment: Fragment | null = null;
+		let startFragment: Fragment | null = null;
 		let bestFragment: Fragment | null = null;
 		let bestSampleIndex = -1;
 
 		if (startOffset !== null && demuxer.lastReadFragment?.moofOffset === startOffset) {
-			const startFragment = demuxer.lastReadFragment;
+			startFragment = demuxer.lastReadFragment;
 			const { sampleIndex, correctSampleFound } = getMatchInFragment(startFragment);
 
 			if (correctSampleFound) {
 				return this.fetchPacketInFragment(res, startFragment, sampleIndex, options);
 			}
-
-			currentPos = startFragment.moofOffset + startFragment.moofSize; // Start reading from the next fragment
-			currentFragment = startFragment;
 
 			if (sampleIndex !== -1) {
 				bestFragment = startFragment;
@@ -3576,112 +3623,118 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 		// Search for a lookup entry; this way, we won't need to start searching from the start of the file
 		// but can jump right into the correct fragment (or at least nearby).
-		const lookupEntryIndex = binarySearchLessOrEqual(
-			this.internalTrack.fragmentLookupTable,
-			searchTimestamp,
-			x => x.timestamp,
-		);
-		const lookupEntry = lookupEntryIndex !== -1
-			? this.internalTrack.fragmentLookupTable[lookupEntryIndex]!
-			: null;
+		let lookupEntryIndex = binarySearchLessOrEqual(fragmentLookupTable, searchTimestamp, x => x.timestamp);
+		// Fragments read during the lookup land after this index, so it stays valid
+		let positionCacheIndex = binarySearchLessOrEqual(fragmentPositionCache, searchTimestamp, x => x.startTimestamp);
 
-		const positionCacheIndex = binarySearchLessOrEqual(
-			this.internalTrack.fragmentPositionCache,
-			searchTimestamp,
-			x => x.startTimestamp,
-		);
-		const positionCacheEntry = positionCacheIndex !== -1
-			? this.internalTrack.fragmentPositionCache[positionCacheIndex]!
-			: null;
+		// The position for which we know the correct sample will not come after it
+		let stopPos = Infinity;
 
-		const lookupEntryPosition = Math.max(
-			lookupEntry?.moofOffset ?? 0,
-			positionCacheEntry?.moofOffset ?? 0,
-		) || null;
-		const lookupTableWins = !!lookupEntry && lookupEntry.moofOffset >= (positionCacheEntry?.moofOffset ?? 0);
+		while (true) {
+			// Skip lookup entries pointing into fragments we've already scanned
+			while (lookupEntryIndex !== -1 && fragmentLookupTable[lookupEntryIndex]!.moofOffset >= stopPos) {
+				lookupEntryIndex--;
+			}
+			while (
+				positionCacheIndex !== -1
+				&& (
+					fragmentPositionCache[positionCacheIndex]!.moofOffset >= stopPos
+					|| (requireKeyFrame && !fragmentPositionCache[positionCacheIndex]!.hasKeyFrame)
+				)
+			) {
+				positionCacheIndex--;
+			}
 
-		if (lookupEntryPosition !== null && lookupEntryPosition > currentPos) {
-			// Use the lookup entry
-			currentPos = lookupEntryPosition;
-			currentFragment = null;
-		}
+			const lookupEntryPosition = Math.max(
+				fragmentLookupTable[lookupEntryIndex]?.moofOffset ?? 0,
+				fragmentPositionCache[positionCacheIndex]?.moofOffset ?? 0,
+			) || null;
 
-		const scanStartPos = currentFragment ? currentFragment.moofOffset : currentPos;
+			let currentPos: number;
+			let currentFragment: Fragment | null = null;
 
-		while (currentPos < stopPos) {
-			if (currentFragment) {
-				const trackData = currentFragment.trackData.get(this.internalTrack.id);
-				if (trackData && trackData.startTimestamp > latestTimestamp) {
-					// We're already past the upper bound, no need to keep searching
+			if (startOffset === null) {
+				currentPos = lookupEntryPosition ?? 0;
+			} else {
+				if (startFragment) {
+					// Start reading from the next fragment
+					currentPos = startFragment.moofOffset + startFragment.moofSize;
+					currentFragment = startFragment;
+				} else {
+					currentPos = startOffset;
+				}
+
+				if (lookupEntryPosition !== null && lookupEntryPosition > currentPos) {
+					// Use the lookup entry
+					currentPos = lookupEntryPosition;
+					currentFragment = null;
+				}
+			}
+
+			const scanStartPos = currentFragment ? currentFragment.moofOffset : currentPos;
+
+			while (currentPos < stopPos) {
+				if (currentFragment) {
+					const trackData = currentFragment.trackData.get(this.internalTrack.id);
+					if (trackData && trackData.startTimestamp > latestTimestamp) {
+						// We're already past the upper bound, no need to keep searching
+						break;
+					}
+
+					currentFragment = null; // So we don't process it again next iteration
+				}
+
+				const summary = demuxer.fragmentSummaries.get(currentPos);
+				if (summary && !summary.trackIds.has(this.internalTrack.id)) {
+					// We've read this fragment before and know it has nothing for this track, so let's not read it
+					// again
+					currentPos += summary.moofSize;
+					continue;
+				}
+
+				// Load the header
+				let slice = demuxer.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
+				if (isThenable(slice)) slice = await slice;
+				if (!slice) break;
+
+				const boxStartPos = currentPos;
+				const boxInfo = readBoxHeader(slice);
+				if (!boxInfo) {
 					break;
 				}
 
-				currentFragment = null; // So we don't process it again next iteration
+				if (boxInfo.name === 'moof') {
+					const result = new ResultValue<Fragment | null>();
+					const promise = demuxer.readFragment(result, boxStartPos);
+					if (result.pending) await promise;
+
+					currentFragment = result.value;
+					if (!currentFragment) {
+						break;
+					}
+
+					const { sampleIndex, correctSampleFound } = getMatchInFragment(currentFragment);
+					if (correctSampleFound) {
+						return this.fetchPacketInFragment(res, currentFragment, sampleIndex, options);
+					}
+					if (sampleIndex !== -1) {
+						bestFragment = currentFragment;
+						bestSampleIndex = sampleIndex;
+					}
+				}
+
+				currentPos = boxStartPos + boxInfo.totalSize;
 			}
 
-			const summary = demuxer.fragmentSummaries.get(currentPos);
-			if (summary && !summary.trackIds.has(this.internalTrack.id)) {
-				// We've read this fragment before and know it has nothing for this track, so let's not read it again
-				currentPos += summary.moofSize;
-				continue;
-			}
-
-			// Load the header
-			let slice = demuxer.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
-			if (isThenable(slice)) slice = await slice;
-			if (!slice) break;
-
-			const boxStartPos = currentPos;
-			const boxInfo = readBoxHeader(slice);
-			if (!boxInfo) {
+			if (lookupEntryPosition === null || (bestFragment && bestFragment.moofOffset >= lookupEntryPosition)) {
 				break;
 			}
 
-			if (boxInfo.name === 'moof') {
-				const result = new ResultValue<Fragment | null>();
-				const promise = demuxer.readFragment(result, boxStartPos);
-				if (result.pending) await promise;
-
-				currentFragment = result.value;
-				if (!currentFragment) {
-					break;
-				}
-
-				const { sampleIndex, correctSampleFound } = getMatchInFragment(currentFragment);
-				if (correctSampleFound) {
-					return this.fetchPacketInFragment(res, currentFragment, sampleIndex, options);
-				}
-				if (sampleIndex !== -1) {
-					bestFragment = currentFragment;
-					bestSampleIndex = sampleIndex;
-				}
-			}
-
-			currentPos = boxStartPos + boxInfo.totalSize;
-		}
-
-		// Handle unsatisfactory lookup table entries or position cache entries
-		if (lookupEntryPosition !== null && (!bestFragment || bestFragment.moofOffset < lookupEntryPosition)) {
 			// We found a lookup entry but no fragment from there on that satisfied the match. In this case, let's
-			// search again but using a previous entry of the kind we started from. Each time this happens, we double
-			// the backwards step to perform better (and have more sequential reads) if it takes us a long time to find
-			// the media.
-			const step = 1 << lookupRetryCount;
-			const previousEntryTimestamp = lookupTableWins
-				? this.internalTrack.fragmentLookupTable[lookupEntryIndex - step]?.timestamp
-				: this.internalTrack.fragmentPositionCache[positionCacheIndex - step]?.startTimestamp;
-			const newSearchTimestamp = previousEntryTimestamp ?? -Infinity;
-
-			return this.performFragmentedLookup(
-				res,
-				null,
-				getMatchInFragment,
-				newSearchTimestamp,
-				latestTimestamp,
-				options,
-				scanStartPos, // So we don't read the same fragments again
-				lookupRetryCount + 1,
-			);
+			// search again from the lookup entry preceding the fragments we just scanned.
+			stopPos = scanStartPos; // So we don't read the same fragments again
+			startOffset = null;
+			startFragment = null;
 		}
 
 		if (bestFragment) {

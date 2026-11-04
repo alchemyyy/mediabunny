@@ -103,9 +103,11 @@ import {
 import { FileSlice, readBytes, Reader, readU16Be, readU32Be, readU8 } from '../reader';
 import {
 	buildMpegTsMimeType,
+	createTimestampWrapInfo,
 	MpegTsStreamType,
-	TIMESCALE,
-	TIMESTAMP_MODULUS,
+	normalizeWrappedTimestamp,
+	MPEG_TS_TIMESCALE,
+	TimestampWrapInfo,
 	TS_PACKET_SIZE,
 } from './mpeg-ts-misc';
 import { AC3_SAMPLE_RATES } from '../../shared/ac3-misc';
@@ -215,10 +217,7 @@ export class MpegTsDemuxer extends Demuxer {
 	sectionEndPositions: number[] = [];
 	seekChunkSize = 5 * 1024 * 1024; // 5 MiB, picked because most HLS segments are below this size
 	minReferencePointByteDistance = -1;
-	timestampWrapInfo: {
-		reference: number;
-		offset: number;
-	} | null = null;
+	timestampWrapInfo: TimestampWrapInfo | null = null;
 
 	constructor(input: Input) {
 		super(input);
@@ -898,27 +897,10 @@ export class MpegTsDemuxer extends Demuxer {
 	}
 
 	normalizeTimestamp(timestamp: number) {
-		if (!this.timestampWrapInfo) {
-			// No info yet, let's initialize it anchored on this timestamp. Since we process packets sequentially when
-			// extracting metadata, this means we'll anchor to the first PTS in the file.
-			const tolerance = 60 * TIMESCALE;
-			this.timestampWrapInfo = {
-				reference: timestamp - tolerance,
-				offset: timestamp >= TIMESTAMP_MODULUS - tolerance
-					? -TIMESTAMP_MODULUS // Timestamps close to the modulus are treated as negative
-					: TIMESTAMP_MODULUS,
-			};
-		}
-
-		const { reference, offset } = this.timestampWrapInfo;
-		if (
-			(offset < 0 && timestamp >= reference)
-			|| (offset > 0 && timestamp < reference)
-		) {
-			return timestamp + offset;
-		}
-
-		return timestamp;
+		// If there's no info yet, initialize it anchored on this timestamp. Since we process packets sequentially when
+		// extracting metadata, this means we'll anchor to the first PTS in the file.
+		this.timestampWrapInfo ??= createTimestampWrapInfo(timestamp);
+		return normalizeWrappedTimestamp(timestamp, this.timestampWrapInfo);
 	}
 }
 
@@ -1416,7 +1398,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 	}
 
 	getTimeResolution() {
-		return TIMESCALE;
+		return MPEG_TS_TIMESCALE;
 	}
 
 	isRelativeToUnixEpoch() {
@@ -1469,8 +1451,8 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		const packet = new EncodedPacket(
 			options.metadataOnly ? PLACEHOLDER_DATA : suppliedPacket.data,
 			packetType,
-			suppliedPacket.pts / TIMESCALE,
-			Math.max(duration / TIMESCALE, 0),
+			suppliedPacket.pts / MPEG_TS_TIMESCALE,
+			Math.max(duration / MPEG_TS_TIMESCALE, 0),
 			suppliedPacket.sequenceNumber,
 			suppliedPacket.data.byteLength,
 		);
@@ -1625,7 +1607,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		keyframesOnly: boolean,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		const searchPts = roundIfAlmostInteger(timestamp * TIMESCALE);
+		const searchPts = roundIfAlmostInteger(timestamp * MPEG_TS_TIMESCALE);
 
 		const demuxer = this.elementaryStream.demuxer;
 		const { reader, seekChunkSize } = demuxer;
@@ -1696,7 +1678,7 @@ abstract class MpegTsTrackBacking implements InputTrackBacking {
 		const referencePesPackets = this.elementaryStream.referencePesPackets;
 		const referencePointIndex = binarySearchLessOrEqual(referencePesPackets, searchPts, x => x.pts);
 		const referencePoint = referencePointIndex !== -1 ? referencePesPackets[referencePointIndex]! : null;
-		if (referencePoint && searchPts - referencePoint.pts < TIMESCALE / 2) {
+		if (referencePoint && searchPts - referencePoint.pts < MPEG_TS_TIMESCALE / 2) {
 			// Reference point ain't too far away, prefer it over the chunk search
 			scanStartPos = referencePoint.sectionStartPos;
 		} else {
@@ -2255,7 +2237,13 @@ export const maybeInsertReferencePacket = (
 		}
 	}
 
-	referencePesPackets.splice(index + 1, 0, pesPacketHeader);
+	// Copy only the header fields (callers may pass a whole PES packet)
+	referencePesPackets.splice(index + 1, 0, {
+		sectionStartPos: pesPacketHeader.sectionStartPos,
+		sectionEndPos: pesPacketHeader.sectionEndPos,
+		pts: pesPacketHeader.pts,
+		randomAccessIndicator: pesPacketHeader.randomAccessIndicator,
+	});
 	return true;
 };
 
@@ -2682,7 +2670,9 @@ export class PacketReadingContext {
 
 							this.supplyPacket(
 								bufferedResult.value,
-								Math.round(SAMPLES_PER_AAC_FRAME * TIMESCALE / elementaryStream.info.sampleRate),
+								Math.round(
+									SAMPLES_PER_AAC_FRAME * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
+								),
 							);
 							return res.set();
 						} else {
@@ -2715,7 +2705,7 @@ export class PacketReadingContext {
 							const framePromise = this.ensureBuffered(bufferedResult, result.header.totalSize);
 							if (bufferedResult.pending) await framePromise;
 
-							const duration = result.header.audioSamplesInFrame * TIMESCALE
+							const duration = result.header.audioSamplesInFrame * MPEG_TS_TIMESCALE
 								/ elementaryStream.info.sampleRate;
 							this.supplyPacket(bufferedResult.value, Math.round(duration));
 							return res.set();
@@ -2766,7 +2756,7 @@ export class PacketReadingContext {
 						if (bufferedResult.pending) await framePromise;
 
 						const duration = Math.round(
-							AC3_SAMPLES_PER_FRAME * TIMESCALE / elementaryStream.info.sampleRate,
+							AC3_SAMPLES_PER_FRAME * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
 						this.supplyPacket(bufferedResult.value, duration);
 						return res.set();
@@ -2809,7 +2799,7 @@ export class PacketReadingContext {
 						// Duration = numblks * 256 samples per block
 						const samplesPerFrame = numblks * 256;
 						const duration = Math.round(
-							samplesPerFrame * TIMESCALE / elementaryStream.info.sampleRate,
+							samplesPerFrame * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
 						this.supplyPacket(bufferedResult.value, duration);
 						return res.set();
@@ -2897,7 +2887,7 @@ export class PacketReadingContext {
 						if (bufferedResult.pending) await framePromise;
 
 						const duration = Math.round(
-							sampleCount * TIMESCALE / elementaryStream.info.sampleRate,
+							sampleCount * MPEG_TS_TIMESCALE / elementaryStream.info.sampleRate,
 						);
 						this.supplyPacket(bufferedResult.value, duration);
 						return res.set();

@@ -311,6 +311,8 @@ test('AC-3 encoding', async () => {
 	expect(await track.getSampleRate()).toBe(sampleRate);
 	expect(await track.getNumberOfChannels()).toBe(channels);
 
+	expect(await track.getFirstTimestamp()).toBeLessThan(0); // Due to priming delay!
+
 	const cursor = new PacketCursor(track);
 	let packetCount = 0;
 	for await (const packet of cursor) {
@@ -360,6 +362,8 @@ test('E-AC-3 encoding', async () => {
 	expect(await track.getCodec()).toBe('eac3');
 	expect(await track.getSampleRate()).toBe(sampleRate);
 	expect(await track.getNumberOfChannels()).toBe(channels);
+
+	expect(await track.getFirstTimestamp()).toBeLessThan(0); // Due to priming delay!
 
 	const cursor = new PacketCursor(track);
 	let packetCount = 0;
@@ -413,13 +417,14 @@ test('AC-3 with huge timestamps', async () => {
 	const firstPacket = await packetReader.getFirst();
 	assert(firstPacket);
 
-	expect(firstPacket.timestamp).toBe(timestamp);
+	const primingDelay = 256 / 48000;
+	expect(firstPacket.timestamp).toBe(timestamp - primingDelay);
 
 	await using sampleCursor = new AudioSampleCursor(track);
 	const firstSample = await sampleCursor.seekTo(timestamp);
 	assert(firstSample);
 
-	expect(firstSample.timestamp).toBe(timestamp);
+	expect(firstSample.timestamp).toBe(timestamp - primingDelay);
 });
 
 test('E-AC-3 with huge timestamps', async () => {
@@ -463,11 +468,12 @@ test('E-AC-3 with huge timestamps', async () => {
 	const firstPacket = await packetReader.getFirst();
 	assert(firstPacket);
 
-	expect(firstPacket.timestamp).toBe(timestamp);
+	const primingDelay = 256 / 48000;
+	expect(firstPacket.timestamp).toBe(timestamp - primingDelay);
 
 	await using sampleCursor = new AudioSampleCursor(track);
 	const firstSample = await sampleCursor.seekTo(timestamp);
 	assert(firstSample);
 
-	expect(firstSample.timestamp).toBe(timestamp);
+	expect(firstSample.timestamp).toBe(timestamp - primingDelay);
 });

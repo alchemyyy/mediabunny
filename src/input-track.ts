@@ -6,8 +6,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { AudioCodec, MediaCodec, PCM_AUDIO_CODECS, VideoCodec } from './codec';
-import { determineVideoPacketType } from './codec-data';
+import {
+	AUDIO_CODECS_WITH_DELTA_PACKETS,
+	AudioCodec,
+	getAudioPreRollDuration,
+	MediaCodec,
+	PCM_AUDIO_CODECS,
+	VideoCodec,
+} from './codec';
+import { determineAudioPacketType, determineVideoPacketType } from './codec-data';
 import { customAudioDecoders, customVideoDecoders } from './custom-coder';
 import { Input } from './input';
 import { Logging } from './logging';
@@ -1176,7 +1183,10 @@ export class InputAudioTrack extends InputTrack {
 	}
 
 	async hasOnlyKeyPackets() {
-		return (await this._backing.getHasOnlyKeyPackets?.()) ?? true;
+		const codec = await this._backing.getCodec();
+
+		return (await this._backing.getHasOnlyKeyPackets?.())
+			?? (codec === null || !AUDIO_CODECS_WITH_DELTA_PACKETS.includes(codec));
 	}
 
 	/** Returns the number of audio channels in the track. */
@@ -1234,6 +1244,22 @@ export class InputAudioTrack extends InputTrack {
 		return decoderConfig?.codec ?? null;
 	}
 
+	/**
+	 * Returns the decoder pre-roll duration for this track. It specifies how far ahead of any given timestamp,
+	 * in seconds, decoding must start so that the audio at that timestamp comes out correctly and the codec state has
+	 * properly converged. Returns `null` if the track's codec is unknown.
+	 */
+	async getPreRollDuration() {
+		const codec = await this._backing.getCodec();
+		if (codec === null) {
+			return null;
+		}
+
+		const decoderConfig = await this._backing.getDecoderConfig();
+		assert(decoderConfig);
+		return getAudioPreRollDuration(codec, decoderConfig);
+	}
+
 	async canDecode() {
 		try {
 			const decoderConfig = await this._backing.getDecoderConfig();
@@ -1268,12 +1294,16 @@ export class InputAudioTrack extends InputTrack {
 		if (!(packet instanceof EncodedPacket)) {
 			throw new TypeError('packet must be an EncodedPacket.');
 		}
+		if (packet.isMetadataOnly) {
+			throw new TypeError('packet must not be metadata-only to determine its type.');
+		}
 
-		if ((await this.getCodec()) === null) {
+		const codec = await this.getCodec();
+		if (codec === null) {
 			return null;
 		}
 
-		return 'key'; // No audio codec with delta packets
+		return determineAudioPacketType(codec, packet.data);
 	}
 }
 

@@ -1303,3 +1303,36 @@ test('hasNext', async () => {
 
 	expect(cursor.hasNext()).not.toBeInstanceOf(Promise);
 });
+
+test('Audio seeking past the end', async () => {
+	using input = new Input({
+		source: new UrlSource('/trim-buck-bunny.mov'),
+		formats: ALL_FORMATS,
+	});
+
+	const audioTrack = (await input.getPrimaryAudioTrack())!;
+
+	let lastTimestamp: number | null = null;
+	{
+		await using cursor = new AudioSampleCursor(audioTrack);
+		for (let sample = await cursor.seekToFirst(); sample; sample = await cursor.next()) {
+			lastTimestamp = sample.timestamp;
+		}
+	}
+	expect(lastTimestamp).not.toBe(null);
+
+	await using cursor = new AudioSampleCursor(audioTrack);
+	cursor._debug.enabled = true;
+
+	// No sample reaches the time, so once decoding has reached the end of the track, the last one answers
+	const last = await cursor.seekTo(Infinity);
+	expect(last).not.toBe(null);
+	expect(last!.timestamp).toBe(lastTimestamp);
+	expect(cursor._debug.pumpsStarted).toBe(1);
+
+	const again = await cursor.seekTo(Infinity);
+	expect(again).not.toBe(null);
+	expect(again!.timestamp).toBe(lastTimestamp);
+
+	expect(await cursor.next()).toBe(null);
+});

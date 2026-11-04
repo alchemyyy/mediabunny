@@ -89,8 +89,8 @@
 
 		//let last  = -Infinity;
 		//const primaryTrack = await input.getPrimaryVideoTrack();
-		//for await (const packet of new Mediabunny.EncodedPacketSink(primaryTrack).packets()) {
-		//	console.log(packet.timestamp, packet.duration, packet.timestamp - last)
+		//for await (const packet of new Mediabunny.PacketCursor(primaryTrack)) {
+		//	console.log(packet.type, packet.timestamp, packet.duration, packet.timestamp - last)
 		//	last = packet.timestamp;
 		//}
 		//console.log("Done")
@@ -177,6 +177,8 @@
 				}
 			},
 			trim: {
+				//start: 5,
+				//end: 10,
 				//start: 0,
 				//end: 5,
 				//start: 25,
@@ -191,12 +193,7 @@
 				//start: startTime,
 				//end: startTime + 2,
 			},
-			copy: {
-				//mode: 'forced',
-				//mode: 'forced',
-				//shiftTolerance: Infinity,
-				//boundaryPolicy: 'shrink',
-			},
+			//copy: false,
 		});
 		//console.log(conversion);
 		console.log(conversion.discardedTracks);

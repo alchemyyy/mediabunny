@@ -13,6 +13,14 @@ Mediabunny is a JavaScript library for reading, writing, and converting media (l
 
 [Documentation](https://mediabunny.dev) | [Examples](https://mediabunny.dev/examples) | [Sponsoring](#sponsoring) | [License](#license) | [Discord](https://discord.gg/hmpkyYuS4U)
 
+### Platinum sponsors
+
+<div align="center">
+  <a href="https://www.figma.com/" target="_blank" rel="sponsored">
+    <img src="./docs/public/sponsors/figma.png" width="80" height="80" alt="Figma">
+  </a>
+</div>
+
 ### Gold sponsors
 
 <div align="center">
@@ -23,12 +31,8 @@ Mediabunny is a JavaScript library for reading, writing, and converting media (l
     </picture>
   </a>
   &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://diffusion.studio/" target="_blank" rel="sponsored">
-    <img src="./docs/public/sponsors/diffusionstudio.png" width="60" height="60" alt="Diffusion Studio">
-  </a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://kino.ai/" target="_blank" rel="sponsored">
-    <img src="./docs/public/sponsors/kino.jpg" width="60" height="60" alt="Kino">
+    <img src="./docs/public/sponsors/kino.png" width="60" height="60" alt="Kino">
   </a>
   &nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://screen.studio/" target="_blank" rel="sponsored">

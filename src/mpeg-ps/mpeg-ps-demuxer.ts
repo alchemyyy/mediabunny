@@ -38,7 +38,12 @@ import {
 	SuppliedPacket,
 	TimestampedPesPacket,
 } from '../mpeg-ts/mpeg-ts-demuxer';
-import { TIMESCALE, TIMESTAMP_MODULUS } from '../mpeg-ts/mpeg-ts-misc';
+import {
+	createTimestampWrapInfo,
+	MPEG_TS_TIMESCALE,
+	normalizeWrappedTimestamp,
+	TimestampWrapInfo,
+} from '../mpeg-ts/mpeg-ts-misc';
 import {
 	EncodedPacket,
 	PacketRetrievalOptions,
@@ -83,11 +88,11 @@ const MPEG2_PACK_HEADER_SIZE = 14;
 
 // Streams are looked for in the file's first 5 MB or 5 seconds, as FFmpeg probes it
 const STREAM_SCAN_BYTE_LIMIT = 5_000_000;
-const STREAM_SCAN_DURATION_LIMIT = 5 * TIMESCALE;
+const STREAM_SCAN_DURATION_LIMIT = 5 * MPEG_TS_TIMESCALE;
 
 const PACK_SEARCH_CHUNK_SIZE = 64 * 1024;
 // A search by SCR aims this far before the time it looks for
-const SEARCH_MARGIN = TIMESCALE;
+const SEARCH_MARGIN = MPEG_TS_TIMESCALE;
 
 const MPEG_VIDEO_B_PICTURE = 3;
 const MPEG_VIDEO_USER_DATA_START_CODE = 0xb2;
@@ -438,7 +443,7 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 			packet,
 			isBPicture: picture.isBPicture,
 			ownPts,
-			duration: picture.fieldCount * TIMESCALE / (2 * this.videoTiming.frameRate),
+			duration: picture.fieldCount * MPEG_TS_TIMESCALE / (2 * this.videoTiming.frameRate),
 			pts: null,
 			untimed: false,
 		});
@@ -491,7 +496,7 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 				this.displayClock += anchor.duration;
 			} else {
 				// The anchor of the B pictures came before the context's start, so it's shown for a frame
-				this.displayClock += TIMESCALE / this.videoTiming.frameRate;
+				this.displayClock += MPEG_TS_TIMESCALE / this.videoTiming.frameRate;
 			}
 		}
 
@@ -581,7 +586,7 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 		const pts = offset === 0 && pesPacket.pts !== null ? pesPacket.pts : this.nextPts ?? pesPacket.pts;
 		assert(pts !== null);
 
-		const duration = Math.round(packetLength / blockAlign * TIMESCALE / info.sampleRate);
+		const duration = Math.round(packetLength / blockAlign * MPEG_TS_TIMESCALE / info.sampleRate);
 		super.supplyPacket(packetLength, duration, pts);
 		this.displayDurations.set(this.suppliedPacket!, duration);
 		return res.set();
@@ -639,10 +644,7 @@ export class MpegPsDemuxer extends Demuxer {
 	 * looks for lies further back, which each further try doubles.
 	 */
 	seekChunkSize = 256 * 1024;
-	timestampWrapInfo: {
-		reference: number;
-		offset: number;
-	} | null = null;
+	timestampWrapInfo: TimestampWrapInfo | null = null;
 
 	/**
 	 * Per stream, the position from which the file holds none of its PES packets, or none with a PTS, as a search that
@@ -1045,26 +1047,9 @@ export class MpegPsDemuxer extends Demuxer {
 	}
 
 	normalizeTimestamp(timestamp: number) {
-		if (!this.timestampWrapInfo) {
-			// Anchored on the first timestamp of the file, as the MPEG-TS demuxer anchors it
-			const tolerance = 60 * TIMESCALE;
-			this.timestampWrapInfo = {
-				reference: timestamp - tolerance,
-				offset: timestamp >= TIMESTAMP_MODULUS - tolerance
-					? -TIMESTAMP_MODULUS
-					: TIMESTAMP_MODULUS,
-			};
-		}
-
-		const { reference, offset } = this.timestampWrapInfo;
-		if (
-			(offset < 0 && timestamp >= reference)
-			|| (offset > 0 && timestamp < reference)
-		) {
-			return timestamp + offset;
-		}
-
-		return timestamp;
+		// Anchored on the first timestamp of the file, as the MPEG-TS demuxer anchors it
+		this.timestampWrapInfo ??= createTimestampWrapInfo(timestamp);
+		return normalizeWrappedTimestamp(timestamp, this.timestampWrapInfo);
 	}
 }
 
@@ -1122,7 +1107,7 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 	}
 
 	getTimeResolution() {
-		return TIMESCALE;
+		return MPEG_TS_TIMESCALE;
 	}
 
 	isRelativeToUnixEpoch() {
@@ -1169,8 +1154,8 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 		const packet = new EncodedPacket(
 			options.metadataOnly ? PLACEHOLDER_DATA : suppliedPacket.data,
 			packetType,
-			suppliedPacket.pts / TIMESCALE,
-			Math.max(duration / TIMESCALE, 0),
+			suppliedPacket.pts / MPEG_TS_TIMESCALE,
+			Math.max(duration / MPEG_TS_TIMESCALE, 0),
 			suppliedPacket.sequenceNumber,
 			suppliedPacket.data.byteLength,
 		);
@@ -1326,7 +1311,7 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 		keyPacketsOnly: boolean,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
-		const searchPts = roundIfAlmostInteger(timestamp * TIMESCALE);
+		const searchPts = roundIfAlmostInteger(timestamp * MPEG_TS_TIMESCALE);
 		const keyOnly = keyPacketsOnly && !this.allPacketsAreKeyPackets();
 		const stream = this.elementaryStream;
 		const demuxer = stream.demuxer;

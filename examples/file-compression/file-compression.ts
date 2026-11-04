@@ -11,6 +11,7 @@ import {
 } from 'mediabunny';
 import { registerAc3Decoder } from '@mediabunny/ac3';
 import { registerDtsDecoder } from '@mediabunny/dts';
+import { registerTrueHdDecoder } from '@mediabunny/truehd';
 import { registerProresDecoder } from '@mediabunny/prores';
 import { registerMpeg4Decoder, registerMpeg4Encoder } from '@mediabunny/mpeg4';
 
@@ -19,6 +20,7 @@ import SampleFileUrl from '../../docs/assets/big-buck-bunny-trimmed.mp4';
 // Enable codecs that aren't natively supported by WebCodecs.
 registerAc3Decoder();
 registerDtsDecoder();
+registerTrueHdDecoder();
 registerProresDecoder();
 registerMpeg4Decoder();
 registerMpeg4Encoder();

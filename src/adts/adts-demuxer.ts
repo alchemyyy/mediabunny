@@ -210,8 +210,7 @@ class AdtsAudioTrackBacking implements InputAudioTrackBacking {
 	}
 
 	getTimeResolution() {
-		const sampleRate = this.getSampleRate();
-		return sampleRate / SAMPLES_PER_AAC_FRAME;
+		return this.getSampleRate();
 	}
 
 	isRelativeToUnixEpoch() {

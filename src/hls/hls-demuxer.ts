@@ -18,6 +18,7 @@ import {
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags, TrackDisposition } from '../metadata';
 import { TrackType } from '../output';
 import {
+	arrayArgmin,
 	assert,
 	joinPaths,
 	MaybePromise,
@@ -41,7 +42,7 @@ import {
 	TAG_STREAM_INF,
 } from './hls-misc';
 import { HlsSegmentedInput } from './hls-segmented-input';
-import { SegmentedInputTrackDeclaration } from '../segmented-input';
+import { SegmentedInputTrackDeclaration, SegmentRetrievalResult } from '../segmented-input';
 import { PathedSource } from '../source';
 
 type InternalTrack = {
@@ -83,6 +84,7 @@ export class HlsDemuxer extends Demuxer {
 	segmentedInputs: HlsSegmentedInput[] = [];
 	hasMasterPlaylist = true;
 	masterPlaylistVariables: HlsPlaylistVariables | null = null;
+	mediaOffsets = new Map<number, Promise<number>>();
 
 	constructor(input: Input) {
 		super(input);
@@ -586,6 +588,74 @@ export class HlsDemuxer extends Demuxer {
 		assert(this.trackBackings);
 
 		return this.trackBackings;
+	}
+
+	getMediaOffsetForDiscontinuity(discontinuityNumber: number) {
+		let promise = this.mediaOffsets.get(discontinuityNumber);
+		if (promise) {
+			return promise;
+		}
+
+		promise = (async () => {
+			// All playlists share their media's timestamps within a discontinuity, so the reference playlist alone
+			// defines global timestamps. For the reference track, the first packet of any discontinuity lands exactly
+			// on the timestamp of the discontinuity's first segment. This ensures that time starts at 0 (unless
+			// PDT is used) and that discontinuities don't mess with overall timestamp continuity.
+			const referenceSegmentedInput = this.getReferenceSegmentedInput();
+
+			const segmentResult = new ResultValue<SegmentRetrievalResult>();
+			let segmentPromise = referenceSegmentedInput.getFirstSegment(segmentResult);
+			if (segmentResult.pending) await segmentPromise;
+
+			let segment = segmentResult.value.segment;
+			while (segment && segment.discontinuityNumber < discontinuityNumber) {
+				segmentResult.reset();
+				segmentPromise = referenceSegmentedInput.getNextSegment(segmentResult, segment, {});
+				if (segmentResult.pending) await segmentPromise;
+
+				segment = segmentResult.value.segment;
+			}
+
+			if (!segment || segment.discontinuityNumber !== discontinuityNumber) {
+				throw new Error(
+					`The reference playlist contains no segment in discontinuity ${discontinuityNumber}, so the`
+					+ ' discontinuity can\'t be synchronized across tracks. If you think this is a bug, please raise an'
+					+ ' issue and include the playlist.',
+				);
+			}
+
+			const input = referenceSegmentedInput.getInputForSegment(segment);
+			const rawTimestampOffset = await referenceSegmentedInput.getRawTimestampOffset(input) ?? 0;
+
+			const tracks = await input.getTracks();
+			const track = tracks.find(x => x.type === 'video') ?? tracks[0];
+			if (!track) {
+				throw new Error('The reference playlist\'s segment contains no tracks.');
+			}
+
+			return segment.timestamp - (rawTimestampOffset + await track.getFirstTimestamp());
+		})();
+		this.mediaOffsets.set(discontinuityNumber, promise);
+
+		return promise;
+	}
+
+	getReferenceSegmentedInput() {
+		if (!this.hasMasterPlaylist) {
+			return this.segmentedInputs[0]!;
+		}
+
+		assert(this.internalTracks);
+
+		// Prefer the cheapest video track, since video timestamps are straightforward and its segments are
+		// cheap to load
+		const candidates = this.internalTracks.filter(x => !x.hasOnlyKeyPackets);
+		const videoCandidates = candidates.filter(x => x.info.type === 'video');
+		const pool = videoCandidates.length > 0 ? videoCandidates : candidates;
+		const index = arrayArgmin(pool, x => x.peakBitrate ?? Infinity);
+		assert(index !== -1);
+
+		return this.getSegmentedInputForPath(pool[index]!.fullPath);
 	}
 
 	getSegmentedInputForPath(path: string) {
