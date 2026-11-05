@@ -923,8 +923,9 @@ export class UrlSource extends PathedSource {
 			runWorker: this._runWorker.bind(this),
 			onIdleWorkerRemoved: worker => this._abortControllers.delete(worker),
 			prefetchProfile: (start, end, workers) => getNetworkPrefetchRange(start, end, workers, this._readAhead),
-			// A held response must not keep a read that needs a worker waiting
+			// A held response must not keep a read that needs a worker waiting, nor take the connection from it
 			yieldPrefetchingWorkers: true,
+			stopPrefetchingForWaitingReads: true,
 			handleUnhandledError: options.handleUnhandledError,
 		});
 	}
@@ -1159,8 +1160,12 @@ export class UrlSource extends PathedSource {
 
 				if (worker.currentPos >= worker.targetPos) {
 					// The response stays open for a while, since a sequential reader moves the target along as it
-					// reads, and the next read would otherwise need a new request
-					if (await this._orchestrator.waitForWorkerTarget(worker, URL_SOURCE_RESPONSE_HOLD_TIME)) {
+					// reads, and the next read would otherwise need a new request. A worker that was stopped for a read
+					// waiting elsewhere ends it right away, so that read has the connection to itself.
+					if (
+						!worker.releaseAtTarget
+						&& await this._orchestrator.waitForWorkerTarget(worker, URL_SOURCE_RESPONSE_HOLD_TIME)
+					) {
 						continue;
 					}
 
@@ -2209,6 +2214,11 @@ type ReadWorker = {
 	age: number;
 	/** Set while a running worker that reached its target waits for the target to move. */
 	wakeTargetWaiter: (() => void) | null;
+	/**
+	 * Set when the worker was stopped for a read waiting elsewhere: at its target, it ends its response rather than
+	 * holding it. Cleared when a read is given to it again.
+	 */
+	releaseAtTarget: boolean;
 };
 
 /**
@@ -2244,6 +2254,13 @@ class ReadOrchestrator {
 		 * busy. The source's runWorker must then stop a worker once it notices it was aborted.
 		 */
 		yieldPrefetchingWorkers?: boolean;
+		/**
+		 * Gives a read that waits for data the connection to itself when it starts a new worker: every other running
+		 * worker that serves no pending read stops where it is, ending its response instead of holding it, and stays
+		 * idle until a read near it resumes it. The source's runWorker must end a worker's response at its target once
+		 * the worker's releaseAtTarget is set.
+		 */
+		stopPrefetchingForWaitingReads?: boolean;
 		handleUnhandledError?: (error: unknown) => unknown;
 	}) {}
 
@@ -2394,6 +2411,7 @@ class ReadOrchestrator {
 			if (newWorker) {
 				if (pendingSlice) {
 					newWorker.pendingSlices = [pendingSlice];
+					this.stopPrefetchingWorkers(newWorker);
 				}
 
 				this.runWorker(newWorker);
@@ -2482,6 +2500,7 @@ class ReadOrchestrator {
 			worker.currentPos, worker.targetPos,
 		)) {
 			worker.targetPos = Math.max(worker.targetPos, hole.end); // Update the worker's target position
+			worker.releaseAtTarget = false;
 
 			for (let i = 0; i < pendingSlices.length; i++) {
 				const pendingSlice = pendingSlices[i]!;
@@ -2580,6 +2599,7 @@ class ReadOrchestrator {
 			pendingSlices: [],
 			age: this.nextAge++,
 			wakeTargetWaiter: null,
+			releaseAtTarget: false,
 		};
 		this.workers.push(worker);
 
@@ -2617,6 +2637,24 @@ class ReadOrchestrator {
 		worker.wakeTargetWaiter?.();
 
 		return true;
+	}
+
+	/** Stops the other workers for a waiting read that starts the given worker; see stopPrefetchingForWaitingReads. */
+	stopPrefetchingWorkers(readingWorker: ReadWorker) {
+		if (!this.options.stopPrefetchingForWaitingReads) {
+			return;
+		}
+
+		for (const worker of this.workers) {
+			if (worker === readingWorker || !worker.running || worker.pendingSlices.length > 0) {
+				continue;
+			}
+
+			// Like cancelReads, the target is pulled back to what the worker has read, and it ends its response there
+			worker.targetPos = worker.currentPos;
+			worker.releaseAtTarget = true;
+			worker.wakeTargetWaiter?.();
+		}
 	}
 
 	runWorker(worker: ReadWorker) {
@@ -2671,6 +2709,10 @@ class ReadOrchestrator {
 
 					this.queuedReads.splice(oldestIndex, 1);
 					newWorker.pendingSlices = queuedRead.pendingSlices;
+					if (newWorker.pendingSlices.length > 0) {
+						this.stopPrefetchingWorkers(newWorker);
+					}
+
 					this.runWorker(newWorker);
 				}
 			});
