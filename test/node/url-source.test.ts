@@ -456,6 +456,57 @@ test('UrlSource keeps the data being read cached beside pinned data larger than 
 	}
 });
 
+test('UrlSource sends its range requests straight to where a redirect led', async () => {
+	const server = await startRangedServer(path => path === '/redirect.bin' ? { redirectTo: '/resource.bin' } : null);
+
+	try {
+		const source = new UrlSource(`${server.origin}/redirect.bin`, { readAhead: testReadAhead });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, sequentialReadSize);
+		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize / 2 + sequentialReadSize);
+
+		expect(server.requestPaths()).toEqual(['/redirect.bin', '/resource.bin', '/resource.bin']);
+	} finally {
+		server.close();
+	}
+});
+
+test('UrlSource starts over at its URL once the target of a redirect stops answering', async () => {
+	let redirectTarget = '/first.bin';
+	const goneTargets = new Set<string>();
+	const server = await startRangedServer((path) => {
+		if (path === '/redirect.bin') {
+			return { redirectTo: redirectTarget };
+		}
+
+		return goneTargets.has(path) ? { status: 410 } : null;
+	});
+
+	try {
+		const source = new UrlSource(`${server.origin}/redirect.bin`, { readAhead: testReadAhead });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, sequentialReadSize);
+
+		// The target expires, and the URL now redirects elsewhere
+		goneTargets.add('/first.bin');
+		redirectTarget = '/second.bin';
+		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize / 2 + sequentialReadSize);
+		await readSequentially(reader, rangedResourceSize / 4, rangedResourceSize / 4 + sequentialReadSize);
+
+		expect(server.requestPaths()).toEqual([
+			'/redirect.bin', '/first.bin',
+			'/first.bin', '/redirect.bin', '/second.bin',
+			'/second.bin',
+		]);
+	} finally {
+		server.close();
+	}
+});
+
 test('UrlSource validates its read-ahead and cache size', () => {
 	expect(() => new UrlSource('https://example.com/a.mp4', { readAhead: 0 })).toThrow(TypeError);
 
@@ -469,14 +520,31 @@ test('UrlSource validates its read-ahead and cache size', () => {
 
 const rangedResourceByte = (pos: number) => (pos * 7 + 3) & 0xff;
 
-/** Serves a synthetic resource with range support, writing each response with backpressure. */
-const startRangedServer = async () => {
+type RangedServerRoute = { redirectTo: string } | { status: number } | null;
+
+/**
+ * Serves a synthetic resource with range support, writing each response with backpressure. The route can answer a
+ * request path with a redirect or an error status instead.
+ */
+const startRangedServer = async (route: (path: string) => RangedServerRoute = () => null) => {
 	let requestCount = 0;
 	let bytesSent = 0;
 	let abortedResponses = 0;
+	const requestPaths: string[] = [];
 
 	const server = http.createServer((req, res) => {
 		requestCount++;
+		requestPaths.push(req.url ?? '');
+
+		const routed = route(req.url ?? '');
+		if (routed) {
+			res.writeHead('redirectTo' in routed ? 307 : routed.status, 'redirectTo' in routed
+				? { Location: routed.redirectTo }
+				: {});
+			res.end();
+			return;
+		}
+
 		const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
 		const start = range ? Number(range[1]) : 0;
 		const end = range && range[2] ? Number(range[2]) + 1 : rangedResourceSize;
@@ -520,8 +588,12 @@ const startRangedServer = async () => {
 	const address = server.address();
 	if (!address || typeof address === 'string') throw new Error('Unexpected server address');
 
+	const origin = `http://localhost:${address.port}`;
+
 	return {
-		url: `http://localhost:${address.port}/resource.bin`,
+		origin,
+		url: `${origin}/resource.bin`,
+		requestPaths: () => requestPaths,
 		requestCount: () => requestCount,
 		bytesSent: () => bytesSent,
 		abortedResponses: () => abortedResponses,

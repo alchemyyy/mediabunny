@@ -777,7 +777,8 @@ export type UrlSourceOptions = {
 /**
  * A source backed by a URL. This is useful for reading data from the network. Requests will be made using an optimized
  * reading and prefetching pattern to minimize request count and latency. Works best with servers that support HTTP
- * range requests; otherwise, resources must be streamed and read sequentially.
+ * range requests; otherwise, resources must be streamed and read sequentially. Once a request is redirected, later
+ * range requests go straight to the redirect's target, until a request to it fails.
  * @group Input sources
  * @public
  */
@@ -814,6 +815,13 @@ export class UrlSource extends PathedSource {
 	_sequentialAbortController: AbortController | null = null;
 	/** @internal */
 	_readAhead: number;
+	/**
+	 * Where the first redirected response ended up. Range requests go straight there from then on, which spares each
+	 * of them the redirect's round trip; it's cleared when a request to it fails, so the next one starts over at the
+	 * URL we were given.
+	 * @internal
+	 */
+	_redirectedUrl: string | null = null;
 
 	/**
 	 * Creates a new {@link UrlSource} backed by the resource at the specified URL.
@@ -989,6 +997,18 @@ export class UrlSource extends PathedSource {
 		return clamp(baseSize - this._offset, 0, this._length ?? Infinity);
 	}
 
+	/** The URL or request to send range requests to. @internal */
+	_getRequestTarget(): string | URL | Request {
+		if (this._redirectedUrl === null) {
+			return this._url;
+		}
+
+		// A Request keeps its method, headers, and credentials for the redirected URL
+		return this._url instanceof Request
+			? new Request(this._redirectedUrl, this._url)
+			: this._redirectedUrl;
+	}
+
 	/** @internal */
 	_read(
 		start: number,
@@ -1041,28 +1061,51 @@ export class UrlSource extends PathedSource {
 			const abortController = new AbortController();
 			this._abortControllers.set(worker, abortController);
 
-			const response = await retriedFetch(
-				this._options.fetchFn ?? fetch,
-				this._url,
-				mergeRequestInit(this._requestInit, {
-					headers: {
-						// Always sending a range request is a good way to probe if the server supports them
-						Range: `bytes=${worker.currentPos}-`,
-					},
-					signal: abortController.signal,
-				}),
-				this._getRetryDelay,
-				() => abortController.signal.aborted,
-			);
+			const requestTarget = this._getRequestTarget();
+			const requestsRedirectTarget = this._redirectedUrl !== null;
+
+			let response: Response;
+			try {
+				response = await retriedFetch(
+					this._options.fetchFn ?? fetch,
+					requestTarget,
+					mergeRequestInit(this._requestInit, {
+						headers: {
+							// Always sending a range request is a good way to probe if the server supports them
+							Range: `bytes=${worker.currentPos}-`,
+						},
+						signal: abortController.signal,
+					}),
+					this._getRetryDelay,
+					() => abortController.signal.aborted,
+				);
+			} catch (error) {
+				if (!requestsRedirectTarget || abortController.signal.aborted) {
+					throw error;
+				}
+
+				// The redirect's target may no longer answer, such as a signed URL that has expired, so start over at
+				// the URL we were given, which redirects anew
+				this._redirectedUrl = null;
+				continue;
+			}
 
 			if (!response.ok) {
+				if (requestsRedirectTarget) {
+					void response.body?.cancel().catch(() => {});
+					this._redirectedUrl = null;
+					continue;
+				}
+
 				// eslint-disable-next-line @typescript-eslint/no-base-to-string
-				throw new Error(`Error fetching ${String(this._url)}: ${response.status} ${response.statusText}`);
+				throw new Error(`Error fetching ${String(requestTarget)}: ${response.status} ${response.statusText}`);
 			}
 
 			if (response.redirected) {
-				// Modify our own root path so that future subrequests get made relative to the redirected URL
+				// Modify our own root path so that future subrequests get made relative to the redirected URL, and send
+				// later range requests straight there
 				this.rootPath = response.url;
+				this._redirectedUrl = response.url;
 			}
 
 			outer:
@@ -1184,7 +1227,7 @@ export class UrlSource extends PathedSource {
 						throw error;
 					}
 
-					const retryDelayInSeconds = this._getRetryDelay(1, error, this._url);
+					const retryDelayInSeconds = this._getRetryDelay(1, error, requestTarget);
 					if (retryDelayInSeconds !== null) {
 						Logging._error('Error while reading response stream. Attempting to resume.', error);
 						await wait(1000 * retryDelayInSeconds);
@@ -1222,7 +1265,11 @@ export class UrlSource extends PathedSource {
 						// The response didn't get us any further, so back off instead of hammering the server
 						consecutiveEmptyResponses++;
 						const error = new Error('Range response ended without delivering any data.');
-						const retryDelayInSeconds = this._getRetryDelay(consecutiveEmptyResponses, error, this._url);
+						const retryDelayInSeconds = this._getRetryDelay(
+							consecutiveEmptyResponses,
+							error,
+							requestTarget,
+						);
 						if (retryDelayInSeconds === null) {
 							throw error;
 						}
