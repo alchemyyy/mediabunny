@@ -99,6 +99,13 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	): MaybePromise<ReadResult | null>;
 	/** @internal */
 	abstract _dispose(): void;
+	/**
+	 * Keeps the given range cached for the lifetime of this source, if this source caches what it reads and its host
+	 * pins its cache (see {@link UrlSource.pinCache}). A format calls it for an index that it reads only when it's
+	 * first needed, which later readers of the source read again.
+	 * @internal
+	 */
+	_pinRange(_start: number, _end: number): void {}
 	/** @internal */
 	_disposed = false;
 	/** @internal */
@@ -435,6 +442,11 @@ export class CustomPathedSource extends PathedSource {
 				.then(ref => ref.free())
 				.catch(() => {});
 		}
+	}
+
+	/** @internal */
+	override _pinRange(start: number, end: number): void {
+		this._root?.source._pinRange(start, end);
 	}
 }
 
@@ -957,7 +969,8 @@ export class UrlSource extends PathedSource {
 	 * Keeps everything cached so far in the cache for the lifetime of this source, while later data is evicted as
 	 * usual. Pinned data doesn't count toward the max cache size, so it never crowds out the data being read. Useful
 	 * for data that every reader of the source reads again, such as a container's header and index when multiple
-	 * inputs read the same source one after another.
+	 * inputs read the same source one after another. An index that a format reads only once it's needed, such as
+	 * Matroska Cues at the end of the file, is pinned too when it's read later.
 	 */
 	pinCache() {
 		this._orchestrator.pinCache();
@@ -971,6 +984,14 @@ export class UrlSource extends PathedSource {
 	 */
 	cancelReads() {
 		this._orchestrator.cancelReads();
+	}
+
+	/** @internal */
+	override _pinRange(start: number, end: number): void {
+		// Sequential mode keeps no cache to pin
+		if (!this._sequentialBacking) {
+			this._orchestrator.pinRange(this._offset + start, this._offset + end);
+		}
 	}
 
 	/** @internal */
@@ -2226,6 +2247,8 @@ class ReadOrchestrator {
 	cache: CacheEntry[] = [];
 	currentCacheSize = 0;
 	disposed = false;
+	/** Whether the cache was pinned, which makes pinRange pin too. */
+	pinsCache = false;
 	queuedReads: {
 		hole: Hole;
 		strictTarget: boolean;
@@ -2944,8 +2967,27 @@ class ReadOrchestrator {
 
 	/** Pins every cache entry, so that it's never evicted nor counted toward the max cache size. */
 	pinCache() {
+		this.pinsCache = true;
+
 		for (const entry of this.cache) {
 			entry.pinned = true;
+		}
+	}
+
+	/**
+	 * Pins the cache entries that a later read of the given range uses, its prefetch padding included, so that reading
+	 * the range again needs no request; once the cache was pinned (see pinCache).
+	 */
+	pinRange(start: number, end: number) {
+		if (!this.pinsCache) {
+			return;
+		}
+
+		const readRange = this.options.prefetchProfile(start, end, []);
+		for (const entry of this.cache) {
+			if (entry.start < readRange.end && readRange.start < entry.end) {
+				entry.pinned = true;
+			}
 		}
 	}
 
@@ -3108,6 +3150,11 @@ export class RangedSource extends Source {
 	/** @internal */
 	override _dispose(): void {
 		this._ref?.free();
+	}
+
+	/** @internal */
+	override _pinRange(start: number, end: number): void {
+		this._baseSource._pinRange(this._offset + start, this._offset + end);
 	}
 
 	override ref() {

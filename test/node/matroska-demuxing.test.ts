@@ -1,6 +1,7 @@
 import { expect, test } from 'vitest';
+import http from 'node:http';
 import { Input } from '../../src/input.js';
-import { CustomSource } from '../../src/source.js';
+import { CustomSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { PacketCursor } from '../../src/cursors.js';
 import { Output } from '../../src/output.js';
@@ -20,7 +21,7 @@ const DURATION_ID = 0x4489;
 const CLUSTER_ID = 0x1f43b675;
 
 /** Muxes a file with one VP8 and one Opus track, with a cluster per second. */
-const muxFile = async () => {
+const muxFile = async (videoPacketSize = 1024) => {
 	const output = new Output({
 		format: new MkvOutputFormat(),
 		target: new BufferTarget(),
@@ -35,7 +36,7 @@ const muxFile = async () => {
 
 	for (let i = 0; i < PACKET_COUNT; i++) {
 		await videoSource.add(
-			new EncodedPacket(new Uint8Array(1024).fill(i), 'key', i, 1),
+			new EncodedPacket(new Uint8Array(videoPacketSize).fill(i), 'key', i, 1),
 			i === 0 ? { decoderConfig: { codec: 'vp8', codedWidth: 320, codedHeight: 240 } } : undefined,
 		);
 		await audioSource.add(
@@ -146,6 +147,58 @@ const openCounting = (bytes: Uint8Array) => {
 	return { input, stats };
 };
 
+/** Returns the position of the Segment's first child with the given ID. */
+const findSegmentChild = (bytes: Uint8Array, id: number) => {
+	const ebml = readHeader(bytes, 0);
+	const segment = readHeader(bytes, ebml.dataStart + ebml.size);
+
+	let pos = segment.dataStart;
+	while (pos < bytes.byteLength) {
+		const header = readHeader(bytes, pos);
+		if (header.id === id) {
+			return pos;
+		}
+
+		pos = header.dataStart + header.size;
+	}
+
+	throw new Error(`The Segment has no element ${id.toString(16)}`);
+};
+
+/** Serves the bytes over HTTP with range support, recording where each request starts. */
+const serveBytes = async (bytes: Uint8Array) => {
+	const requestStarts: number[] = [];
+
+	const server = http.createServer((req, res) => {
+		const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+		const start = range ? Number(range[1]) : 0;
+		const end = range && range[2] ? Number(range[2]) + 1 : bytes.byteLength;
+		requestStarts.push(start);
+
+		res.on('error', () => {}); // The client may abort the connection at any time
+		res.writeHead(range ? 206 : 200, {
+			'Content-Type': 'video/x-matroska',
+			'Content-Length': end - start,
+			...(range ? { 'Content-Range': `bytes ${start}-${end - 1}/${bytes.byteLength}` } : {}),
+		});
+		res.end(bytes.subarray(start, end));
+	});
+
+	await new Promise<void>(resolve => server.listen(0, resolve));
+
+	const address = server.address();
+	if (!address || typeof address === 'string') throw new Error('Unexpected server address');
+
+	return {
+		url: `http://localhost:${address.port}/file.mkv`,
+		requestStarts: () => requestStarts,
+		close: () => {
+			server.closeAllConnections();
+			server.close();
+		},
+	};
+};
+
 test('Matroska with an unfinalized Segment of size 0 reads its tracks in a bounded number of reads', async () => {
 	const original = await muxFile();
 	const bytes = makeUnfinalized(original);
@@ -241,4 +294,72 @@ test('Matroska clusters after the end of their Segment are attributed to it with
 		videoPacketCount++;
 	}
 	expect(videoPacketCount).toBe(PACKET_COUNT);
+});
+
+test('Matroska reads Cues at the end of the file only once a lookup jumps past the start', async () => {
+	const bytes = await muxFile();
+	const cuesPos = findSegmentChild(bytes, CUES_ID);
+
+	const { input, stats } = openCounting(bytes);
+	using _ = input;
+
+	const videoReader = new PacketReader((await input.getVideoTracks())[0]!);
+	const audioReader = new PacketReader((await input.getAudioTracks())[0]!);
+
+	// Playing from the start reads nothing near the Cues
+	expect((await videoReader.getKeyAt(0))?.timestamp).toBe(0);
+	expect((await audioReader.getFirst())?.timestamp).toBe(0.5);
+	expect(stats.maxEnd).toBeLessThan(cuesPos);
+
+	// A jump reads them, and they take it to its cluster without reading every cluster before it
+	const readsBeforeJump = stats.reads;
+	expect((await videoReader.getKeyAt(150.5))?.timestamp).toBe(150);
+	expect(stats.maxEnd).toBeGreaterThan(cuesPos);
+	expect(stats.reads - readsBeforeJump).toBeLessThan(20);
+
+	// A track without cue points of its own jumps with the richest track's
+	expect((await audioReader.getAt(120.5))?.timestamp).toBe(120.5);
+});
+
+test('Matroska Cues read for a jump stay cached for later inputs over a source whose cache is pinned', async () => {
+	// Large enough that the head of the file and its Cues come in separate requests
+	const bytes = await muxFile(2 ** 16);
+	const cuesPos = findSegmentChild(bytes, CUES_ID);
+	const server = await serveBytes(bytes);
+
+	try {
+		// Like a player that opens an input per seek over one source, and pins what its first input read; the cache
+		// holds far less than the file
+		const source = new UrlSource(server.url, { maxCacheSize: 2 ** 20, readAhead: 2 ** 20 });
+		using ref = source.ref();
+
+		{
+			using input = new Input({ source: ref.source, formats: ALL_FORMATS });
+			const reader = new PacketReader((await input.getVideoTracks())[0]!);
+			ref.source.pinCache();
+
+			// The jump reads the Cues, and reading on from there evicts whatever isn't pinned
+			let packet = await reader.getKeyAt(100);
+			expect(packet?.timestamp).toBe(100);
+			for (let i = 0; i < 50 && packet; i++) {
+				packet = await reader.getNext(packet);
+			}
+		}
+
+		const requestCountBeforeSecondInput = server.requestStarts().length;
+
+		{
+			using input = new Input({ source: ref.source, formats: ALL_FORMATS });
+			const reader = new PacketReader((await input.getVideoTracks())[0]!);
+			expect((await reader.getKeyAt(60))?.timestamp).toBe(60);
+		}
+
+		// Its jump needs only the cluster a third into the file; a request near the end would read the Cues again,
+		// starting a little before them, where reads round their start down to
+		const laterRequestStarts = server.requestStarts().slice(requestCountBeforeSecondInput);
+		expect(laterRequestStarts.length).toBeGreaterThan(0);
+		expect(laterRequestStarts.every(start => start < cuesPos - 2 ** 18)).toBe(true);
+	} finally {
+		server.close();
+	}
 });
