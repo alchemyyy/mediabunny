@@ -117,6 +117,12 @@ type Segment = {
 	tracks: InternalTrack[];
 	idToTrack: Map<number, InternalTrack>;
 	cuePoints: CuePoint[];
+	/**
+	 * Where the Cues are that the seek head points to, when they were left for loadDeferredCues to read once a lookup
+	 * needs them; null when there are none to read later, or once they are read.
+	 */
+	deferredCuesPosition: number | null;
+	deferredCuesPromise: Promise<void> | null;
 
 	dataStartPos: number;
 	elementEndPos: number | null;
@@ -492,6 +498,8 @@ export class MatroskaDemuxer extends Demuxer {
 			tracks: [],
 			idToTrack: new Map(),
 			cuePoints: [],
+			deferredCuesPosition: null,
+			deferredCuesPromise: null,
 
 			dataStartPos: segmentDataStart,
 			elementEndPos: dataSize === undefined
@@ -652,6 +660,13 @@ export class MatroskaDemuxer extends Demuxer {
 				if (this.currentSegment[target.flag]) continue;
 				if (!this.claimSeekTarget(segmentDataStart + seekEntry.segmentPosition)) continue;
 
+				if (target.id === EBMLId.Cues) {
+					// The Cues only serve to jump into the file, and they usually sit at its end, so a lookup that
+					// jumps past the start reads them (loadDeferredCues); reading from the start never goes there
+					this.currentSegment.deferredCuesPosition = segmentDataStart + seekEntry.segmentPosition;
+					continue;
+				}
+
 				let slice = this.reader.requestSliceRange(
 					segmentDataStart + seekEntry.segmentPosition,
 					MIN_HEADER_SIZE,
@@ -694,15 +709,28 @@ export class MatroskaDemuxer extends Demuxer {
 			track.codecDelay = Math.round((this.currentSegment.timestampFactor * track.codecDelayNs) / 1e9);
 		}
 
-		// Assign cue points to their respective tracks
-		for (const cuePoint of this.currentSegment.cuePoints) {
-			const track = this.currentSegment.idToTrack.get(cuePoint.trackId);
+		if (this.currentSegment.deferredCuesPosition === null) {
+			this.assignCuePoints(this.currentSegment);
+		}
+
+		this.currentSegment = null;
+	}
+
+	/** Gives each of the segment's tracks the cue points that index it, sorted by time. */
+	assignCuePoints(segment: Segment) {
+		// New lists, so that a lookup already searching a track's list doesn't see it change
+		for (const track of segment.tracks) {
+			track.cuePoints = [];
+		}
+
+		for (const cuePoint of segment.cuePoints) {
+			const track = segment.idToTrack.get(cuePoint.trackId);
 			if (track) {
 				track.cuePoints.push(cuePoint);
 			}
 		}
 
-		for (const track of this.currentSegment.tracks) {
+		for (const track of segment.tracks) {
 			// Sort cue points by time and remove multiple cue points for the same time
 			const cuePoints = track.cuePoints;
 			cuePoints.sort((a, b) => a.time - b.time);
@@ -718,7 +746,7 @@ export class MatroskaDemuxer extends Demuxer {
 
 		let trackWithMostCuePoints: InternalTrack | null = null;
 		let maxCuePointCount = -Infinity;
-		for (const track of this.currentSegment.tracks) {
+		for (const track of segment.tracks) {
 			if (track.cuePoints.length > maxCuePointCount) {
 				maxCuePointCount = track.cuePoints.length;
 				trackWithMostCuePoints = track;
@@ -728,13 +756,71 @@ export class MatroskaDemuxer extends Demuxer {
 		// For every track that has received 0 cue points (can happen, often only the video track receives cue points),
 		// we still want to have better seeking. Therefore, let's give it the cue points of the track with the most cue
 		// points, which should provide us with the most fine-grained seeking.
-		for (const track of this.currentSegment.tracks) {
+		for (const track of segment.tracks) {
 			if (track.cuePoints.length === 0) {
 				track.cuePoints = trackWithMostCuePoints!.cuePoints;
 			}
 		}
+	}
 
-		this.currentSegment = null;
+	/**
+	 * Reads the Cues that readSegment left for later, once. A synchronous source reads them right away, and nothing is
+	 * returned to wait for; a read that failed is tried again on the next call.
+	 */
+	loadDeferredCues(segment: Segment) {
+		if (segment.deferredCuesPosition === null || segment.deferredCuesPromise) {
+			return segment.deferredCuesPromise;
+		}
+
+		const result = new ResultValue<void>();
+		const promise = this.readDeferredCues(result, segment);
+		if (!result.pending) {
+			return null;
+		}
+
+		return segment.deferredCuesPromise = promise.then(() => {}, (error: unknown) => {
+			segment.deferredCuesPromise = null;
+			throw error;
+		});
+	}
+
+	async readDeferredCues(res: ResultValue<void>, segment: Segment): MaybeRelevantPromise {
+		const position = segment.deferredCuesPosition;
+		assert(position !== null);
+		segment.cuePoints = [];
+
+		let slice = this.reader.requestSliceRange(position, MIN_HEADER_SIZE, MAX_HEADER_SIZE);
+		if (isThenable(slice)) slice = await slice;
+
+		const header = slice && readElementHeader(slice);
+		if (slice && header && header.id === EBMLId.Cues) {
+			const { size } = header;
+			assertDefinedSize(size);
+
+			let dataSlice = this.reader.requestSlice(slice.filePos, size);
+			if (isThenable(dataSlice)) dataSlice = await dataSlice;
+
+			if (dataSlice) {
+				// No awaiting while the segment is set, so concurrent calls can't interfere with each other
+				assert(!this.currentSegment);
+				this.currentSegment = segment;
+
+				try {
+					this.readContiguousElements(dataSlice);
+				} finally {
+					this.currentSegment = null;
+				}
+
+				// Every later input over the same source reads them again
+				this.reader.source._pinRange(position, slice.filePos + size);
+			}
+		}
+
+		segment.cuesSeen = true;
+		segment.deferredCuesPosition = null;
+		this.assignCuePoints(segment);
+
+		return res.set(undefined);
 	}
 
 	async readCluster(res: ResultValue<Cluster>, startPos: number, segment: Segment): MaybeRelevantPromise {
@@ -2630,7 +2716,18 @@ abstract class MatroskaTrackBacking implements InputTrackBacking {
 		// Whether the match must be a key frame, so that position cache entries without one can be skipped
 		requireKeyFrame = false,
 	): MaybeRelevantPromise {
-		const { demuxer, segment, cuePoints, clusterPositionCache } = this.internalTrack;
+		const { demuxer, segment } = this.internalTrack;
+
+		// A lookup for a time after the start jumps into the file with the Cues, read now if they were left for later.
+		// One for the start begins at the first cluster with or without them.
+		if (segment.deferredCuesPosition !== null && searchTimestamp > this.internalTrack.codecDelay) {
+			const loading = demuxer.loadDeferredCues(segment);
+			if (loading) {
+				await loading;
+			}
+		}
+
+		const { cuePoints, clusterPositionCache } = this.internalTrack;
 
 		let startCluster: Cluster | null = null;
 		let bestCluster: Cluster | null = null;
