@@ -82,6 +82,7 @@ import {
 	toDataView,
 	roundIfAlmostInteger,
 	ResultValue,
+	MaybePromise,
 	MaybeRelevantPromise,
 	hexStringToBytes,
 	HEX_STRING_REGEX,
@@ -134,6 +135,13 @@ const DVC1_ADVANCED_PROFILE = 12;
 
 const TRUEHD_CHANNEL_ASSIGNMENT_COUNTS = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1];
 
+/**
+ * The largest track box the movie box's read takes in one piece, its sample tables with it. Leaving the tables of a
+ * smaller one to its first lookup would cost a network source a new request for the boxes after them, which takes
+ * longer than reading through them.
+ */
+const MAX_TRACK_BOX_READ_THROUGH_SIZE = 2 ** 20;
+
 type InternalTrack = {
 	unsupportedFeatures: UnsupportedTrackFeature[];
 	id: number;
@@ -147,8 +155,22 @@ type InternalTrack = {
 	internalCodecId: string | null;
 	name: string | null;
 	languageCode: string;
-	sampleTableByteOffset: number | null; // null when the track's sample table is another file (ominous ik 👀)
+	/**
+	 * Where the track's stbl box begins in the file and how big it is; -1 until the box is found, null when the
+	 * track's sample table is another file (ominous ik 👀)
+	 */
+	sampleTableByteOffset: number | null;
+	sampleTableByteSize: number;
 	sampleTable: SampleTable | null;
+	/** The read of the sample table while it's pending (see getSampleTableForTrack) */
+	sampleTablePromise: Promise<SampleTable> | null;
+	/** The stbl box, when the movie box's read took it in one piece, until the sample table is built from it */
+	sampleTableSlice: FileSlice | null;
+	/**
+	 * A copy of the track's stsd box, header included, kept for hosts that read the sample entry boxes Mediabunny
+	 * doesn't parse. Internal, but read from outside; null until the box is read.
+	 */
+	sampleDescriptionBytes: Uint8Array | null;
 	fragmentLookupTable: FragmentLookupTableEntry[];
 	currentFragmentState: FragmentTrackState | null;
 	/**
@@ -345,7 +367,6 @@ const MAX_BOX_NESTING_DEPTH = 64;
 
 export class IsobmffDemuxer extends Demuxer {
 	reader: Reader;
-	moovSlice: FileSlice | null = null;
 
 	currentTrack: InternalTrack | null = null;
 	tracks: InternalTrack[] = [];
@@ -426,14 +447,26 @@ export class IsobmffDemuxer extends Demuxer {
 					const majorBrand = readAscii(slice, 4);
 					this.isQuickTime = majorBrand === 'qt  ';
 				} else if (boxInfo.name === 'moov') {
-					// Found moov, load it
+					const moovEnd = slice.filePos + boxInfo.contentSize;
 
-					let moovSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
-					if (isThenable(moovSlice)) moovSlice = await moovSlice;
-					if (!moovSlice) break;
+					if (this.reader.source._readsOnlyForward()) {
+						// A source that reads only forward can't read a track's sample tables again at its first
+						// lookup once its cache dropped them, so the movie box is read in one piece, tables and all
+						let moovSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
+						if (isThenable(moovSlice)) moovSlice = await moovSlice;
+						if (!moovSlice) {
+							break;
+						}
 
-					this.moovSlice = moovSlice;
-					this.readContiguousBoxes(this.moovSlice);
+						this.readContiguousBoxes(moovSlice);
+					} else {
+						// Read the movie box, most tracks' sample tables aside
+						if (this.reader.fileSizeNonStrict !== null && moovEnd > this.reader.fileSizeNonStrict) {
+							break;
+						}
+
+						await this.readBoxesWithoutSampleTables(slice.filePos, moovEnd);
+					}
 
 					if (this.movieTimescale === -1) {
 						throw new Error('Invalid moov box: missing mvhd box.');
@@ -562,7 +595,11 @@ export class IsobmffDemuxer extends Demuxer {
 				name: foreignTrack.name,
 				languageCode: foreignTrack.languageCode,
 				sampleTableByteOffset: null,
+				sampleTableByteSize: 0,
 				sampleTable: null,
+				sampleTablePromise: null,
+				sampleTableSlice: null,
+				sampleDescriptionBytes: foreignTrack.sampleDescriptionBytes,
 				fragmentLookupTable: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
@@ -596,11 +633,43 @@ export class IsobmffDemuxer extends Demuxer {
 		}
 	}
 
-	getSampleTableForTrack(internalTrack: InternalTrack) {
+	/**
+	 * Returns the track's sample table, which the movie box's read left for the track's first lookup, reading it once.
+	 * A synchronous source reads it right away, and nothing is returned to wait for; a read that failed is tried again
+	 * on the next call.
+	 */
+	getSampleTableForTrack(internalTrack: InternalTrack): MaybePromise<SampleTable> {
 		if (internalTrack.sampleTable) {
 			return internalTrack.sampleTable;
 		}
+		if (internalTrack.sampleTablePromise) {
+			return internalTrack.sampleTablePromise;
+		}
 
+		if (internalTrack.sampleTableSlice) {
+			return this.readSampleTable(internalTrack, internalTrack.sampleTableSlice);
+		}
+		if (internalTrack.sampleTableByteOffset === null) {
+			// There's no sample table to read, it's in another file (happens with segments)
+			return this.readSampleTable(internalTrack, null);
+		}
+
+		const slice = this.reader.requestSlice(internalTrack.sampleTableByteOffset, internalTrack.sampleTableByteSize);
+		if (!isThenable(slice)) {
+			return this.readSampleTable(internalTrack, slice);
+		}
+
+		return internalTrack.sampleTablePromise = (async () => {
+			try {
+				return this.readSampleTable(internalTrack, await slice);
+			} finally {
+				internalTrack.sampleTablePromise = null;
+			}
+		})();
+	}
+
+	/** Builds the track's sample table from its stbl box; one outside the file, or none, leaves it empty. */
+	readSampleTable(internalTrack: InternalTrack, stblSlice: FileSlice | null) {
 		const sampleTable: SampleTable = {
 			sampleTimingEntries: [],
 			sampleCompositionTimeOffsets: [],
@@ -613,25 +682,25 @@ export class IsobmffDemuxer extends Demuxer {
 			sortedCompositionTimeOffsets: null,
 		};
 		internalTrack.sampleTable = sampleTable;
+		internalTrack.sampleTableSlice = null;
 
-		if (internalTrack.sampleTableByteOffset === null) {
-			// There's no sample table to read, it's in another file (happens with segments)
+		if (!stblSlice) {
 			return sampleTable;
 		}
 
-		assert(this.moovSlice);
-
-		const stblContainerSlice = this.moovSlice.slice(internalTrack.sampleTableByteOffset);
-
+		// No awaiting while the track is set, so concurrent reads of other tracks' tables can't interfere
 		this.currentTrack = internalTrack;
 		try {
-			this.traverseBox(stblContainerSlice);
+			this.traverseBox(stblSlice);
 		} catch (error) {
 			internalTrack.sampleTable = null;
 			throw error;
 		} finally {
 			this.currentTrack = null;
 		}
+
+		// Every later input over the same source reads it again
+		this.reader.source._pinRange(stblSlice.start, stblSlice.end);
 
 		const lastTimingEntry = last(sampleTable.sampleTimingEntries);
 		const lastChunkEntryIndex = binarySearchLessOrEqual(
@@ -932,6 +1001,181 @@ export class IsobmffDemuxer extends Demuxer {
 		return res.set(fragment);
 	}
 
+	/**
+	 * Reads the boxes in the given range as readContiguousBoxes does, but leaves the sample tables of most tracks for
+	 * their first lookup (see getSampleTableForTrack). A movie box with a track for every language holds mostly tables
+	 * of tracks that are never played, and one at the end of the file has to be read before anything can be. The
+	 * tables of the first video and the first audio track, which a player most often plays, are read with the rest,
+	 * as are those of a small track box, which is read in one piece: skipping them would cost a network source a new
+	 * request for the boxes after them.
+	 */
+	async readBoxesWithoutSampleTables(start: number, end: number) {
+		if (this.boxNestingDepth === MAX_BOX_NESTING_DEPTH) {
+			throw new Error('Invalid file: boxes are nested too deeply.');
+		}
+
+		this.boxNestingDepth++;
+
+		try {
+			let pos = start;
+			while (pos <= end - MIN_BOX_HEADER_SIZE) {
+				let boxInfo = this.readBoxHeaderAt(pos, end);
+				if (isThenable(boxInfo)) boxInfo = await boxInfo;
+				if (!boxInfo) {
+					break;
+				}
+
+				const contentStart = pos + boxInfo.headerSize;
+				const boxEnd = pos + boxInfo.totalSize;
+				const isContained = boxEnd <= end;
+				const track = this.currentTrack;
+				const trackType = track?.info?.type;
+
+				if (isContained && boxInfo.name === 'trak' && boxInfo.totalSize > MAX_TRACK_BOX_READ_THROUGH_SIZE) {
+					if (!this.currentFragment && !track) {
+						const newTrack = this.createTrack();
+						this.currentTrack = newTrack;
+
+						await this.readBoxesWithoutSampleTables(contentStart, boxEnd);
+
+						this.registerTrack(newTrack);
+						this.currentTrack = null;
+					}
+				} else if (isContained && (boxInfo.name === 'mdia' || boxInfo.name === 'minf')) {
+					await this.readBoxesWithoutSampleTables(contentStart, boxEnd);
+				} else if (
+					isContained
+					&& boxInfo.name === 'stbl'
+					&& track
+					&& !(
+						(trackType === 'video' || trackType === 'audio')
+						&& !this.tracks.some(otherTrack => otherTrack.info?.type === trackType)
+					)
+				) {
+					track.sampleTableByteOffset = pos;
+					track.sampleTableByteSize = boxInfo.totalSize;
+
+					await this.readSampleDescriptionBox(contentStart, boxEnd);
+				} else if (!await this.traverseBoxAt(pos, Math.min(boxEnd, end))) {
+					break;
+				}
+
+				pos = boxEnd;
+			}
+		} finally {
+			this.boxNestingDepth--;
+		}
+	}
+
+	/**
+	 * Reads the stsd box of a stbl box, which describes the track's samples; the other boxes, the sample tables, are
+	 * read with the stbl box at the track's first lookup.
+	 */
+	async readSampleDescriptionBox(start: number, end: number) {
+		let pos = start;
+		while (pos <= end - MIN_BOX_HEADER_SIZE) {
+			let boxInfo = this.readBoxHeaderAt(pos, end);
+			if (isThenable(boxInfo)) boxInfo = await boxInfo;
+			if (!boxInfo) {
+				break;
+			}
+
+			const boxEnd = pos + boxInfo.totalSize;
+			if (boxInfo.name === 'stsd') {
+				// What comes after it is left unread, as even just reading the headers of the tables may take a
+				// request each
+				await this.traverseBoxAt(pos, Math.min(boxEnd, end));
+				break;
+			}
+
+			pos = boxEnd;
+		}
+	}
+
+	/** Reads the header of the box at the given position, within its parent's end. */
+	readBoxHeaderAt(pos: number, end: number) {
+		const slice = this.reader.requestSliceRange(pos, MIN_BOX_HEADER_SIZE, Math.min(MAX_BOX_HEADER_SIZE, end - pos));
+		if (isThenable(slice)) {
+			return slice.then(slice => slice && readBoxHeader(slice));
+		}
+
+		return slice && readBoxHeader(slice);
+	}
+
+	/**
+	 * Reads the box in the given range in one piece and traverses it; returns false when the range lies outside the
+	 * file. A box that sticks out of its parent is passed up to the parent's end, as readContiguousBoxes reads it.
+	 */
+	async traverseBoxAt(start: number, end: number) {
+		let slice = this.reader.requestSlice(start, end - start);
+		if (isThenable(slice)) slice = await slice;
+		if (!slice) {
+			return false;
+		}
+
+		this.traverseBox(slice);
+		return true;
+	}
+
+	createTrack() {
+		return {
+			id: -1,
+			demuxer: this,
+			trackBacking: null,
+			disposition: {
+				...DEFAULT_TRACK_DISPOSITION,
+				primary: false,
+			},
+			info: null,
+			timescale: -1,
+			durationInMovieTimescale: -1,
+			durationInMediaTimescale: -1,
+			matrix: IDENTITY_MATRIX,
+			unsupportedFeatures: [],
+			internalCodecId: null,
+			name: null,
+			languageCode: UNDETERMINED_LANGUAGE,
+			sampleTableByteOffset: -1,
+			sampleTableByteSize: 0,
+			sampleTable: null,
+			sampleTablePromise: null,
+			sampleTableSlice: null,
+			sampleDescriptionBytes: null,
+			fragmentLookupTable: [],
+			currentFragmentState: null,
+			fragmentPositionCache: [],
+			editListPreviousSegmentDurations: 0,
+			editListOffset: 0,
+			encryptionInfo: null,
+			encryptionAuxInfo: null,
+			frmaCodecString: null,
+			maxBitrate: null,
+			avgBitrate: null,
+		} satisfies InternalTrack as InternalTrack;
+	}
+
+	/** Adds a track whose trak box was read, if it's a video or audio track with all it takes to read it. */
+	registerTrack(track: InternalTrack) {
+		if (
+			track.id !== -1
+			&& track.timescale !== -1
+			&& track.info !== null
+			&& track.sampleTableByteOffset !== -1
+		) {
+			if (track.info.type === 'video' && track.info.width !== -1) {
+				const videoTrack = track as InternalVideoTrack;
+				track.trackBacking = new IsobmffVideoTrackBacking(videoTrack);
+				this.tracks.push(track);
+				this.idToTrack.set(track.id, track);
+			} else if (track.info.type === 'audio' && track.info.numberOfChannels !== -1) {
+				const audioTrack = track as InternalAudioTrack;
+				track.trackBacking = new IsobmffAudioTrackBacking(audioTrack);
+				this.tracks.push(track);
+				this.idToTrack.set(track.id, track);
+			}
+		}
+	}
+
 	readContiguousBoxes(slice: FileSlice) {
 		if (this.boxNestingDepth === MAX_BOX_NESTING_DEPTH) {
 			throw new Error('Invalid file: boxes are nested too deeply.');
@@ -1026,59 +1270,12 @@ export class IsobmffDemuxer extends Demuxer {
 					break; // Misplaced
 				}
 
-				const track = {
-					id: -1,
-					demuxer: this,
-					trackBacking: null,
-					disposition: {
-						...DEFAULT_TRACK_DISPOSITION,
-						primary: false,
-					},
-					info: null,
-					timescale: -1,
-					durationInMovieTimescale: -1,
-					durationInMediaTimescale: -1,
-					matrix: IDENTITY_MATRIX,
-					unsupportedFeatures: [],
-					internalCodecId: null,
-					name: null,
-					languageCode: UNDETERMINED_LANGUAGE,
-					sampleTableByteOffset: -1,
-					sampleTable: null,
-					fragmentLookupTable: [],
-					currentFragmentState: null,
-					fragmentPositionCache: [],
-					editListPreviousSegmentDurations: 0,
-					editListOffset: 0,
-					encryptionInfo: null,
-					encryptionAuxInfo: null,
-					frmaCodecString: null,
-					maxBitrate: null,
-					avgBitrate: null,
-				} satisfies InternalTrack as InternalTrack;
+				const track = this.createTrack();
 				this.currentTrack = track;
 
 				this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 
-				if (
-					track.id !== -1
-					&& track.timescale !== -1
-					&& track.info !== null
-					&& track.sampleTableByteOffset !== -1
-				) {
-					if (track.info.type === 'video' && track.info.width !== -1) {
-						const videoTrack = track as InternalVideoTrack;
-						track.trackBacking = new IsobmffVideoTrackBacking(videoTrack);
-						this.tracks.push(track);
-						this.idToTrack.set(track.id, track);
-					} else if (track.info.type === 'audio' && track.info.numberOfChannels !== -1) {
-						const audioTrack = track as InternalAudioTrack;
-						track.trackBacking = new IsobmffAudioTrackBacking(audioTrack);
-						this.tracks.push(track);
-						this.idToTrack.set(track.id, track);
-					}
-				}
-
+				this.registerTrack(track);
 				this.currentTrack = null;
 			}; break;
 
@@ -1253,7 +1450,12 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				track.sampleTableByteOffset = startPos;
+				if (!track.sampleTable) {
+					// The metadata pass; the sample tables are built from the box at the track's first lookup
+					track.sampleTableByteOffset = startPos;
+					track.sampleTableByteSize = boxInfo.totalSize;
+					track.sampleTableSlice = slice.slice(startPos, boxInfo.totalSize);
+				}
 
 				this.readContiguousBoxes(slice.slice(contentStartPos, boxInfo.contentSize));
 			}; break;
@@ -1267,6 +1469,11 @@ export class IsobmffDemuxer extends Demuxer {
 				if (track.info === null || track.sampleTable) {
 					break;
 				}
+
+				// A copy, which keeps none of the bytes around it alive
+				const sampleDescriptionSize = Math.min(boxEndPos, slice.end) - startPos;
+				const sampleDescriptionSlice = slice.slice(startPos, sampleDescriptionSize);
+				track.sampleDescriptionBytes = readBytes(sampleDescriptionSlice, sampleDescriptionSize).slice();
 
 				const stsdVersion = readU8(slice);
 				slice.skip(3); // Flags
@@ -3279,7 +3486,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 	): MaybeRelevantPromise {
 		const timestampInTimescale = this.mapTimestampIntoTimescale(timestamp);
 
-		const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		let sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		if (isThenable(sampleTable)) sampleTable = await sampleTable;
 		if (!sampleTableIsEmpty(sampleTable) || !this.internalTrack.demuxer.isFragmented) {
 			// Prefer the non-fragmented packet
 			const sampleIndex = getSampleIndexForTimestamp(sampleTable, timestampInTimescale);
@@ -3371,7 +3579,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 	): MaybeRelevantPromise {
 		const timestampInTimescale = this.mapTimestampIntoTimescale(timestamp);
 
-		const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		let sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		if (isThenable(sampleTable)) sampleTable = await sampleTable;
 		if (!sampleTableIsEmpty(sampleTable) || !this.internalTrack.demuxer.isFragmented) {
 			// Prefer the non-fragmented packet
 			const sampleIndex = getKeyframeSampleIndexForTimestamp(sampleTable, timestampInTimescale);
@@ -3414,7 +3623,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			const sampleIndex = packet.sequenceNumber; // sequenceNumber = sampleIndex in this case
 			assert(sampleIndex >= 0);
 
-			const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+			let sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+			if (isThenable(sampleTable)) sampleTable = await sampleTable;
 			const nextKeyFrameSampleIndex = getNextKeyframeIndexForSample(sampleTable, sampleIndex);
 			return this.fetchPacketForSampleIndex(res, nextKeyFrameSampleIndex, options);
 		}
@@ -3473,7 +3683,8 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			return res.set(new PacketRetrievalResult(null));
 		}
 
-		const sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		let sampleTable = this.internalTrack.demuxer.getSampleTableForTrack(this.internalTrack);
+		if (isThenable(sampleTable)) sampleTable = await sampleTable;
 		const sampleInfo = getSampleInfo(sampleTable, sampleIndex);
 		if (!sampleInfo) {
 			return res.set(new PacketRetrievalResult(null));

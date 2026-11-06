@@ -106,6 +106,15 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 * @internal
 	 */
 	_pinRange(_start: number, _end: number): void {}
+	/**
+	 * Whether this source reads only forward, so that it can't read again what its cache dropped. A format reads an
+	 * index that it would otherwise read when it's first needed right away from such a source.
+	 * @internal
+	 */
+	_readsOnlyForward(): boolean {
+		return false;
+	}
+
 	/** @internal */
 	_disposed = false;
 	/** @internal */
@@ -447,6 +456,11 @@ export class CustomPathedSource extends PathedSource {
 	/** @internal */
 	override _pinRange(start: number, end: number): void {
 		this._root?.source._pinRange(start, end);
+	}
+
+	/** @internal */
+	override _readsOnlyForward(): boolean {
+		return this._root?.source._readsOnlyForward() ?? false;
 	}
 }
 
@@ -979,7 +993,8 @@ export class UrlSource extends PathedSource {
 	 * usual. Pinned data doesn't count toward the max cache size, so it never crowds out the data being read. Useful
 	 * for data that every reader of the source reads again, such as a container's header and index when multiple
 	 * inputs read the same source one after another. An index that a format reads only once it's needed, such as
-	 * Matroska Cues at the end of the file, is pinned too when it's read later.
+	 * Matroska Cues at the end of the file or the sample tables of an MP4 track that's read after the first ones, is
+	 * pinned too when it's read later.
 	 */
 	pinCache() {
 		this._orchestrator.pinCache();
@@ -1001,6 +1016,12 @@ export class UrlSource extends PathedSource {
 		if (!this._sequentialBacking) {
 			this._orchestrator.pinRange(this._offset + start, this._offset + end);
 		}
+	}
+
+	/** @internal */
+	override _readsOnlyForward(): boolean {
+		// Sequential mode, for a server that ignores range requests, reads on through one response
+		return this._sequentialBacking !== null;
 	}
 
 	/** @internal */
@@ -1991,6 +2012,11 @@ export class ReadableStreamSource extends Source {
 	}
 
 	/** @internal */
+	override _readsOnlyForward(): boolean {
+		return true;
+	}
+
+	/** @internal */
 	_read(start: number, end: number): MaybePromise<ReadResult | null> {
 		if (this._endIndex !== null && end > this._endIndex) {
 			return null;
@@ -2595,9 +2621,20 @@ class ReadOrchestrator {
 
 	/**
 	 * Waits for a running worker that reached its target to have its target moved further, which resolves with true,
-	 * or for the timeout to pass or the worker to be aborted, which resolve with false.
+	 * or for the timeout to pass or the worker to be aborted, which resolve with false. A worker whose orchestrator
+	 * yields prefetching workers doesn't wait while a read is queued for a worker: it takes the read if it lies just
+	 * ahead, and otherwise resolves with false at once, ending so that the read gets a worker.
 	 */
 	waitForWorkerTarget(worker: ReadWorker, timeout: number) {
+		// Its share of its pending slices is done, other workers fill the rest of them (see
+		// signalWorkerStoppedRunning), so a read that needs a worker may take its place while it waits
+		worker.pendingSlices.length = 0;
+
+		if (this.options.yieldPrefetchingWorkers && this.queuedReads.length > 0) {
+			this.checkQueuedReadsAgainstWorker(worker);
+			return Promise.resolve(!worker.aborted && worker.currentPos < worker.targetPos);
+		}
+
 		return new Promise<boolean>((resolve) => {
 			const finish = () => {
 				clearTimeout(timer);
@@ -3244,6 +3281,11 @@ export class RangedSource extends Source {
 	/** @internal */
 	override _pinRange(start: number, end: number): void {
 		this._baseSource._pinRange(this._offset + start, this._offset + end);
+	}
+
+	/** @internal */
+	override _readsOnlyForward(): boolean {
+		return this._baseSource._readsOnlyForward();
 	}
 
 	override ref() {
