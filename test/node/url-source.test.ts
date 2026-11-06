@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -370,6 +370,9 @@ test('UrlSource.cancelReads rejects waiting reads and stops prefetching, while r
 		const reader = new Reader(ref.source);
 
 		await readSequentially(reader, 0, testReadAhead);
+		// Let the response reach its target and wait there; a real delay, since its progress over the real connection
+		// has no signal to await
+		await new Promise(resolve => setTimeout(resolve, 500));
 		const requestsBeforeFarRead = server.requestCount();
 
 		const farRead = reader.requestSlice(rangedResourceSize / 2, sequentialReadSize);
@@ -377,9 +380,10 @@ test('UrlSource.cancelReads rejects waiting reads and stops prefetching, while r
 		source.cancelReads();
 		await expect(farRead).rejects.toBeInstanceOf(ReadCanceledError);
 
-		// Reading on where reading stopped continues on the response that was open, without a new request
+		// Reading on where reading stopped continues, on one new request: the far read had ended the response
+		// that waited there, to have the connection to itself
 		await readSequentially(reader, testReadAhead, 2 * testReadAhead);
-		expect(server.requestCount()).toBe(requestsBeforeFarRead + 1);
+		await vi.waitFor(() => expect(server.requestCount()).toBe(requestsBeforeFarRead + 2));
 
 		// A read elsewhere afterwards works as usual
 		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize / 2 + testReadAhead);
@@ -405,6 +409,28 @@ test('UrlSource lets a held response give way to a read that needs its request',
 
 		expect(performance.now() - farReadStart).toBeLessThan(responseHoldTime / 2);
 		expect(server.requestCount()).toBe(2);
+	} finally {
+		server.close();
+	}
+});
+
+test('UrlSource ends a prefetching response once a read waiting elsewhere needs a request of its own', async () => {
+	const server = await startRangedServer();
+
+	try {
+		const source = new UrlSource(server.url, { readAhead: testReadAhead });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		await readSequentially(reader, 0, sequentialReadSize);
+		await readSequentially(reader, rangedResourceSize / 2, rangedResourceSize / 2 + sequentialReadSize);
+
+		// The response at the start ends long before its hold would have ended it, rather than keep taking data
+		await vi.waitFor(() => expect(server.abortedResponses()).toBe(1), { timeout: responseHoldTime / 4 });
+
+		// Reading on at the start resumes it with a new request
+		await readSequentially(reader, sequentialReadSize, 2 * testReadAhead);
+		expect(server.requestCount()).toBe(3);
 	} finally {
 		server.close();
 	}
