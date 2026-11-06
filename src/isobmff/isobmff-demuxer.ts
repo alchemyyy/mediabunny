@@ -166,6 +166,11 @@ type InternalTrack = {
 	sampleTablePromise: Promise<SampleTable> | null;
 	/** The stbl box, when the movie box's read took it in one piece, until the sample table is built from it */
 	sampleTableSlice: FileSlice | null;
+	/**
+	 * A copy of the track's stsd box, header included, kept for hosts that read the sample entry boxes Mediabunny
+	 * doesn't parse. Internal, but read from outside; null until the box is read.
+	 */
+	sampleDescriptionBytes: Uint8Array | null;
 	fragmentLookupTable: FragmentLookupTableEntry[];
 	currentFragmentState: FragmentTrackState | null;
 	/**
@@ -594,6 +599,7 @@ export class IsobmffDemuxer extends Demuxer {
 				sampleTable: null,
 				sampleTablePromise: null,
 				sampleTableSlice: null,
+				sampleDescriptionBytes: foreignTrack.sampleDescriptionBytes,
 				fragmentLookupTable: [],
 				currentFragmentState: null,
 				fragmentPositionCache: [],
@@ -1134,6 +1140,7 @@ export class IsobmffDemuxer extends Demuxer {
 			sampleTable: null,
 			sampleTablePromise: null,
 			sampleTableSlice: null,
+			sampleDescriptionBytes: null,
 			fragmentLookupTable: [],
 			currentFragmentState: null,
 			fragmentPositionCache: [],
@@ -1462,6 +1469,11 @@ export class IsobmffDemuxer extends Demuxer {
 				if (track.info === null || track.sampleTable) {
 					break;
 				}
+
+				// A copy, which keeps none of the bytes around it alive
+				const sampleDescriptionSize = Math.min(boxEndPos, slice.end) - startPos;
+				const sampleDescriptionSlice = slice.slice(startPos, sampleDescriptionSize);
+				track.sampleDescriptionBytes = readBytes(sampleDescriptionSlice, sampleDescriptionSize).slice();
 
 				const stsdVersion = readU8(slice);
 				slice.skip(3); // Flags

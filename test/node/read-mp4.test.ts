@@ -409,17 +409,21 @@ const findBox = (bytes: Uint8Array, parent: BoxRange, name: string) => {
 	return box;
 };
 
-/** Returns the file's movie box, and where each track's sample tables lie: in its stbl box, after its stsd box. */
+/**
+ * Returns the file's movie box, each track's stsd box, and where each track's sample tables lie: in its stbl box,
+ * after its stsd box.
+ */
 const findSampleTables = (bytes: Uint8Array) => {
 	const moov = findBox(bytes, { name: '', start: 0, contentStart: 0, end: bytes.length }, 'moov');
-	const sampleTables = listBoxes(bytes, moov.contentStart, moov.end)
+	const sampleTableBoxes = listBoxes(bytes, moov.contentStart, moov.end)
 		.filter(box => box.name === 'trak')
-		.map((trak) => {
-			const stbl = findBox(bytes, findBox(bytes, findBox(bytes, trak, 'mdia'), 'minf'), 'stbl');
-			return { start: findBox(bytes, stbl, 'stsd').end, end: stbl.end };
-		});
+		.map(trak => findBox(bytes, findBox(bytes, findBox(bytes, trak, 'mdia'), 'minf'), 'stbl'));
+	const sampleDescriptions = sampleTableBoxes.map(stbl => findBox(bytes, stbl, 'stsd'));
+	const sampleTables = sampleTableBoxes.map(
+		(stbl, index) => ({ start: sampleDescriptions[index]!.end, end: stbl.end }),
+	);
 
-	return { moov, sampleTables };
+	return { moov, sampleDescriptions, sampleTables };
 };
 
 /** Opens the bytes through a synchronous or asynchronous source that records the ranges it reads. */
@@ -464,7 +468,7 @@ test.each([
 			{ handler: 'soun', sampleCount: LARGE_TRACK_SAMPLE_COUNT },
 			{ handler: 'soun', sampleCount: 1000 },
 		], { brand, moovLast });
-		const { sampleTables } = findSampleTables(bytes);
+		const { sampleDescriptions, sampleTables } = findSampleTables(bytes);
 		const { input, readsInto } = openRecordingReads(bytes, asynchronous);
 		using _ = input;
 
@@ -473,6 +477,12 @@ test.each([
 		assert(videoTrack);
 		const audioTracks = await input.getAudioTracks();
 		expect(audioTracks).toHaveLength(3);
+
+		// Every track keeps a copy of its stsd box for hosts, whether its sample tables were left for later or not
+		type BackedTrack = { _backing: { internalTrack: { sampleDescriptionBytes: Uint8Array | null } } };
+		expect([videoTrack, ...audioTracks].map(
+			track => (track as unknown as BackedTrack)._backing.internalTrack.sampleDescriptionBytes,
+		)).toEqual(sampleDescriptions.map(box => bytes.slice(box.start, box.end)));
 
 		// The edit list starts the video two samples into its media
 		const videoReader = new PacketReader(videoTrack);
