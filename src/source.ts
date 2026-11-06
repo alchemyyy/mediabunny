@@ -106,6 +106,15 @@ export abstract class Source extends EventEmitter<SourceEvents> {
 	 * @internal
 	 */
 	_pinRange(_start: number, _end: number): void {}
+	/**
+	 * Whether this source reads only forward, so that it can't read again what its cache dropped. A format reads an
+	 * index that it would otherwise read when it's first needed right away from such a source.
+	 * @internal
+	 */
+	_readsOnlyForward(): boolean {
+		return false;
+	}
+
 	/** @internal */
 	_disposed = false;
 	/** @internal */
@@ -447,6 +456,11 @@ export class CustomPathedSource extends PathedSource {
 	/** @internal */
 	override _pinRange(start: number, end: number): void {
 		this._root?.source._pinRange(start, end);
+	}
+
+	/** @internal */
+	override _readsOnlyForward(): boolean {
+		return this._root?.source._readsOnlyForward() ?? false;
 	}
 }
 
@@ -1002,6 +1016,12 @@ export class UrlSource extends PathedSource {
 		if (!this._sequentialBacking) {
 			this._orchestrator.pinRange(this._offset + start, this._offset + end);
 		}
+	}
+
+	/** @internal */
+	override _readsOnlyForward(): boolean {
+		// Sequential mode, for a server that ignores range requests, reads on through one response
+		return this._sequentialBacking !== null;
 	}
 
 	/** @internal */
@@ -1989,6 +2009,11 @@ export class ReadableStreamSource extends Source {
 	/** @internal */
 	_getFileSize(): number | null {
 		return this._endIndex; // Starts out as null, meaning this source is unsized
+	}
+
+	/** @internal */
+	override _readsOnlyForward(): boolean {
+		return true;
 	}
 
 	/** @internal */
@@ -3256,6 +3281,11 @@ export class RangedSource extends Source {
 	/** @internal */
 	override _pinRange(start: number, end: number): void {
 		this._baseSource._pinRange(this._offset + start, this._offset + end);
+	}
+
+	/** @internal */
+	override _readsOnlyForward(): boolean {
+		return this._baseSource._readsOnlyForward();
 	}
 
 	override ref() {

@@ -19,6 +19,7 @@ import {
 	PacketCursor,
 	PacketReader,
 	QTFF,
+	ReadableStreamSource,
 	UrlSource,
 } from '../../src/index.js';
 import { assert, toUint8Array } from '../../src/misc.js';
@@ -547,12 +548,15 @@ test.each([false, true])('ISOBMFF reads a fragmented file\'s tracks (asynchronou
 	expect(videoPacketCount).toBe(100);
 });
 
-/** Serves the bytes over HTTP with range support, recording where each request starts. */
-const serveBytes = async (bytes: Uint8Array) => {
+/**
+ * Serves the bytes over HTTP, recording where each request starts; with range support, or answering every request
+ * with the whole file like a server that ignores ranges.
+ */
+const serveBytes = async (bytes: Uint8Array, options: { ignoreRanges?: boolean } = {}) => {
 	const requestStarts: number[] = [];
 
 	const server = http.createServer((req, res) => {
-		const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+		const range = options.ignoreRanges ? null : /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
 		const start = range ? Number(range[1]) : 0;
 		const end = range && range[2] ? Number(range[2]) + 1 : bytes.byteLength;
 		requestStarts.push(start);
@@ -635,3 +639,46 @@ test('ISOBMFF sample tables read at a later lookup stay cached for later inputs 
 		server.close();
 	}
 });
+
+test.each(['ReadableStreamSource', 'UrlSource of a server that ignores ranges'])(
+	'ISOBMFF reads every sample table with the movie box from a source that reads only forward (%s)',
+	async (sourceKind) => {
+		const bytes = craftMovie([
+			{ handler: 'vide', sampleCount: LARGE_TRACK_SAMPLE_COUNT },
+			{ handler: 'soun', sampleCount: LARGE_TRACK_SAMPLE_COUNT },
+			{ handler: 'soun', sampleCount: LARGE_TRACK_SAMPLE_COUNT },
+		], { brand: 'isom', moovLast: false });
+		const server = sourceKind === 'ReadableStreamSource' ? null : await serveBytes(bytes, { ignoreRanges: true });
+
+		try {
+			// The cache holds less than the movie box, which the reads below leave far behind
+			let streamPos = 0;
+			const source = server
+				? new UrlSource(server.url, { maxCacheSize: 2 ** 20 })
+				: new ReadableStreamSource(new ReadableStream({
+					pull: (controller) => {
+						if (streamPos >= bytes.length) {
+							controller.close();
+							return;
+						}
+
+						controller.enqueue(bytes.slice(streamPos, streamPos += 2 ** 16));
+					},
+				}), { maxCacheSize: 2 ** 20 });
+			using input = new Input({ source, formats: ALL_FORMATS });
+
+			const videoReader = new PacketReader((await input.getVideoTracks())[0]!);
+			const audioTracks = await input.getAudioTracks();
+
+			// Each read lies after the one before it
+			expect(getSampleValue(await videoReader.getFirst())).toBe(0);
+			expect(getSampleValue(await videoReader.getKeyAt(11_000))).toBe(275_000);
+			expect(getSampleValue(await new PacketReader(audioTracks[0]!).getAt(5900))).toBe((1 << 24) | 295_000);
+
+			// The later audio track is first looked up long after the movie box left the cache
+			expect(getSampleValue(await new PacketReader(audioTracks[1]!).getAt(3000))).toBe((2 << 24) | 150_000);
+		} finally {
+			server?.close();
+		}
+	},
+);

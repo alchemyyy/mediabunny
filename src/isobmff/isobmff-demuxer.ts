@@ -141,11 +141,6 @@ const TRUEHD_CHANNEL_ASSIGNMENT_COUNTS = [2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1]
  * longer than reading through them.
  */
 const MAX_TRACK_BOX_READ_THROUGH_SIZE = 2 ** 20;
-/**
- * The boxes of a sample table box that the movie box's read takes; the others, the sample tables proper, wait for
- * the track's first lookup (see getSampleTableForTrack).
- */
-const SAMPLE_TABLE_METADATA_BOX_NAMES = ['stsd', 'saiz', 'saio'];
 
 type InternalTrack = {
 	unsupportedFeatures: UnsupportedTrackFeature[];
@@ -447,13 +442,26 @@ export class IsobmffDemuxer extends Demuxer {
 					const majorBrand = readAscii(slice, 4);
 					this.isQuickTime = majorBrand === 'qt  ';
 				} else if (boxInfo.name === 'moov') {
-					// Found moov, read it, its tracks' sample tables aside
 					const moovEnd = slice.filePos + boxInfo.contentSize;
-					if (this.reader.fileSizeNonStrict !== null && moovEnd > this.reader.fileSizeNonStrict) {
-						break;
-					}
 
-					await this.readBoxesWithoutSampleTables(slice.filePos, moovEnd);
+					if (this.reader.source._readsOnlyForward()) {
+						// A source that reads only forward can't read a track's sample tables again at its first
+						// lookup once its cache dropped them, so the movie box is read in one piece, tables and all
+						let moovSlice = this.reader.requestSlice(slice.filePos, boxInfo.contentSize);
+						if (isThenable(moovSlice)) moovSlice = await moovSlice;
+						if (!moovSlice) {
+							break;
+						}
+
+						this.readContiguousBoxes(moovSlice);
+					} else {
+						// Read the movie box, most tracks' sample tables aside
+						if (this.reader.fileSizeNonStrict !== null && moovEnd > this.reader.fileSizeNonStrict) {
+							break;
+						}
+
+						await this.readBoxesWithoutSampleTables(slice.filePos, moovEnd);
+					}
 
 					if (this.movieTimescale === -1) {
 						throw new Error('Invalid moov box: missing mvhd box.');
@@ -1041,7 +1049,7 @@ export class IsobmffDemuxer extends Demuxer {
 					track.sampleTableByteOffset = pos;
 					track.sampleTableByteSize = boxInfo.totalSize;
 
-					await this.readSampleDescriptionBoxes(contentStart, boxEnd);
+					await this.readSampleDescriptionBox(contentStart, boxEnd);
 				} else if (!await this.traverseBoxAt(pos, Math.min(boxEnd, end))) {
 					break;
 				}
@@ -1054,13 +1062,10 @@ export class IsobmffDemuxer extends Demuxer {
 	}
 
 	/**
-	 * Reads the boxes of a stbl box that describe the track's samples rather than list them: its stsd box, and the saiz
-	 * and saio boxes of an encrypted track.
+	 * Reads the stsd box of a stbl box, which describes the track's samples; the other boxes, the sample tables, are
+	 * read with the stbl box at the track's first lookup.
 	 */
-	async readSampleDescriptionBoxes(start: number, end: number) {
-		const track = this.currentTrack;
-		assert(track);
-
+	async readSampleDescriptionBox(start: number, end: number) {
 		let pos = start;
 		while (pos <= end - MIN_BOX_HEADER_SIZE) {
 			let boxInfo = this.readBoxHeaderAt(pos, end);
@@ -1070,15 +1075,11 @@ export class IsobmffDemuxer extends Demuxer {
 			}
 
 			const boxEnd = pos + boxInfo.totalSize;
-			if (SAMPLE_TABLE_METADATA_BOX_NAMES.includes(boxInfo.name)) {
-				if (!await this.traverseBoxAt(pos, Math.min(boxEnd, end))) {
-					break;
-				}
-
-				if (boxInfo.name === 'stsd' && !track.encryptionInfo) {
-					// The other boxes are sample tables, which even just reading the headers of may take a request each
-					break;
-				}
+			if (boxInfo.name === 'stsd') {
+				// What comes after it is left unread, as even just reading the headers of the tables may take a
+				// request each
+				await this.traverseBoxAt(pos, Math.min(boxEnd, end));
+				break;
 			}
 
 			pos = boxEnd;
