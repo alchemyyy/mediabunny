@@ -414,6 +414,33 @@ test('UrlSource lets a held response give way to a read that needs its request',
 	}
 });
 
+test('UrlSource gives a read queued behind a busy response that response once it reaches its target', async () => {
+	const server = await startRangedServer();
+
+	try {
+		const source = new UrlSource(server.url, { readAhead: testReadAhead, parallelism: 1 });
+		using ref = source.ref();
+		const reader = new Reader(ref.source);
+
+		// The only response is busy with the first read when the far read comes, which waits in the queue for it
+		const start = performance.now();
+		const firstRead = reader.requestSlice(0, sequentialReadSize);
+		const farRead = reader.requestSlice(rangedResourceSize / 2, sequentialReadSize);
+		assert(firstRead instanceof Promise && farRead instanceof Promise);
+
+		await firstRead;
+		const farSlice = await farRead;
+		assert(farSlice);
+		expect(readBytes(farSlice, 1)[0]).toBe(rangedResourceByte(rangedResourceSize / 2));
+
+		// The response that served the first read ended for it rather than wait out its hold
+		expect(performance.now() - start).toBeLessThan(responseHoldTime / 2);
+		expect(server.requestCount()).toBe(2);
+	} finally {
+		server.close();
+	}
+});
+
 test('UrlSource ends a prefetching response once a read waiting elsewhere needs a request of its own', async () => {
 	const server = await startRangedServer();
 
