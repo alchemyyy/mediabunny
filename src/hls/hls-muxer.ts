@@ -50,6 +50,12 @@ const toHlsCodecString = (codecString: string) => {
 	if (codecString === 'opus') {
 		return 'Opus';
 	}
+	if (codecString === 'flac') {
+		return 'fLaC';
+	}
+	if (codecString === 'mp3' || codecString === 'mp4a.69' || codecString === 'mp4a.6B' || codecString === 'mp4a.6b') {
+		return 'mp4a.40.34';
+	}
 
 	return codecString;
 };
@@ -58,8 +64,6 @@ type HlsTrackData = {
 	track: OutputTrack;
 	packets: EncodedPacket[];
 	playlist: Playlist;
-	// We must store it on the TrackData, reading it directly from the track leads to async race conditions!
-	closed: boolean;
 	info: {
 		type: 'video';
 		decoderConfig: VideoDecoderConfig;
@@ -139,6 +143,7 @@ export class HlsMuxer extends Muxer {
 
 	targetSegmentDuration: number;
 	trackDatas: HlsTrackData[] = [];
+	closedTracks = new Set<OutputTrack>();
 	singleFilePerPlaylist: boolean;
 	isLive: boolean;
 	maxLiveSegmentCount: number;
@@ -164,7 +169,7 @@ export class HlsMuxer extends Muxer {
 		this.isLive = format._options.live ?? false;
 		this.maxLiveSegmentCount = format._options.maxLiveSegmentCount ?? Infinity;
 		this.mediaTimestampBase = format._options.mediaTimestampBase ?? 10;
-		this.globalTargetDuration = this.targetSegmentDuration;
+		this.globalTargetDuration = 0;
 
 		this.getPlaylistPath = format._options.getPlaylistPath
 			?? (({ n }) => `playlist-${n}.m3u8`);
@@ -295,125 +300,6 @@ export class HlsMuxer extends Muxer {
 		const unpairedVideoTracks: OutputTrack[] = [];
 		const unpairedAudioTracks: OutputTrack[] = [];
 
-		// Now, create the top-level variant streams
-		for (const track of this.output.tracks) {
-			const assignedGroupKeys = groupAssignment.get(track);
-			if (assignedGroupKeys) {
-				assert(assignedGroupKeys.length > 0);
-
-				if (track.type !== mainType) {
-					continue;
-				}
-
-				for (const key of assignedGroupKeys) {
-					const group = groups.find(x => x.key === key);
-					assert(group);
-
-					if (assignedGroupKeys.length === 1 && group.tracks.length === 1) {
-						const otherGroupKeys = groupAssignment.get(group.tracks[0]!);
-						assert(otherGroupKeys !== undefined);
-
-						if (otherGroupKeys.length === 1) {
-							const otherGroup = groups.find(x => x.key === otherGroupKeys[0]!)!;
-
-							if (otherGroup.tracks.length === 1) {
-								assert(otherGroup.tracks[0] === track);
-
-								variantStreams.push({
-									tracks: [track, group.tracks[0]!],
-									linkedGroup: null,
-								});
-								continue;
-							}
-						}
-					}
-
-					variantStreams.push({
-						tracks: [track],
-						linkedGroup: group,
-					});
-					group.needsEmit = true;
-				}
-			} else {
-				if (track.type === 'video') {
-					unpairedVideoTracks.push(track);
-				} else if (track.type === 'audio') {
-					unpairedAudioTracks.push(track);
-				}
-			}
-		}
-
-		const getMetadataKeyForTrack = ({ metadata }: OutputTrack) => {
-			let key = '';
-			key += `${metadata.languageCode ?? UNDETERMINED_LANGUAGE}-`;
-			key += `${metadata.name ?? ''}-`;
-			key += `${metadata.disposition?.default ?? true}-`;
-			key += `${metadata.disposition?.primary ?? false}-`;
-			key += `${metadata.disposition?.forced ?? false}-`;
-
-			return key;
-		};
-
-		// Video tracks that can't be paired with any other track always live on the top-level, the question is just if
-		// they need to be separated into #EXT-X-MEDIA tags or not
-		if (unpairedVideoTracks.length > 0) {
-			const uniqueMetadata = new Set(unpairedVideoTracks.map(getMetadataKeyForTrack));
-
-			if (uniqueMetadata.size > 1) {
-				// They differ in metadata, emit as group
-				const group: typeof groups[number] = {
-					key: unpairedVideoTracks.map(x => x.id).join('-'),
-					name: 'video-' + (groups.length + 1),
-					tracks: unpairedVideoTracks,
-					needsEmit: true,
-					firstNoUri: true,
-				};
-				groups.push(group);
-
-				variantStreams.push({
-					tracks: [unpairedVideoTracks[0]!],
-					linkedGroup: group,
-				});
-			} else {
-				for (const track of unpairedVideoTracks) {
-					variantStreams.push({
-						tracks: [track],
-						linkedGroup: null,
-					});
-				}
-			}
-		}
-
-		// Audio tracks that can't be paired with any other track always live on the top-level, the question is just if
-		// they need to be separated into #EXT-X-MEDIA tags or not
-		if (unpairedAudioTracks.length > 0) {
-			const uniqueMetadata = new Set(unpairedAudioTracks.map(getMetadataKeyForTrack));
-
-			if (uniqueMetadata.size > 1) {
-				// They differ in metadata, emit as group
-				const group: typeof groups[number] = {
-					key: unpairedAudioTracks.map(x => x.id).join('-'),
-					name: 'audio-' + (groups.length + 1),
-					tracks: unpairedAudioTracks,
-					needsEmit: true,
-					firstNoUri: true,
-				};
-				groups.push(group);
-
-				variantStreams.push({
-					tracks: [unpairedAudioTracks[0]!],
-					linkedGroup: group,
-				});
-			} else {
-				for (const track of unpairedAudioTracks) {
-					variantStreams.push({
-						tracks: [track],
-						linkedGroup: null,
-					});
-				}
-			}
-		}
-
 		const deduceSegmentFormat = (tracks: OutputTrack[]) => {
 			const codecs: MediaCodec[] = [];
 			let videoCount = 0;
@@ -463,12 +349,140 @@ export class HlsMuxer extends Muxer {
 				}
 			}
 
-			// We must find a format. If no format is found, that means we incorrectly gated track creation and
-			// assignment at an earlier step.
-			assert(candidate);
-
 			return candidate;
 		};
+
+		// Now, create the top-level variant streams
+		for (const track of this.output.tracks) {
+			const assignedGroupKeys = groupAssignment.get(track);
+			if (assignedGroupKeys) {
+				assert(assignedGroupKeys.length > 0);
+
+				if (track.type !== mainType) {
+					continue;
+				}
+
+				for (const key of assignedGroupKeys) {
+					const group = groups.find(x => x.key === key);
+					assert(group);
+
+					if (assignedGroupKeys.length === 1 && group.tracks.length === 1) {
+						const otherGroupKeys = groupAssignment.get(group.tracks[0]!);
+						assert(otherGroupKeys !== undefined);
+
+						if (otherGroupKeys.length === 1) {
+							const otherGroup = groups.find(x => x.key === otherGroupKeys[0]!)!;
+
+							if (otherGroup.tracks.length === 1) {
+								assert(otherGroup.tracks[0] === track);
+
+								const canSharePlaylist = !!deduceSegmentFormat([track, group.tracks[0]!]);
+								if (canSharePlaylist) {
+									variantStreams.push({
+										tracks: [track, group.tracks[0]!],
+										linkedGroup: null,
+									});
+									continue;
+								}
+							}
+						}
+					}
+
+					variantStreams.push({
+						tracks: [track],
+						linkedGroup: group,
+					});
+					group.needsEmit = true;
+				}
+			} else {
+				if (track.type === 'video') {
+					unpairedVideoTracks.push(track);
+				} else if (track.type === 'audio') {
+					unpairedAudioTracks.push(track);
+				}
+			}
+		}
+
+		const getMetadataKeyForTrack = ({ metadata }: OutputTrack) => {
+			let key = '';
+			key += `${metadata.languageCode ?? UNDETERMINED_LANGUAGE}-`;
+			key += `${metadata.name ?? ''}-`;
+			key += `${metadata.disposition?.default ?? true}-`;
+			key += `${metadata.disposition?.primary ?? false}-`;
+			key += `${metadata.disposition?.forced ?? false}-`;
+
+			return key;
+		};
+
+		// Video tracks that can't be paired with any other track always live on the top-level, the question is just if
+		// they need to be separated into #EXT-X-MEDIA tags or not
+		if (unpairedVideoTracks.length > 0) {
+			// Key-packets-only tracks are standalone I-frame streams, so they can't be renditions within a group
+			const iFrameTracks = unpairedVideoTracks.filter(x => x.isVideoTrack() && x.metadata.hasOnlyKeyPackets);
+			const groupableTracks = unpairedVideoTracks.filter(x => !iFrameTracks.includes(x));
+			const uniqueMetadata = new Set(groupableTracks.map(getMetadataKeyForTrack));
+
+			if (uniqueMetadata.size > 1) {
+				// They differ in metadata, emit as group
+				const group: typeof groups[number] = {
+					key: groupableTracks.map(x => x.id).join('-'),
+					name: 'video-' + (groups.length + 1),
+					tracks: groupableTracks,
+					needsEmit: true,
+					firstNoUri: true,
+				};
+				groups.push(group);
+
+				variantStreams.push({
+					tracks: [groupableTracks[0]!],
+					linkedGroup: group,
+				});
+
+				for (const track of iFrameTracks) {
+					variantStreams.push({
+						tracks: [track],
+						linkedGroup: null,
+					});
+				}
+			} else {
+				for (const track of unpairedVideoTracks) {
+					variantStreams.push({
+						tracks: [track],
+						linkedGroup: null,
+					});
+				}
+			}
+		}
+
+		// Audio tracks that can't be paired with any other track always live on the top-level, the question is just if
+		// they need to be separated into #EXT-X-MEDIA tags or not
+		if (unpairedAudioTracks.length > 0) {
+			const uniqueMetadata = new Set(unpairedAudioTracks.map(getMetadataKeyForTrack));
+
+			if (uniqueMetadata.size > 1) {
+				// They differ in metadata, emit as group
+				const group: typeof groups[number] = {
+					key: unpairedAudioTracks.map(x => x.id).join('-'),
+					name: 'audio-' + (groups.length + 1),
+					tracks: unpairedAudioTracks,
+					needsEmit: true,
+					firstNoUri: true,
+				};
+				groups.push(group);
+
+				variantStreams.push({
+					tracks: [unpairedAudioTracks[0]!],
+					linkedGroup: group,
+				});
+			} else {
+				for (const track of unpairedAudioTracks) {
+					variantStreams.push({
+						tracks: [track],
+						linkedGroup: null,
+					});
+				}
+			}
+		}
 
 		const registerPlaylist = async (tracks: OutputTrack[]) => {
 			if (tracks.some(track => this.playlists.some(playlist => playlist.tracks.includes(track)))) {
@@ -476,6 +490,9 @@ export class HlsMuxer extends Muxer {
 			}
 
 			const format = deduceSegmentFormat(tracks);
+			// We must find a format. If no format is found, that means we incorrectly gated track creation and
+			// assignment at an earlier step.
+			assert(format);
 
 			const id = this.playlists.length + 1;
 			const path = await this.getPlaylistPath({
@@ -567,7 +584,7 @@ export class HlsMuxer extends Muxer {
 
 	private allTracksAreKnown(playlist: Playlist) {
 		for (const track of playlist.tracks) {
-			if (!track.source._closed && !this.trackDatas.some(x => x.track === track)) {
+			if (!this.closedTracks.has(track) && !this.trackDatas.some(x => x.track === track)) {
 				return false; // We haven't seen a sample from this open track yet
 			}
 		}
@@ -575,20 +592,20 @@ export class HlsMuxer extends Muxer {
 		return true;
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
-		const trackData = this.trackDatas.find(x => x.track === track);
-		if (trackData) {
-			trackData.closed = true;
-		}
-
 		const playlist = this.playlists.find(x => x.tracks.includes(track));
 		assert(playlist); // If there isn't one then the assignment algo failed innit
 
 		using lock = playlist.mutex.lock();
 		if (lock.pending) await lock.ready;
 
-		await this.advancePlaylist(playlist);
+		this.closedTracks.add(track);
+
+		// Another track of the playlist may have closed alongside this one and already finished the playlist, hence
+		// this check
+		if (!playlist.done) {
+			await this.advancePlaylist(playlist);
+		}
 	}
 
 	getVideoTrackData(track: OutputVideoTrack, packet: EncodedPacket | null, meta?: EncodedVideoChunkMetadata) {
@@ -609,7 +626,6 @@ export class HlsMuxer extends Muxer {
 			track,
 			packets: [],
 			playlist: playlists[0]!,
-			closed: false,
 			info: {
 				type: 'video',
 				decoderConfig: meta.decoderConfig,
@@ -639,7 +655,6 @@ export class HlsMuxer extends Muxer {
 			track,
 			packets: [],
 			playlist: playlists[0]!,
-			closed: false,
 			info: {
 				type: 'audio',
 				decoderConfig: meta.decoderConfig,
@@ -724,11 +739,12 @@ export class HlsMuxer extends Muxer {
 		}
 
 		const trackDatas = this.trackDatas.filter(x => playlist.tracks.includes(x.track));
+		const allClosed = trackDatas.every(x => this.closedTracks.has(x.track));
 
 		if (playlist.currentSegmentStartTimestamp === null) {
 			// All tracks are known but we never received any data. Tracks that declared themselves up front are known
 			// before their first packet, so we can only call it a day once they're actually closed.
-			if (trackDatas.every(x => x.closed)) {
+			if (allClosed) {
 				await this.onPlaylistDone(playlist);
 			}
 
@@ -737,6 +753,13 @@ export class HlsMuxer extends Muxer {
 
 		const videoTrack = trackDatas.find(x => x.info.type === 'video') as HlsVideoTrackData | undefined;
 		const audioTrack = trackDatas.find(x => x.info.type === 'audio') as HlsAudioTrackData | undefined;
+		const videoTrackIsClosed = !!videoTrack && this.closedTracks.has(videoTrack.track);
+		const audioTrackIsClosed = !!audioTrack && this.closedTracks.has(audioTrack.track);
+
+		// RFC 8216: "The EXT-X-I-FRAMES-ONLY tag indicates that each Media Segment in the Playlist describes a
+		// single I-frame"
+		const isKeyPacketsOnly = playlist.tracks[0]!.isVideoTrack()
+			&& playlist.tracks[0].metadata.hasOnlyKeyPackets;
 
 		// Loop in case we can finalize multiple segments
 		while (true) {
@@ -757,15 +780,15 @@ export class HlsMuxer extends Muxer {
 			let videoEndIndex = 0;
 			let audioEndIndex = 0;
 
-			if (videoTrack && (!videoTrack.closed || videoTrack.packets.length > 0)) {
+			if (videoTrack && (!videoTrackIsClosed || videoTrack.packets.length > 0)) {
 				// A video track is active (and maybe an audio track too)
 				const allBelow = videoTrack.packets.every(x => x.timestamp < currentSegmentEndTimestamp);
 
 				let bestKeyPacket: EncodedPacket | null = null;
 				let bestKeyPacketIndex: number | null = null;
 
-				if (allBelow) {
-					if (!videoTrack.closed) {
+				if (allBelow && !isKeyPacketsOnly) {
+					if (!videoTrackIsClosed) {
 						// Not enough data yet
 						return;
 					}
@@ -781,6 +804,10 @@ export class HlsMuxer extends Muxer {
 						if (i > 0 && packet.type === 'key') {
 							bestKeyPacket = packet;
 							bestKeyPacketIndex = i;
+
+							if (isKeyPacketsOnly) {
+								break;
+							}
 						}
 					}
 				}
@@ -794,7 +821,7 @@ export class HlsMuxer extends Muxer {
 						if (index !== -1) {
 							audioEndIndex = index;
 						} else {
-							if (audioTrack.closed) {
+							if (audioTrackIsClosed) {
 								audioEndIndex = audioTrack.packets.length;
 							} else {
 								return;
@@ -802,7 +829,7 @@ export class HlsMuxer extends Muxer {
 						}
 					}
 				} else {
-					if (!videoTrack.closed) {
+					if (!videoTrackIsClosed) {
 						return;
 					}
 
@@ -819,7 +846,7 @@ export class HlsMuxer extends Muxer {
 							if (index !== -1) {
 								audioEndIndex = index;
 							} else {
-								if (audioTrack.closed) {
+								if (audioTrackIsClosed) {
 									audioEndIndex = audioTrack.packets.length;
 								} else {
 									return;
@@ -831,7 +858,7 @@ export class HlsMuxer extends Muxer {
 							if (index !== -1) {
 								audioEndIndex = index;
 							} else {
-								if (audioTrack.closed) {
+								if (audioTrackIsClosed) {
 									audioEndIndex = audioTrack.packets.length;
 								} else {
 									return;
@@ -840,13 +867,13 @@ export class HlsMuxer extends Muxer {
 						}
 					}
 				}
-			} else if (audioTrack && (!audioTrack.closed || audioTrack.packets.length > 0)) {
+			} else if (audioTrack && (!audioTrackIsClosed || audioTrack.packets.length > 0)) {
 				// There's only an audio track active
 
 				const allBelow = audioTrack.packets.every(x => x.timestamp < currentSegmentEndTimestamp);
 
 				if (allBelow) {
-					if (audioTrack.closed) {
+					if (audioTrackIsClosed) {
 						// We can write all packets since they're all below
 						audioEndIndex = audioTrack.packets.length;
 					} else {
@@ -862,7 +889,6 @@ export class HlsMuxer extends Muxer {
 
 			if (videoEndIndex === 0 && audioEndIndex === 0) {
 				// No more segments to write - if all tracks are closed, this playlist is done
-				const allClosed = trackDatas.every(x => x.closed);
 				if (allClosed) {
 					await this.onPlaylistDone(playlist);
 				}
@@ -1023,7 +1049,12 @@ export class HlsMuxer extends Muxer {
 				} else {
 					// Create the output for this segment
 					output = new Output({
-						format: playlist.segmentFormat,
+						// TEMP HACK: MP3 makes little sense with the Xing header, because many players interpret it
+						// as mid-stream silence. But it's enabled by default, and changing that would be breaking.
+						// So, it's a hardcoded special case for now. In the future, we should deprecate arbitrary
+						// segment formats for HLS and switch to special HLS-specific segment formats which can carry
+						// their own logic.
+						format: playlist.segmentFormat._withoutXingHeader(),
 						target: new PathedTarget(
 							fullSegmentPath,
 							async (request: TargetRequest) => {
@@ -1119,6 +1150,7 @@ export class HlsMuxer extends Muxer {
 							...videoTrack.track.metadata,
 							decoderConfig: videoTrack.info.decoderConfig,
 							primingPacket: videoTrack.info.primingPacket ?? undefined,
+							maximumPacketCount: videoEndIndex,
 						});
 					}
 
@@ -1131,6 +1163,7 @@ export class HlsMuxer extends Muxer {
 							...audioTrack.track.metadata,
 							decoderConfig: audioTrack.info.decoderConfig,
 							primingPacket: audioTrack.info.primingPacket ?? undefined,
+							maximumPacketCount: audioEndIndex,
 						});
 
 						if (!playlist.segmentFormat.supportsTimestampedMediaData && audioEndIndex > 0) {
@@ -1303,14 +1336,16 @@ export class HlsMuxer extends Muxer {
 			this.format._options.onSegment?.(playlist.singleFile.target, playlist.singleFile.info);
 		}
 
-		await this.writePlaylist(playlist);
+		if (this.isLive) {
+			await this.writePlaylist(playlist);
 
-		if (this.isLive && playlist.writtenSegments.length === 0) {
-			await this.tryWriteMasterPlaylist();
+			if (playlist.writtenSegments.length === 0) {
+				await this.tryWriteMasterPlaylist();
+			}
 		}
 	}
 
-	private updatePlaylistBitrates(playlist: Playlist) {
+	private updatePlaylistBitrates(playlist: Playlist, targetDuration: number) {
 		const segments = playlist.writtenSegments;
 
 		let peakBitrate = 0;
@@ -1329,14 +1364,11 @@ export class HlsMuxer extends Muxer {
 				windowBytes += segments[j]!.byteSize;
 				windowDuration += segments[j]!.duration;
 
-				if (
-					windowDuration >= 0.5 * this.globalTargetDuration
-					&& windowDuration <= 1.5 * this.globalTargetDuration
-				) {
+				if (windowDuration >= 0.5 * targetDuration && windowDuration <= 1.5 * targetDuration) {
 					peakBitrate = Math.max(peakBitrate, 8 * windowBytes / windowDuration);
 				}
 
-				if (windowDuration > 1.5 * this.globalTargetDuration) {
+				if (windowDuration > 1.5 * targetDuration) {
 					break;
 				}
 			}
@@ -1375,7 +1407,11 @@ export class HlsMuxer extends Muxer {
 							decoderConfig?.codedHeight ?? 1080,
 						);
 					} else if (track.isAudioTrack()) {
-						trackPeakBitrate = mediumQuality._toAudioBitrate(track.source._codec) ?? 0;
+						const decoderConfig = trackData?.info.decoderConfig as AudioDecoderConfig | undefined;
+						trackPeakBitrate = mediumQuality._toAudioBitrate(
+							track.source._codec,
+							decoderConfig?.numberOfChannels ?? 2,
+						) ?? 0;
 					}
 				}
 
@@ -1391,7 +1427,14 @@ export class HlsMuxer extends Muxer {
 		assert(this.output._target instanceof PathedTarget);
 		const pathedTarget = this.output._target;
 
-		this.updatePlaylistBitrates(playlist);
+		// In live mode, target duration is not allowed to change, so we use the nominal value. It must be a
+		// "decimal-integer", and it's rounded like the EXTINF values first so that float noise doesn't mess it up
+		const targetDuration = Math.max(
+			Math.ceil(+(this.isLive ? this.targetSegmentDuration : this.globalTargetDuration).toFixed(12)),
+			1, // A target duration of 0 is kinda weird
+		);
+
+		this.updatePlaylistBitrates(playlist, targetDuration);
 
 		let hasByteOffsets = false;
 		for (const segment of playlist.writtenSegments) {
@@ -1413,14 +1456,11 @@ export class HlsMuxer extends Muxer {
 			version = 6;
 		}
 
-		// In live mode, target duration is not allowed to change, so we use the nominal value
-		const targetDuration = this.isLive ? this.targetSegmentDuration : this.globalTargetDuration;
-
 		const playlistPath = joinPaths(pathedTarget.rootPath, playlist.path);
 		const playlistText = '#EXTM3U\n'
 			+ `#EXT-X-VERSION:${version}\n`
 			+ (!this.isLive ? '#EXT-X-PLAYLIST-TYPE:VOD\n' : '')
-			+ `#EXT-X-TARGETDURATION:${Math.ceil(targetDuration)}\n` // Must be a "decimal-integer"
+			+ `#EXT-X-TARGETDURATION:${targetDuration}\n`
 			+ (Number.isFinite(this.maxLiveSegmentCount) ? `#EXT-X-MEDIA-SEQUENCE:${playlist.mediaSequence}\n` : '')
 			+ '#EXT-X-INDEPENDENT-SEGMENTS\n'
 			+ (isKeyPacketsOnly ? '#EXT-X-I-FRAMES-ONLY\n' : '')
@@ -1473,6 +1513,7 @@ export class HlsMuxer extends Muxer {
 		let lastGroupId: string | null = null;
 		let groupIdTrackCount = 0;
 		let hasHadDefaultTrackInGroup = false;
+		const namesInGroup = new Set<string>();
 
 		for (const decl of this.playlistDeclarations) {
 			if (decl.groupId === null) {
@@ -1489,23 +1530,28 @@ export class HlsMuxer extends Muxer {
 				let peakDeclBitrate = 0;
 				let maxRefAverageBitrate = 0;
 
-				if (decl.references.length > 0) {
-					const firstRef = decl.references[0]!;
-					const firstTrack = firstRef.playlist.tracks[0]!;
-					const trackData = this.trackDatas.find(x => x.track === firstTrack);
-					const codecString = trackData?.info.decoderConfig.codec ?? firstTrack.source._codec;
-					codecs.push(toHlsCodecString(codecString));
+				// The variant's own playlist can be the URI-less rendition of the group it references, in which case
+				// the group's renditions take the place of the variant's own media instead of adding to it
+				const ownPlaylistIsReferenced = decl.references.some(x => x.playlist === decl.playlist);
 
-					for (const ref of decl.references) {
-						assert(ref.playlist.peakBitrate !== null);
-						peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
-						maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
+				for (const ref of decl.references) {
+					// The spec wants every codec of any rendition in the group listed
+					for (const track of ref.playlist.tracks) {
+						const trackData = this.trackDatas.find(x => x.track === track);
+						const codecString = trackData?.info.decoderConfig.codec ?? track.source._codec;
+						codecs.push(toHlsCodecString(codecString));
 					}
+
+					assert(ref.playlist.peakBitrate !== null);
+					peakDeclBitrate = Math.max(peakDeclBitrate, ref.playlist.peakBitrate);
+					maxRefAverageBitrate = Math.max(maxRefAverageBitrate, ref.playlist.averageBitrate ?? 0);
 				}
 
 				assert(decl.playlist.peakBitrate !== null);
-				const totalPeakBitrate = decl.playlist.peakBitrate + peakDeclBitrate;
-				const totalAverageBitrate = (decl.playlist.averageBitrate ?? 0) + maxRefAverageBitrate;
+				const ownPeakBitrate = ownPlaylistIsReferenced ? 0 : decl.playlist.peakBitrate;
+				const ownAverageBitrate = ownPlaylistIsReferenced ? 0 : (decl.playlist.averageBitrate ?? 0);
+				const totalPeakBitrate = ownPeakBitrate + peakDeclBitrate;
+				const totalAverageBitrate = ownAverageBitrate + maxRefAverageBitrate;
 
 				if (!firstVariantWritten) {
 					masterPlaylistText += '\n';
@@ -1524,7 +1570,7 @@ export class HlsMuxer extends Muxer {
 					masterPlaylistText += `,AVERAGE-BANDWIDTH=${Math.ceil(totalAverageBitrate)}`;
 				}
 
-				masterPlaylistText += `,CODECS="${codecs.join(',')}"`;
+				masterPlaylistText += `,CODECS="${[...new Set(codecs)].join(',')}"`;
 
 				const videoTrack = decl.playlist.tracks.find(x => x.isVideoTrack());
 				if (videoTrack?.isVideoTrack()) {
@@ -1532,19 +1578,34 @@ export class HlsMuxer extends Muxer {
 						HlsVideoTrackData | undefined;
 					const decoderConfig = trackData?.info.decoderConfig;
 					if (decoderConfig) {
-						let width = decoderConfig.displayAspectWidth ?? decoderConfig.codedWidth;
-						let height = decoderConfig.displayAspectHeight ?? decoderConfig.codedHeight;
+						assert(decoderConfig.codedWidth !== undefined);
+						assert(decoderConfig.codedHeight !== undefined);
 
-						if (width !== undefined && height !== undefined) {
-							if (
-								videoTrack.metadata.rotation !== undefined
-								&& videoTrack.metadata.rotation % 180 === 90
-							) {
-								[width, height] = [height, width];
+						let width = decoderConfig.codedWidth;
+						let height = decoderConfig.codedHeight;
+
+						if (
+							decoderConfig.displayAspectWidth !== undefined
+							&& decoderConfig.displayAspectHeight !== undefined
+						) {
+							const num = decoderConfig.displayAspectWidth * decoderConfig.codedHeight;
+							const den = decoderConfig.displayAspectHeight * decoderConfig.codedWidth;
+
+							if (num > den) {
+								width = Math.round(width * num / den);
+							} else {
+								height = Math.round(height * den / num);
 							}
-
-							masterPlaylistText += `,RESOLUTION=${width}x${height}`;
 						}
+
+						if (
+							videoTrack.metadata.rotation !== undefined
+							&& videoTrack.metadata.rotation % 180 === 90
+						) {
+							[width, height] = [height, width];
+						}
+
+						masterPlaylistText += `,RESOLUTION=${width}x${height}`;
 					}
 
 					// FRAME-RATE is not defined for EXT-X-I-FRAME-STREAM-INF
@@ -1588,10 +1649,12 @@ export class HlsMuxer extends Muxer {
 					groupIdTrackCount = 0;
 					masterPlaylistText += '\n';
 					hasHadDefaultTrackInGroup = false;
+					namesInGroup.clear();
 				}
 				lastGroupId = decl.groupId;
 				groupIdTrackCount++;
 
+				// Once subtitle tracks are supported, this logic is wrong (they need TYPE=SUBTITLES)
 				masterPlaylistText += `#EXT-X-MEDIA:TYPE=${type.toUpperCase()},GROUP-ID="${decl.groupId}"`;
 
 				if (name !== null && /[\n\r"]/.test(name)) {
@@ -1605,7 +1668,14 @@ export class HlsMuxer extends Muxer {
 				// Name is required, so we have to set it to SOMETHING
 				name ??= `${languageCode ?? decl.groupId}-${groupIdTrackCount}`;
 
-				masterPlaylistText += `,NAME="${name}"`;
+				// The spec requires distinct names within a group
+				let uniqueName = name;
+				for (let i = 2; namesInGroup.has(uniqueName); i++) {
+					uniqueName = `${name} (${i})`;
+				}
+				namesInGroup.add(uniqueName);
+
+				masterPlaylistText += `,NAME="${uniqueName}"`;
 
 				if (languageCode !== undefined) {
 					masterPlaylistText += `,LANGUAGE="${languageCode}"`;
@@ -1625,7 +1695,7 @@ export class HlsMuxer extends Muxer {
 					masterPlaylistText += ',AUTOSELECT=YES';
 				}
 
-				if (dispositionForced) {
+				if (dispositionForced && type === 'subtitle') { // The spec reserves FORCED for subtitle renditions
 					masterPlaylistText += ',FORCED=YES';
 				}
 
@@ -1697,8 +1767,8 @@ export class HlsMuxer extends Muxer {
 			if (lock.pending) await lock.ready;
 		}));
 
-		for (const trackData of this.trackDatas) {
-			trackData.closed = true;
+		for (const track of this.output.tracks) {
+			this.closedTracks.add(track);
 		}
 
 		await Promise.all(this.playlists.map(playlist => (
@@ -1706,6 +1776,7 @@ export class HlsMuxer extends Muxer {
 		)));
 
 		if (!this.isLive) {
+			await Promise.all(this.playlists.map(playlist => this.writePlaylist(playlist)));
 			await this.writeMasterPlaylist();
 		}
 	}

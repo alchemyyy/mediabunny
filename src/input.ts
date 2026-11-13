@@ -30,7 +30,6 @@ import {
 	EventEmitter,
 	polyfillSymbolDispose,
 	removeItem,
-	ResultValue,
 } from './misc';
 import { Reader } from './reader';
 import {
@@ -40,7 +39,7 @@ import {
 	SourceRequest,
 	sourceRequestsAreEqual,
 } from './source';
-import { PacketRetrievalOptions, PacketRetrievalResult } from './packet';
+import { PacketRetrievalOptions } from './packet';
 
 polyfillSymbolDispose();
 
@@ -192,6 +191,10 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 
 	/** @internal */
 	get _rootSource() {
+		if (this._disposed) {
+			throw new InputDisposedError();
+		}
+
 		return this._rootRef.source;
 	}
 
@@ -211,7 +214,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			x.cacheGroup === cacheGroup && sourceRequestsAreEqual(x.request, request),
 		);
 		if (cachedEntry) {
-			cachedEntry.age++;
+			cachedEntry.age = this._nextSourceCacheAge++;
 			return Promise.resolve(cachedEntry.sourceRef.source.ref());
 		}
 
@@ -223,7 +226,15 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 
 		const promise = (async () => {
-			const sourceRef = await this._getSourceUncached(request);
+			let sourceRef: SourceRef;
+			try {
+				sourceRef = await this._getSourceUncached(request);
+			} finally {
+				// Also on failure, so that later requests for this source can try again
+				const promiseIndex = this._sourceCachePromises.findIndex(x => x.request === request);
+				assert(promiseIndex !== -1);
+				this._sourceCachePromises.splice(promiseIndex, 1);
+			}
 
 			if (this._disposed) {
 				sourceRef.free();
@@ -250,10 +261,6 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			}
 
 			this._sourceRefs.push(sourceRef);
-
-			const promiseIndex = this._sourceCachePromises.findIndex(x => x.request === request);
-			assert(promiseIndex !== -1);
-			this._sourceCachePromises.splice(promiseIndex, 1);
 
 			const cacheEntry: SourceCacheEntry = {
 				request,
@@ -286,17 +293,29 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			this._reader = new Reader(this._rootSource);
 			this._emit('source', { source: this._rootSource, request: null, isRoot: true });
 
+			// The format whose data starts earliest wins
+			let bestFormat: InputFormat | null = null;
+			let bestMatchPosition = Infinity;
 			for (const format of this._formats) {
-				const canRead = await format._canReadInput(this);
-				if (canRead) {
-					this._format = format;
-					this._onFormatDetermined?.(format);
+				const matchPosition = await format._getMatchPosition(this);
+				if (matchPosition !== null && matchPosition < bestMatchPosition) {
+					bestFormat = format;
+					bestMatchPosition = matchPosition;
 
-					return format._createDemuxer(this);
+					if (matchPosition === 0) {
+						break; // Nothing can beat this
+					}
 				}
 			}
 
-			throw new UnsupportedInputFormatError();
+			if (!bestFormat) {
+				throw new UnsupportedInputFormatError();
+			}
+
+			this._format = bestFormat;
+			this._onFormatDetermined?.(bestFormat);
+
+			return bestFormat._createDemuxer(this);
 		})();
 	}
 
@@ -350,14 +369,8 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 		}
 
 		// Only count the timestamps of tracks that have at least one packet
-		const firstPackets = await Promise.all(filtered.map(async (x) => {
-			const result = new ResultValue<PacketRetrievalResult>();
-			const promise = x._backing.getFirstPacket(result, { metadataOnly: true });
-			if (result.pending) await promise;
-
-			return result.value.packet;
-		}));
-		const result = Math.min(...firstPackets.map(x => x?.timestamp ?? Infinity));
+		const firstTimestamps = await Promise.all(filtered.map(x => x.getFirstTimestampOrNull()));
+		const result = Math.min(...firstTimestamps.map(x => x ?? Infinity));
 
 		return result === Infinity ? 0 : result;
 	}
@@ -384,8 +397,11 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			return 0;
 		}
 
-		const tracksDurations = await Promise.all(filtered.map(x => x.computeDuration(options)));
-		return Math.max(...tracksDurations);
+		// Only count the durations of tracks that have at least one packet
+		const tracksDurations = await Promise.all(filtered.map(x => x.computeDurationOrNull(options)));
+		const result = Math.max(...tracksDurations.map(x => x ?? -Infinity));
+
+		return result === -Infinity ? 0 : result;
 	}
 
 	/**
@@ -548,6 +564,7 @@ export class Input<S extends Source = Source> extends EventEmitter<InputEvents> 
 			ref.free();
 		}
 		this._sourceRefs.length = 0;
+		this._sourceCache.length = 0;
 
 		if (this._demuxerPromise) {
 			// The demuxer promise may already be rejected after failed format detection.

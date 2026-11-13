@@ -47,11 +47,6 @@ const mpegAudioParser: SyncFrameParser = {
 	parse: (bytes, offset) => {
 		const word = ((bytes[offset]! << 24) | (bytes[offset + 1]! << 16) | (bytes[offset + 2]! << 8)
 			| bytes[offset + 3]!) >>> 0;
-		// The reserved sample rate index, which readMp3FrameHeader would read as 44.1 kHz
-		if (((word >>> 10) & 0x3) === 3) {
-			return null;
-		}
-
 		const { header } = readMp3FrameHeader(word, null);
 		if (!header || header.totalSize <= MP3_FRAME_HEADER_SIZE) {
 			return null;

@@ -241,7 +241,8 @@ describe('MPEG program stream packets match ffprobe', () => {
 			for (const [index, expected] of expectedTracks.entries()) {
 				const track = tracks[index]!;
 				expect(await track.getCodec()).toBe(expected.codec);
-				expect(track.id).toBe(expected.id);
+				// Main's track.id is the 1-based track index; the program stream's stream ID is the container's
+				expect(track.containerTrackId).toBe(expected.id);
 				expect(await track.getInternalCodecId()).toBe(expected.id);
 
 				const packets = await readAllPackets(track);
@@ -360,7 +361,10 @@ test('Should order MPEG program stream tracks by their first PES packets and ski
 
 	using input = new Input({ source: new BufferSource(edited), formats: ALL_FORMATS });
 	const tracks = await input.getTracks();
-	expect(tracks.map(track => [track.type, track.id])).toEqual([['audio', 0x81], ['video', 0x1e0], ['audio', 0x80]]);
+	expect(tracks.map(track => [track.type, track.containerTrackId])).toEqual(
+		[['audio', 0x81], ['video', 0x1e0], ['audio', 0x80]],
+	);
+	expect(tracks.map(track => track.id)).toEqual([1, 2, 3]);
 	const [copiedPacket] = await readAllPackets(tracks[0]!);
 	const [originalPacket] = await readAllPackets(tracks[2]!);
 	expect([copiedPacket!.timestamp, copiedPacket!.data]).toEqual([originalPacket!.timestamp, originalPacket!.data]);

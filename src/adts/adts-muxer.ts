@@ -67,15 +67,15 @@ export class AdtsMuxer extends Muxer {
 
 			const description = meta?.decoderConfig?.description;
 
-			// Follows from the Mediabunny Codec Registry:
-			this.inputIsAdts = !description;
-
-			if (!this.inputIsAdts) {
-				const config = parseAacAudioSpecificConfig(toUint8Array(description!));
+			if (description) {
+				const config = parseAacAudioSpecificConfig(toUint8Array(description));
 				const template = buildAdtsHeaderTemplate(config);
 				this.header = template.header;
 				this.headerBitstream = template.bitstream;
 			}
+
+			// Follows from the Mediabunny Codec Registry:
+			this.inputIsAdts = !description;
 		}
 
 		if (this.inputIsAdts) {

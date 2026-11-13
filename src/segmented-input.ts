@@ -25,6 +25,7 @@ import {
 	MaybePromise,
 	MaybeRelevantPromise,
 	ResultValue,
+	roundIfAlmostInteger,
 	roundToDivisor,
 } from './misc';
 import { EncodedPacket, PacketRetrievalOptions, PacketRetrievalResult } from './packet';
@@ -71,7 +72,6 @@ export class SegmentRetrievalResult {
 }
 
 export type SegmentedInputTrackDeclaration = {
-	id: number;
 	type: TrackType;
 };
 
@@ -89,6 +89,7 @@ export abstract class SegmentedInput {
 
 	trackBackingsPromise: Promise<InputTrackBacking[]> | null = null;
 	firstSegment: Segment | null = null;
+	hasOnlyKeyPackets = false;
 
 	// Roughly maps local segment timestamps onto actual packet timestamps
 	learnedSegmentTimestampOffset: number | null = null;
@@ -143,8 +144,9 @@ export abstract class SegmentedInput {
 	}
 
 	async getUnixTimeForTimestamp(timestamp: number): Promise<number | null> {
+		// Past the live edge, the last known segment's mapping extrapolates just as precisely, so no need to wait
 		const segmentResult = new ResultValue<SegmentRetrievalResult>();
-		const promise = this.getSegmentAt(segmentResult, timestamp, {});
+		const promise = this.getSegmentAt(segmentResult, timestamp, { skipLiveWait: true });
 		if (segmentResult.pending) await promise;
 
 		let segment = segmentResult.value.segment;
@@ -204,19 +206,13 @@ export abstract class SegmentedInput {
 						const number = arrayCount(backings, x => x.getType() === 'video') + 1;
 
 						backings.push(
-							new SegmentedInputInputVideoTrackBacking(this, {
-								id: backings.length + 1,
-								type: 'video',
-							}, number),
+							new SegmentedInputInputVideoTrackBacking(this, { type: 'video' }, number),
 						);
 					} else if (track.type === 'audio') {
 						const number = arrayCount(backings, x => x.getType() === 'audio') + 1;
 
 						backings.push(
-							new SegmentedInputInputAudioTrackBacking(this, {
-								id: backings.length + 1,
-								type: 'audio',
-							}, number),
+							new SegmentedInputInputAudioTrackBacking(this, { type: 'audio' }, number),
 						);
 					}
 				}
@@ -259,12 +255,11 @@ export abstract class SegmentedInput {
 			// shift the media timestamps by multiples of the period length so that the first timestamp is closest
 			// to the segment's timestamp (which DOES rise monotonically). This even works correctly for non-wrapping
 			// formats like fMP4 because for them it's just a noop (or a constant shift for all media).
-			const tracks = await input.getTracks();
-			const track = tracks.find(x => x.type === 'video') ?? tracks[0];
-			assert(track);
-
-			const mediaStart = await track.getFirstTimestamp() + mediaOffset;
-			mediaOffset += period * Math.round((segment.timestamp - mediaStart) / period);
+			const firstTimestamp = await getReferenceFirstTimestamp(input);
+			if (firstTimestamp !== null) {
+				const mediaStart = firstTimestamp + mediaOffset;
+				mediaOffset += period * Math.round((segment.timestamp - mediaStart) / period);
+			}
 		}
 
 		return mediaOffset;
@@ -277,6 +272,24 @@ export abstract class SegmentedInput {
 		this.inputCache.length = 0;
 	}
 }
+
+export const getReferenceFirstTimestamp = async (input: Input) => {
+	// Prefer video over audio
+	const tracks = await input.getTracks();
+	const orderedTracks = [
+		...tracks.filter(x => x.type === 'video'),
+		...tracks.filter(x => x.type !== 'video'),
+	];
+
+	for (const track of orderedTracks) {
+		const firstTimestamp = await track.getFirstTimestampOrNull();
+		if (firstTimestamp !== null) {
+			return firstTimestamp;
+		}
+	}
+
+	return null;
+};
 
 type PacketInfo = {
 	segment: Segment;
@@ -344,10 +357,6 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 		})();
 	}
 
-	getId(): number {
-		return this.decl.id;
-	}
-
 	getType(): TrackType {
 		return this.decl.type;
 	}
@@ -370,7 +379,10 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 	}
 
 	getHasOnlyKeyPackets() {
-		return this.delegate(() => this.firstInputTrack!._backing.getHasOnlyKeyPackets?.() ?? null);
+		return this.delegate(() => {
+			return this.segmentedInput.hasOnlyKeyPackets
+				|| (this.firstInputTrack!._backing.getHasOnlyKeyPackets?.() ?? null);
+		});
 	}
 
 	getPairingMask() {
@@ -653,6 +665,18 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 
 		let currentSegment = segmentResult.value.segment;
 		if (!currentSegment) {
+			// The media may start before the first segment's timestamp
+			segmentResult.reset();
+			const firstSegmentPromise = this.segmentedInput.getFirstSegment(segmentResult, {
+				skipLiveWait: options.skipLiveWait,
+			});
+			if (segmentResult.pending) await firstSegmentPromise;
+
+			provisional ||= segmentResult.value.provisional;
+			currentSegment = segmentResult.value.segment;
+		}
+
+		if (!currentSegment) {
 			const result = new PacketRetrievalResult(null);
 			result.provisional = provisional;
 
@@ -729,7 +753,10 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 				}
 			}
 
-			const offsetTimestamp = timestamp - mediaOffset;
+			let timeResolution = track._backing.getTimeResolution();
+			if (isThenable(timeResolution)) timeResolution = await timeResolution;
+
+			const offsetTimestamp = toSegmentTimestamp(timestamp, mediaOffset, timeResolution);
 
 			packetResult.reset();
 			const packetPromise = keyframesOnly
@@ -817,7 +844,15 @@ class SegmentedInputInputTrackBacking implements InputTrackBacking {
 						);
 						if (mediaOffsetResult.pending) await nextMediaOffsetPromise;
 
-						if (nextPacket.timestamp + mediaOffsetResult.value <= timestamp) {
+						let nextTimeResolution = nextTrack!._backing.getTimeResolution();
+						if (isThenable(nextTimeResolution)) nextTimeResolution = await nextTimeResolution;
+
+						const nextOffsetTimestamp = toSegmentTimestamp(
+							timestamp,
+							mediaOffsetResult.value,
+							nextTimeResolution,
+						);
+						if (nextPacket.timestamp <= nextOffsetTimestamp) {
 							currentSegment = nextSegment;
 							continue;
 						}
@@ -842,6 +877,12 @@ const getTracksMaybeSync = (input: Input): MaybePromise<InputTrack[]> => {
 	}
 
 	return input.getTracks();
+};
+
+const toSegmentTimestamp = (timestamp: number, mediaOffset: number, timeResolution: number) => {
+	// Mirrors the rounding in createAdjustedPacket
+	const tick = Math.floor(roundIfAlmostInteger(timeResolution * timestamp));
+	return (tick - Math.round(timeResolution * mediaOffset)) / timeResolution;
 };
 
 class SegmentedInputInputVideoTrackBacking

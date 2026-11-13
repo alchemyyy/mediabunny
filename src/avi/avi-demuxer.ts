@@ -223,7 +223,8 @@ abstract class AviTrackBacking implements InputTrackBacking {
 	abstract getType(): TrackType;
 	abstract getDecoderConfig(): Promise<VideoDecoderConfig | AudioDecoderConfig | null>;
 
-	getId(): number {
+	/** The 1-based index of the stream among the AVI's stream headers. */
+	getContainerTrackId(): number {
 		return this.streamInfo.index + 1;
 	}
 
@@ -522,6 +523,7 @@ class AviVideoTrackBacking extends AviTrackBacking implements InputVideoTrackBac
 				hevcCodecInfo: codec === 'hevc' && firstPacket
 					? extractHevcDecoderConfigurationRecord(firstPacket.data)
 					: null,
+				hevcType: 'hev1' as const, // AVI doesn't promise that parameter sets stay out of the chunks
 				vp9CodecInfo: codec === 'vp9' && firstPacket
 					? extractVp9CodecInfoFromPacket(firstPacket.data)
 					: null,

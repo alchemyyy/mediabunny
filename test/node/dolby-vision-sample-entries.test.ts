@@ -9,7 +9,8 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
 // FFmpeg-made streams under each Dolby Vision sample entry, and a Profile 10 AV1 stream with its dvvC box. Each reads
 // with the codec string Mediabunny derives from the configuration box of the entry's base layer, as for its base entry.
 const SAMPLE_ENTRIES = [
-	{ file: 'dvh1.mp4', sampleEntry: 'dvh1', codec: 'hevc', codecString: 'hev1.2.4.L30.90' },
+	// HEVC codec strings follow the sample entry since 1.66.0, and dvh1 is the Dolby Vision form of hvc1
+	{ file: 'dvh1.mp4', sampleEntry: 'dvh1', codec: 'hevc', codecString: 'hvc1.2.4.L30.90' },
 	{ file: 'dvhe.mp4', sampleEntry: 'dvhe', codec: 'hevc', codecString: 'hev1.2.4.L30.90' },
 	{ file: 'dva1.mp4', sampleEntry: 'dva1', codec: 'avc', codecString: 'avc1.64000a' },
 	{ file: 'dvav.mp4', sampleEntry: 'dvav', codec: 'avc', codecString: 'avc3.64000a' },

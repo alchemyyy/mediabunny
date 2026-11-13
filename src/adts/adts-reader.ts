@@ -8,7 +8,8 @@
 
 import { Bitstream } from '../../shared/bitstream';
 import { aacFrequencyTable } from '../../shared/aac-misc';
-import { FileSlice, readBytes, readU16Be } from '../reader';
+import { isThenable, MaybePromise, MaybeRelevantPromise, ResultValue } from '../misc';
+import { FileSlice, readBytes, Reader, readU16Be, readU8 } from '../reader';
 
 export const MIN_ADTS_FRAME_HEADER_SIZE = 7;
 export const MAX_ADTS_FRAME_HEADER_SIZE = 9;
@@ -21,6 +22,73 @@ export type AdtsFrameHeader = {
 	numberOfAacFrames: number;
 	crcCheck: number | null;
 	startPos: number;
+};
+
+const readConfirmedAdtsFrameHeaderInto = async (
+	res: ResultValue<AdtsFrameHeader | null>,
+	reader: Reader,
+	startPos: number,
+	searchLength: number,
+	ref: AdtsFrameHeader | null,
+): MaybeRelevantPromise => {
+	const headersMatch = (a: AdtsFrameHeader, b: AdtsFrameHeader) => a.objectType === b.objectType
+		&& a.samplingFrequencyIndex === b.samplingFrequencyIndex
+		&& a.channelConfiguration === b.channelConfiguration;
+
+	let slice = reader.requestSliceRange(
+		startPos,
+		MIN_ADTS_FRAME_HEADER_SIZE,
+		searchLength + MAX_ADTS_FRAME_HEADER_SIZE,
+	);
+	if (isThenable(slice)) slice = await slice;
+	if (!slice) {
+		return res.set(null);
+	}
+
+	// A header is only confirmed by what follows it, since sync words show up in junk all the time
+	for (let pos = startPos; pos < Math.min(startPos + searchLength, slice.end); pos++) {
+		slice.filePos = pos;
+		if (readU8(slice) !== 0xff) {
+			continue;
+		}
+
+		slice.filePos = pos;
+		const header = readAdtsFrameHeader(slice);
+		if (!header || (ref && !headersMatch(header, ref))) {
+			continue;
+		}
+
+		const frameEndPos = pos + header.frameLength;
+		if (frameEndPos === reader.fileSize) {
+			// The frame ends the file
+			return res.set(header);
+		}
+
+		let nextSlice = reader.requestSliceRange(frameEndPos, MIN_ADTS_FRAME_HEADER_SIZE, MAX_ADTS_FRAME_HEADER_SIZE);
+		if (isThenable(nextSlice)) nextSlice = await nextSlice;
+
+		const nextHeader = nextSlice && readAdtsFrameHeader(nextSlice);
+		if (nextHeader && headersMatch(header, nextHeader)) {
+			return res.set(header);
+		}
+	}
+
+	return res.set(null);
+};
+
+/**
+ * Finds the first ADTS frame header within a search length from a position that the next frame confirms,
+ * synchronously when the reader has the data at hand.
+ */
+export const readConfirmedAdtsFrameHeader = (
+	reader: Reader,
+	startPos: number,
+	searchLength: number,
+	ref: AdtsFrameHeader | null,
+): MaybePromise<AdtsFrameHeader | null> => {
+	const res = new ResultValue<AdtsFrameHeader | null>();
+	const promise = readConfirmedAdtsFrameHeaderInto(res, reader, startPos, searchLength, ref);
+	return res.pending ? promise.then(() => res.value) : res.value;
 };
 
 export const readAdtsFrameHeader = (slice: FileSlice): AdtsFrameHeader | null => {
@@ -55,9 +123,6 @@ export const readAdtsFrameHeader = (slice: FileSlice): AdtsFrameHeader | null =>
 
 	bitstream.skipBits(1); // Private bit
 	const channelConfiguration = bitstream.readBits(3);
-	if (channelConfiguration === 0) {
-		throw new Error('ADTS frames with channel configuration 0 are not supported.');
-	}
 
 	bitstream.skipBits(1); // Originality
 	bitstream.skipBits(1); // Home
@@ -67,7 +132,7 @@ export const readAdtsFrameHeader = (slice: FileSlice): AdtsFrameHeader | null =>
 	bitstream.skipBits(11); // Buffer fullness
 	const numberOfAacFrames = bitstream.readBits(2) + 1;
 	if (numberOfAacFrames !== 1) {
-		throw new Error('ADTS frames with more than one AAC frame are not supported.');
+		return null; // Not supported
 	}
 
 	let crcCheck: number | null = null;

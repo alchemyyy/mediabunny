@@ -302,7 +302,8 @@ test('Ogg demuxing', async () => {
 	await testBasicPacketReading(audioTrack, -128 / 44100);
 
 	const duration = await audioTrack.computeDuration();
-	expect(duration).toBeCloseTo(57.31360544217687);
+	// Main 1.66 removed Ogg end trimming, so the duration runs to the end of the last packet (same value on main)
+	expect(duration).toBeCloseTo(57.325714285714284);
 });
 
 test('Ogg sync reading', async () => {

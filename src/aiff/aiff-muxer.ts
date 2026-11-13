@@ -299,6 +299,11 @@ export class AiffMuxer extends Muxer {
 		using lock = this.mutex.lock();
 		if (lock.pending) await lock.ready;
 
+		// Pad the SSND chunk to an even size; its size field excludes the pad byte
+		if (this.dataSize & 1) {
+			this.writer.write(new Uint8Array(1));
+		}
+
 		const endPos = this.writer.getPos();
 
 		// Backfill FORM size (everything after the 8-byte FORM + size header).

@@ -36,7 +36,14 @@ import {
 } from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
-import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
+import {
+	aacChannelMap,
+	aacFrequencyTable,
+	AacProgramConfigElement,
+	buildAacAudioSpecificConfig,
+	getAacProgramConfigElementChannelCount,
+	readAdtsProgramConfigElement,
+} from '../../shared/aac-misc';
 import {
 	OPUS_PRE_ROLL_DURATION,
 	OPUS_SAMPLE_RATE,
@@ -59,6 +66,7 @@ import {
 	parseOpusTocByte,
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
+	splitEac3AudioFrames,
 } from '../codec-data';
 import { buildIsobmffMimeType, isReferencedTrackId, TIMESTAMP_OFFSET } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
@@ -108,7 +116,6 @@ export type IsobmffTrackData = {
 		firstChunk: number;
 		samplesPerChunk: number;
 	}[];
-	closed: boolean;
 
 	// 0 means unknown
 	avgBitrate: number;
@@ -148,6 +155,10 @@ export type IsobmffTrackData = {
 		 */
 		requiresAdtsStripping: boolean;
 		primingPacket: EncodedPacket | null;
+		pendingEac3Packets: {
+			packet: EncodedPacket;
+			blockCount: number;
+		}[];
 		preroll: {
 			packetCount: number;
 			accumulatedAudioSamples: number;
@@ -161,7 +172,11 @@ export type IsobmffTrackData = {
 		config: SubtitleConfig;
 	};
 	lastCueEndTimestamp: number | null;
-	cueQueue: SubtitleCue[];
+	cueQueue: {
+		cue: SubtitleCue;
+		start: number;
+		end: number;
+	}[];
 	allCues: SubtitleCue[];
 	nextSourceId: number;
 	cueToSourceId: WeakMap<SubtitleCue, number>;
@@ -238,6 +253,7 @@ export class IsobmffMuxer extends Muxer {
 	private ftypSize: number | null = null;
 
 	trackDatas: IsobmffTrackData[] = [];
+	private closedTracks = new Set<OutputTrack>();
 	private allTracksKnown = promiseWithResolvers();
 
 	creationTime!: number;
@@ -288,7 +304,7 @@ export class IsobmffMuxer extends Muxer {
 		if (!this.isCmaf) {
 			this.writer = await this.output._getRootWriter(target => (
 				this.formatOptions.fastStart !== undefined
-					? this.formatOptions.fastStart === 'fragmented'
+					? this.formatOptions.fastStart === 'in-memory' || this.formatOptions.fastStart === 'fragmented'
 					: target instanceof BufferTarget // Since if this is the case we'll use 'in-memory'
 			));
 			this.boxWriter = new IsobmffBoxWriter(this.writer);
@@ -409,7 +425,7 @@ export class IsobmffMuxer extends Muxer {
 
 	private allTracksAreKnown() {
 		for (const track of this.output.tracks) {
-			if (!track.source._closed && !this.trackDatas.some(x => x.track === track)) {
+			if (!this.closedTracks.has(track) && !this.trackDatas.some(x => x.track === track)) {
 				return false; // We haven't seen a sample from this open track yet
 			}
 		}
@@ -545,7 +561,6 @@ export class IsobmffMuxer extends Muxer {
 			finalizedChunks: [],
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
-			closed: false,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 		};
@@ -592,17 +607,31 @@ export class IsobmffMuxer extends Muxer {
 				);
 			}
 
-			const sampleRate = aacFrequencyTable[adtsFrame.samplingFrequencyIndex];
-			const numberOfChannels = aacChannelMap[adtsFrame.channelConfiguration];
+			let numberOfChannels: number;
+			let programConfigElement: AacProgramConfigElement | null = null;
+			if (adtsFrame.channelConfiguration === 0) {
+				// The channel layout is described by a PCE in the frame, which has to move into the description
+				const headerSize = adtsFrame.crcCheck === null
+					? MIN_ADTS_FRAME_HEADER_SIZE
+					: MAX_ADTS_FRAME_HEADER_SIZE;
+				const result = readAdtsProgramConfigElement(packet.data.subarray(headerSize));
+				if (!result) {
+					throw new Error(
+						'ADTS frames with channel configuration 0 must begin with a program config element.',
+					);
+				}
 
-			if (sampleRate === undefined || numberOfChannels === undefined) {
-				throw new Error('Invalid ADTS frame header.');
+				programConfigElement = result.programConfigElement;
+				numberOfChannels = getAacProgramConfigElementChannelCount(programConfigElement);
+			} else {
+				numberOfChannels = aacChannelMap[adtsFrame.channelConfiguration]!;
 			}
 
 			decoderConfig.description = buildAacAudioSpecificConfig({
 				objectType: adtsFrame.objectType,
-				outputSampleRate: sampleRate,
+				outputSampleRate: aacFrequencyTable[adtsFrame.samplingFrequencyIndex]!,
 				outputNumberOfChannels: numberOfChannels,
+				programConfigElement,
 			});
 			requiresAdtsStripping = true;
 		}
@@ -635,6 +664,7 @@ export class IsobmffMuxer extends Muxer {
 				expectedNextPcmPacketTimestamp: null,
 				requiresAdtsStripping,
 				primingPacket: packet,
+				pendingEac3Packets: [],
 				preroll: {
 					packetCount: 0,
 					accumulatedAudioSamples: 0,
@@ -653,7 +683,6 @@ export class IsobmffMuxer extends Muxer {
 			finalizedChunks: [],
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
-			closed: false,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 		};
@@ -698,7 +727,6 @@ export class IsobmffMuxer extends Muxer {
 			finalizedChunks: [],
 			currentChunk: null,
 			compactlyCodedChunkTable: [],
-			closed: false,
 			avgBitrate: track.source._nominalBitrate ?? track.metadata.averageBitrate ?? 0,
 			maxBitrate: track.source._nominalBitrate ?? track.metadata.bitrate ?? 0,
 
@@ -776,6 +804,14 @@ export class IsobmffMuxer extends Muxer {
 				? MIN_ADTS_FRAME_HEADER_SIZE
 				: MAX_ADTS_FRAME_HEADER_SIZE;
 			packetData = packetData.subarray(headerLength);
+
+			if (adtsFrame.channelConfiguration === 0) {
+				// The description already carries the PCE
+				const result = readAdtsProgramConfigElement(packetData);
+				if (result) {
+					packetData = packetData.subarray(result.size);
+				}
+			}
 		}
 
 		this.validateTimestamp(
@@ -783,6 +819,31 @@ export class IsobmffMuxer extends Muxer {
 			packet.timestamp,
 			packet.type === 'key',
 		);
+
+		if (track.source._codec === 'eac3') {
+			// An MP4 sample holds six blocks' worth of E-AC-3 frames (ETSI TS 102 366, Annex F), so shorter frames get
+			// merged
+			const frames = splitEac3AudioFrames(packetData);
+			const blockCount = frames
+				? frames.reduce((sum, frame) => sum + frame.blockCount, 0)
+				: 6; // Unparsable data counts as a whole sample
+
+			const pending = trackData.info.pendingEac3Packets;
+			const totalBlockCount = pending.reduce((sum, x) => sum + x.blockCount, 0) + blockCount;
+			if (totalBlockCount > 6) {
+				throw new Error('E-AC-3 frames must add up to exactly six blocks to be muxed into MP4 samples.');
+			}
+
+			pending.push({
+				packet,
+				blockCount,
+			});
+			if (totalBlockCount === 6) {
+				await this.writePendingEac3Packets(trackData);
+			}
+
+			return;
+		}
 
 		let timestamp = packet.timestamp;
 		let duration = packet.duration;
@@ -861,27 +922,29 @@ export class IsobmffMuxer extends Muxer {
 
 	private async padWithSilence(trackData: IsobmffAudioTrackData, timestamp: number, duration: number) {
 		const deltaInTimescale = intoTimescale(duration, trackData.timescale);
-		duration = deltaInTimescale / trackData.timescale;
+		const { sampleSize, silentValue } = parsePcmCodec(
+			trackData.info.decoderConfig.codec as PcmAudioCodec,
+		);
 
-		if (deltaInTimescale > 0) {
-			const { sampleSize, silentValue } = parsePcmCodec(
-				trackData.info.decoderConfig.codec as PcmAudioCodec,
-			);
-			const samplesNeeded = deltaInTimescale * trackData.info.numberOfChannels;
-			const data = new Uint8Array(sampleSize * samplesNeeded).fill(silentValue);
+		// Pad at most a second at a time so long gaps don't need huge allocations
+		const bytesPerFrame = sampleSize * trackData.info.numberOfChannels;
+		const silence = new Uint8Array(bytesPerFrame * Math.min(deltaInTimescale, trackData.timescale))
+			.fill(silentValue);
 
+		for (let offset = 0; offset < deltaInTimescale; offset += trackData.timescale) {
+			const frameCount = Math.min(deltaInTimescale - offset, trackData.timescale);
 			const paddingSample = this.createSampleForTrack(
 				trackData,
-				new Uint8Array(data.buffer),
-				timestamp,
-				duration,
+				silence.subarray(0, bytesPerFrame * frameCount),
+				timestamp + offset / trackData.timescale,
+				frameCount / trackData.timescale,
 				'key',
 				0,
 			);
 			await this.registerSample(trackData, paddingSample);
 		}
 
-		return duration;
+		return deltaInTimescale / trackData.timescale;
 	}
 
 	async addSubtitleCue(track: OutputSubtitleTrack, cue: SubtitleCue, meta?: SubtitleMetadata) {
@@ -894,11 +957,29 @@ export class IsobmffMuxer extends Muxer {
 		this.validateTimestamp(trackData.track, cue.timestamp, true);
 
 		if (track.source._codec === 'webvtt') {
-			trackData.cueQueue.push(cue);
 			if (this.isChapterTrack(trackData)) {
+				// Every chapter cue becomes a sample of its own, one without a duration too
+				trackData.cueQueue.push({
+					cue,
+					start: cue.timestamp,
+					end: cue.timestamp + cue.duration,
+				});
 				await this.processChapterTextCues(trackData, cue.timestamp);
 			} else {
-				await this.processWebVTTCues(trackData, cue.timestamp);
+				// Snapping to the timescale makes touching cues compare equal despite floating point error
+				const start = intoTimescale(cue.timestamp, trackData.timescale) / trackData.timescale;
+				const end = intoTimescale(cue.timestamp + cue.duration, trackData.timescale) / trackData.timescale;
+
+				// Cues without duration are never visible and can't be laid out into samples, so they're dropped
+				if (end > start) {
+					trackData.cueQueue.push({
+						cue,
+						start,
+						end,
+					});
+				}
+
+				await this.processWebVTTCues(trackData, start);
 			}
 		} else {
 			// TODO
@@ -910,15 +991,15 @@ export class IsobmffMuxer extends Muxer {
 		// overlapping samples require special logic. The algorithm produces the format specified in ISO 14496-30.
 
 		while (trackData.cueQueue.length > 0) {
-			trackData.lastCueEndTimestamp ??= Math.min(0, trackData.cueQueue[0]!.timestamp);
+			trackData.lastCueEndTimestamp ??= Math.min(0, trackData.cueQueue[0]!.start);
 
 			const timestamps = new Set<number>([]);
-			for (const cue of trackData.cueQueue) {
-				assert(cue.timestamp <= until);
-				assert(trackData.lastCueEndTimestamp <= cue.timestamp + cue.duration);
+			for (const { start, end } of trackData.cueQueue) {
+				assert(start <= until);
+				assert(trackData.lastCueEndTimestamp <= end);
 
-				timestamps.add(Math.max(cue.timestamp, trackData.lastCueEndTimestamp)); // Start timestamp
-				timestamps.add(cue.timestamp + cue.duration); // End timestamp
+				timestamps.add(Math.max(start, trackData.lastCueEndTimestamp)); // Start timestamp
+				timestamps.add(end); // End timestamp
 			}
 
 			const sortedTimestamps = [...timestamps].sort((a, b) => a - b);
@@ -954,18 +1035,17 @@ export class IsobmffMuxer extends Muxer {
 			this.auxWriter.seek(0);
 
 			for (let i = 0; i < trackData.cueQueue.length; i++) {
-				const cue = trackData.cueQueue[i]!;
+				const { cue, start, end } = trackData.cueQueue[i]!;
 
-				if (cue.timestamp >= sampleEnd) {
+				if (start >= sampleEnd) {
 					break;
 				}
 
 				inlineTimestampRegex.lastIndex = 0;
 				const containsTimestamp = inlineTimestampRegex.test(cue.text);
 
-				const endTimestamp = cue.timestamp + cue.duration;
 				let sourceId = trackData.cueToSourceId.get(cue);
-				if (sourceId === undefined && sampleEnd < endTimestamp) {
+				if (sourceId === undefined && sampleEnd < end) {
 					// We know this cue will appear in more than one sample, therefore we need to mark it with a
 					// unique ID
 					sourceId = trackData.nextSourceId++;
@@ -987,7 +1067,7 @@ export class IsobmffMuxer extends Muxer {
 				);
 				this.auxBoxWriter.writeBox(box);
 
-				if (endTimestamp === sampleEnd) {
+				if (end === sampleEnd) {
 					// The cue won't appear in any future sample, so we're done with it
 					trackData.cueQueue.splice(i--, 1);
 				}
@@ -1054,8 +1134,8 @@ export class IsobmffMuxer extends Muxer {
 	}
 
 	private async processChapterTextCues(trackData: IsobmffSubtitleTrackData, until: number) {
-		while (trackData.cueQueue.length > 0 && trackData.cueQueue[0]!.timestamp <= until) {
-			const cue = trackData.cueQueue.shift()!;
+		while (trackData.cueQueue.length > 0 && trackData.cueQueue[0]!.start <= until) {
+			const { cue } = trackData.cueQueue.shift()!;
 			const cueDuration = Math.max(cue.duration, 0.001);
 			const sample = this.createSampleForTrack(
 				trackData,
@@ -1267,7 +1347,7 @@ export class IsobmffMuxer extends Muxer {
 				if (trackData.samples.length > maximumPacketCount) {
 					throw new Error(
 						`Track #${trackData.track.id} has already reached the maximum packet count`
-						+ ` (${maximumPacketCount}). Either add less packets or increase the maximum packet count.`,
+						+ ` (${maximumPacketCount}). Either add fewer packets or increase the maximum packet count.`,
 					);
 				}
 			}
@@ -1299,13 +1379,18 @@ export class IsobmffMuxer extends Muxer {
 						return firstQueuedSample.type === 'key';
 					}
 
-					return otherTrackData.closed;
+					return this.closedTracks.has(otherTrackData.track);
 				});
+
+				// The first fragment comes with the moov box, whose edit lists need the start offset of every track
+				const startOffsetsKnown = this.wroteFragmentedHeader
+					|| this.trackDatas.every(x => x.startTimestampOffset !== null || this.closedTracks.has(x.track));
 
 				if (
 					currentChunkDuration >= this.minimumFragmentDuration
 					&& keyFrameQueuedEverywhere
 					&& sample.timestamp > this.maxWrittenTimestamp
+					&& startOffsetsKnown
 				) {
 					beginNewChunk = true;
 					await this.finalizeFragment();
@@ -1409,7 +1494,7 @@ export class IsobmffMuxer extends Muxer {
 			let minTimestamp = Infinity;
 
 			for (const trackData of this.trackDatas) {
-				if (!isFinalCall && trackData.sampleQueue.length === 0 && !trackData.closed) {
+				if (!isFinalCall && trackData.sampleQueue.length === 0 && !this.closedTracks.has(trackData.track)) {
 					break outer;
 				}
 
@@ -1500,6 +1585,8 @@ export class IsobmffMuxer extends Muxer {
 			assert(trackData.currentChunk);
 			assert(trackData.startTimestampOffset !== null);
 
+			fragmentStartTimestamp = Math.min(fragmentStartTimestamp, trackData.currentChunk.startTimestamp);
+
 			trackData.currentChunk.offset = currentPos;
 			trackData.currentChunk.moofOffset = moofOffset;
 			trackData.currentChunk.trafIndex = i;
@@ -1511,11 +1598,9 @@ export class IsobmffMuxer extends Muxer {
 				sample.timestamp -= trackData.startTimestampOffset;
 				sample.decodeTimestamp -= trackData.startTimestampOffset;
 			}
-
-			fragmentStartTimestamp = Math.min(fragmentStartTimestamp, trackData.currentChunk.startTimestamp);
 		}
 
-		const mdatSize = currentPos - mdatStartPos;
+		let mdatSize = currentPos - mdatStartPos;
 		const needsLargeMdatSize = mdatSize >= 2 ** 32;
 
 		if (needsLargeMdatSize) {
@@ -1524,6 +1609,15 @@ export class IsobmffMuxer extends Muxer {
 			for (const trackData of tracksInFragment) {
 				trackData.currentChunk!.offset! += MAX_BOX_HEADER_SIZE - MIN_BOX_HEADER_SIZE;
 			}
+
+			mdatSize += MAX_BOX_HEADER_SIZE - MIN_BOX_HEADER_SIZE;
+		}
+
+		// trun's data offset is a signed 32-bit integer relative to the moof
+		if (last(tracksInFragment)!.currentChunk!.offset! - moofOffset >= 2 ** 31) {
+			throw new Error(
+				'The data of a fragment\'s track must start less than 2 GiB after its moof box; use shorter fragments.',
+			);
 		}
 
 		if (this.formatOptions.onMoof) {
@@ -1635,23 +1729,25 @@ export class IsobmffMuxer extends Muxer {
 		return upperBound;
 	}
 
-	// eslint-disable-next-line @typescript-eslint/no-misused-promises
 	override async onTrackClose(track: OutputTrack) {
 		using lock = this.mutex.lock();
 		if (lock.pending) await lock.ready;
 
 		const trackData = this.trackDatas.find(x => x.track === track);
-		if (trackData) {
-			trackData.closed = true;
-
-			if (trackData.type === 'subtitle' && track.source._codec === 'webvtt') {
-				if (this.isChapterTrack(trackData)) {
-					await this.processChapterTextCues(trackData, Infinity);
-				} else {
-					await this.processWebVTTCues(trackData, Infinity);
-				}
+		if (trackData?.type === 'subtitle' && track.source._codec === 'webvtt') {
+			if (this.isChapterTrack(trackData)) {
+				await this.processChapterTextCues(trackData, Infinity);
+			} else {
+				await this.processWebVTTCues(trackData, Infinity);
 			}
+		}
+		if (trackData?.type === 'audio' && trackData.info.pendingEac3Packets.length > 0) {
+			await this.writePendingEac3Packets(trackData);
+		}
 
+		this.closedTracks.add(track);
+
+		if (trackData) {
 			this.processTimestamps(trackData);
 		}
 
@@ -1704,6 +1800,26 @@ export class IsobmffMuxer extends Muxer {
 		await this.finalizeFragment();
 	}
 
+	private async writePendingEac3Packets(trackData: IsobmffAudioTrackData) {
+		const packets = trackData.info.pendingEac3Packets.map(x => x.packet);
+		trackData.info.pendingEac3Packets.length = 0;
+
+		let data = packets[0]!.data;
+		if (packets.length > 1) {
+			data = new Uint8Array(packets.reduce((sum, packet) => sum + packet.data.byteLength, 0));
+
+			let offset = 0;
+			for (const packet of packets) {
+				data.set(packet.data, offset);
+				offset += packet.data.byteLength;
+			}
+		}
+
+		const duration = packets.reduce((sum, packet) => sum + packet.duration, 0);
+		const sample = this.createSampleForTrack(trackData, data, packets[0]!.timestamp, duration, 'key', 0);
+		await this.registerSample(trackData, sample);
+	}
+
 	/** Finalizes the file, making it ready for use. Must be called after all video and audio chunks have been added. */
 	async finalize() {
 		using lock = this.mutex.lock();
@@ -1713,8 +1829,6 @@ export class IsobmffMuxer extends Muxer {
 		this.ensureOneEnabledTrack();
 
 		for (const trackData of this.trackDatas) {
-			trackData.closed = true;
-
 			if (trackData.type === 'subtitle' && trackData.track.source._codec === 'webvtt') {
 				if (this.isChapterTrack(trackData)) {
 					await this.processChapterTextCues(trackData, Infinity);
@@ -1722,7 +1836,11 @@ export class IsobmffMuxer extends Muxer {
 					await this.processWebVTTCues(trackData, Infinity);
 				}
 			}
+			if (trackData.type === 'audio' && trackData.info.pendingEac3Packets.length > 0) {
+				await this.writePendingEac3Packets(trackData);
+			}
 
+			this.closedTracks.add(trackData.track);
 			this.processTimestamps(trackData);
 		}
 
@@ -1791,17 +1909,24 @@ export class IsobmffMuxer extends Muxer {
 
 			// We know how many chunks there are, but computing the chunk positions requires an iterative approach:
 			// In order to know where the first chunk should go, we first need to know the size of the moov box. But we
-			// cannot write a proper moov box without first knowing all chunk positions. So, we generate a tentative
-			// moov box with placeholder values (0) for the chunk offsets to be able to compute its size. If it then
-			// turns out that appending all chunks exceeds 4 GiB, we need to repeat this process, now with the co64 box
-			// being used in the moov box instead, which will make it larger. After that, we definitely know the final
-			// size of the moov box and can compute the proper chunk positions.
+			// cannot write a proper moov box without first knowing all chunk positions, since tracks with chunks past
+			// 4 GiB need the larger co64 box, and a large mdat needs a larger header. So, we measure the boxes, place
+			// the chunks after them, and repeat until the measured sizes stop changing. This converges eventually:
+			// boxes only ever switch to their larger variants, which pushes the chunks further back, so they can never
+			// switch back.
 
-			for (let i = 0; i < 2; i++) {
-				const movieBox = moov(this);
-				const movieBoxSize = this.boxWriter.measureBox(movieBox);
-				mdatSize = this.boxWriter.measureBox(this.mdat);
-				let currentChunkPos = this.writer.getPos() + movieBoxSize + mdatSize;
+			let previousHeaderSize: number | null = null;
+			while (true) {
+				const movieBoxSize = this.boxWriter.measureBox(moov(this));
+				const mdatHeaderSize = this.boxWriter.measureBox(this.mdat);
+				const headerSize = movieBoxSize + mdatHeaderSize;
+				if (headerSize === previousHeaderSize) {
+					break;
+				}
+				previousHeaderSize = headerSize;
+
+				mdatSize = mdatHeaderSize;
+				let currentChunkPos = this.writer.getPos() + headerSize;
 
 				for (const chunk of this.finalizedChunks) {
 					chunk.offset = currentChunkPos;
@@ -1812,8 +1937,9 @@ export class IsobmffMuxer extends Muxer {
 					}
 				}
 
-				if (currentChunkPos < 2 ** 32) break;
-				if (mdatSize >= 2 ** 32) this.mdat.largeSize = true;
+				if (mdatSize >= 2 ** 32) {
+					this.mdat.largeSize = true;
+				}
 			}
 
 			if (this.formatOptions.onMoov) {
@@ -1841,6 +1967,8 @@ export class IsobmffMuxer extends Muxer {
 					this.writer.write(sample.data);
 					sample.data = null;
 				}
+
+				await this.writer.flush(); // Flush now so that the target doesn't buffer excessively
 			}
 
 			if (this.formatOptions.onMdat) {
@@ -1852,6 +1980,11 @@ export class IsobmffMuxer extends Muxer {
 				const contentSize = this.segmentHeaderSize !== null
 					? this.writer.getPos() - this.segmentHeaderSize
 					: 0;
+				if (contentSize >= 2 ** 31) {
+					throw new Error(
+						'CMAF segments must be smaller than 2 GiB, as their sidx box can\'t index anything larger.',
+					);
+				}
 
 				this.writer.seek(0);
 
@@ -1898,21 +2031,17 @@ export class IsobmffMuxer extends Muxer {
 					);
 				}
 
-				this.writer.seek(this.ftypSize);
-
-				if (this.formatOptions.onMoov) {
-					this.writer.startTrackingWrites();
-				}
-
-				this.boxWriter.writeBox(movieBox);
+				// The free box fills up the rest of the reserved space, behind the moov box
+				this.writer.seek(this.ftypSize + moovSize);
 				this.boxWriter.writeBox(free(reservedSpace - moovSize));
-			} else {
-				if (this.formatOptions.onMoov) {
-					this.writer.startTrackingWrites();
-				}
-
-				this.boxWriter.writeBox(movieBox);
+				this.writer.seek(this.ftypSize);
 			}
+
+			if (this.formatOptions.onMoov) {
+				this.writer.startTrackingWrites();
+			}
+
+			this.boxWriter.writeBox(movieBox);
 
 			if (this.formatOptions.onMoov) {
 				const { data, start } = this.writer.stopTrackingWrites();

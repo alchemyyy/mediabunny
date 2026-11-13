@@ -83,7 +83,10 @@ export class Mp3Muxer extends Muxer {
 				throw new Error('Invalid MP3 header in sample.');
 			}
 
-			if (!this.xingFrameData) {
+			if (!this.xingFrameData && header.layer !== 1) {
+				// Xing frames only exist for Layer III; with Layers I and II, decoders would play one as audio
+				this.writeXingHeader = false;
+			} else if (!this.xingFrameData) {
 				const xingOffset = getXingOffset(header.mpegVersionId, header.channel);
 				if (view.byteLength >= xingOffset + 4) {
 					const word = view.getUint32(xingOffset, false);
@@ -113,6 +116,7 @@ export class Mp3Muxer extends Muxer {
 					copyright: header.copyright,
 					original: header.original,
 					emphasis: header.emphasis,
+					targetBitrate: header.bitrate,
 
 					isCbr: false,
 					frameCount: null,
@@ -126,8 +130,6 @@ export class Mp3Muxer extends Muxer {
 				// frame do we know whether it should say Xing or Info.
 				this.xingFramePos = this.writer.getPos();
 				this.mp3Writer.writeXingFrame(this.xingFrameData);
-
-				this.frameCount++;
 			}
 
 			if (this.frameBitrate === null) {
@@ -197,6 +199,7 @@ export class Mp3Muxer extends Muxer {
 					copyright: header.copyright,
 					original: header.original,
 					emphasis: header.emphasis,
+					targetBitrate: header.bitrate,
 
 					isCbr: false,
 					frameCount: null,
@@ -235,6 +238,7 @@ export class Mp3Muxer extends Muxer {
 					copyright: 0,
 					original: 0,
 					emphasis: 0,
+					targetBitrate: null,
 
 					isCbr: false,
 					frameCount: null,
@@ -252,8 +256,6 @@ export class Mp3Muxer extends Muxer {
 
 			this.xingFramePos = this.writer.getPos();
 			this.mp3Writer.writeXingFrame(this.xingFrameData);
-
-			this.frameCount++;
 		}
 
 		if (this.writeXingHeader) {

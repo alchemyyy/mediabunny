@@ -26,6 +26,7 @@ import {
 	addAvcBitstreamRestriction,
 	AvcNalUnitType,
 	concatAvcNalUnits,
+	countShownVideoFrames,
 	deserializeAvcDecoderConfigurationRecord,
 	determineVideoPacketType,
 	extractNalUnitTypeForAvc,
@@ -56,6 +57,7 @@ import {
 	promiseWithResolvers,
 	removeItem,
 	Rotation,
+	roundToDivisor,
 	SetOptional,
 	toDataView,
 	toUint8Array,
@@ -175,27 +177,33 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 						toUint8Array(this.decoderConfig.description),
 					);
 					if (record && record.sequenceParameterSets.length > 0) {
-						const sps = parseAvcSps(record.sequenceParameterSets[0]!);
-						if (sps) {
-							if (sps.frameMbsOnlyFlag === 0) {
-								// Chromium has/had a bug with playing interlaced AVC
-								// (https://issues.chromium.org/issues/456919096) which can be worked around by
-								// requesting that software decoding be used. So, here we peek into the AVC description,
-								// if present, and switch to software decoding if we find interlaced content.
-								this.decoderConfig = {
-									...this.decoderConfig,
-									hardwareAcceleration: 'prefer-software',
-								};
-							}
+						const firstSps = parseAvcSps(record.sequenceParameterSets[0]!);
+						if (firstSps && firstSps.frameMbsOnlyFlag === 0) {
+							// Chromium has/had a bug with playing interlaced AVC
+							// (https://issues.chromium.org/issues/456919096) which can be worked around by
+							// requesting that software decoding be used. So, here we peek into the AVC description,
+							// if present, and switch to software decoding if we find interlaced content.
+							this.decoderConfig = {
+								...this.decoderConfig,
+								hardwareAcceleration: 'prefer-software',
+							};
+						}
 
-							if (sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
-								// Modify the SPS to fix potential loss of B frames
-								record.sequenceParameterSets[0] = addAvcBitstreamRestriction(sps);
-								this.decoderConfig = {
-									...this.decoderConfig,
-									description: serializeAvcDecoderConfigurationRecord(record),
-								};
+						// Modify the SPSs to fix potential loss of B frames
+						let recordModified = false;
+						for (let i = 0; i < record.sequenceParameterSets.length; i++) {
+							const sps = parseAvcSps(record.sequenceParameterSets[i]!);
+							if (sps && sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+								record.sequenceParameterSets[i] = addAvcBitstreamRestriction(sps);
+								recordModified = true;
 							}
+						}
+
+						if (recordModified) {
+							this.decoderConfig = {
+								...this.decoderConfig,
+								description: serializeAvcDecoderConfigurationRecord(record),
+							};
 						}
 					}
 				}
@@ -293,62 +301,18 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			assert(this.decoder);
 
 			if (!isWebKit()) {
-				insertSorted(this.inputTimestamps, packet.timestamp, x => x);
+				// It is important that we don't add timestamps for packets that won't produce a frame. If we did, it
+				// would offset everything. See https://github.com/Vanilagy/mediabunny/issues/642.
+				const shownFrameCount = countShownVideoFrames(this.codec, packet.data);
+				for (let i = 0; i < shownFrameCount; i++) {
+					insertSorted(this.inputTimestamps, packet.timestamp, x => x);
+				}
 			}
 
 			if (isChromium() && this.currentPacketIndex === 0) {
-				if (this.codec === 'avc') {
-					// Workaround for https://issues.chromium.org/issues/470109459
-					const filteredNalUnits: Uint8Array[] = [];
-					let hasFrameData = false;
-
-					for (const loc of iterateAvcNalUnits(packet.data, this.decoderConfig)) {
-						const type = extractNalUnitTypeForAvc(packet.data[loc.offset]!);
-						hasFrameData ||= type >= 1 && type <= 5;
-
-						if (type === AvcNalUnitType.AUD) {
-							if (hasFrameData) {
-								// Already has actual frame data, so treat an AUD as simply the end of the packet
-								break;
-							} else {
-								// If packets contain an AUD and have NALUs before it, this trips up Chromium's key
-								// frame detector. Clear the NALUs if an AUD is encountered.
-								// https://github.com/Vanilagy/mediabunny/issues/396
-								filteredNalUnits.length = 0;
-							}
-						}
-
-						// These trip up Chromium's key frame detection, so let's strip them
-						if (!(type >= 20 && type <= 31)) {
-							filteredNalUnits.push(packet.data.subarray(loc.offset, loc.offset + loc.length));
-						}
-					}
-
-					if (!this.decoderConfig.description) {
-						// Do SPS fixups if necessary
-						for (let i = 0; i < filteredNalUnits.length; i++) {
-							const nalUnit = filteredNalUnits[i]!;
-							if (extractNalUnitTypeForAvc(nalUnit[0]!) !== AvcNalUnitType.SPS) {
-								continue;
-							}
-
-							const sps = parseAvcSps(nalUnit);
-							if (sps && sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
-								filteredNalUnits[i] = addAvcBitstreamRestriction(sps);
-							}
-
-							break;
-						}
-					}
-
-					const newData = concatAvcNalUnits(filteredNalUnits, this.decoderConfig);
-					packet = new EncodedPacket(newData, packet.type, packet.timestamp, packet.duration);
-				} else if (this.codec === 'hevc') {
-					// Workaround for https://issues.chromium.org/issues/507611247
-					const sanitizedData = sanitizeHevcPacketForChromium(packet.data, this.decoderConfig);
-					if (sanitizedData) {
-						packet = new EncodedPacket(sanitizedData, packet.type, packet.timestamp, packet.duration);
-					}
+				const fixedData = this.fixFirstPacketDataForChromium(packet.data);
+				if (fixedData) {
+					packet = packet.clone({ data: fixedData });
 				}
 			}
 
@@ -456,11 +420,76 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				this.alphaRaslSkipped = true;
 			}
 
+			// The alpha decoder is a decoder of its own, so its first packet needs the same treatment
+			if (isChromium() && this.currentAlphaPacketIndex === 0) {
+				const fixedData = this.fixFirstPacketDataForChromium(packet.sideData.alpha);
+				if (fixedData) {
+					packet = packet.clone({
+						sideData: {
+							...packet.sideData,
+							alpha: fixedData,
+						},
+					});
+				}
+			}
+
 			this.currentAlphaPacketIndex++;
 			this.alphaDecoder.decode(packet.alphaToEncodedVideoChunk(type ?? packet.type));
 			this.alphaDecoderQueueSize++;
 		} else {
 			this.pushNullAlphaFrame();
+		}
+	}
+
+	fixFirstPacketDataForChromium(data: Uint8Array) {
+		if (this.codec === 'avc') {
+			// Workaround for https://issues.chromium.org/issues/470109459
+			const filteredNalUnits: Uint8Array[] = [];
+			let hasFrameData = false;
+
+			for (const loc of iterateAvcNalUnits(data, this.decoderConfig)) {
+				const type = extractNalUnitTypeForAvc(data[loc.offset]!);
+				hasFrameData ||= type >= 1 && type <= 5;
+
+				if (type === AvcNalUnitType.AUD) {
+					if (hasFrameData) {
+						// Already has actual frame data, so treat an AUD as simply the end of the packet
+						break;
+					} else {
+						// If packets contain an AUD and have NALUs before it, this trips up Chromium's key frame
+						// detector. Clear the NALUs if an AUD is encountered.
+						// https://github.com/Vanilagy/mediabunny/issues/396
+						filteredNalUnits.length = 0;
+					}
+				}
+
+				// These trip up Chromium's key frame detection, so let's strip them
+				if (!(type >= 20 && type <= 31)) {
+					filteredNalUnits.push(data.subarray(loc.offset, loc.offset + loc.length));
+				}
+			}
+
+			if (!this.decoderConfig.description) {
+				// Do SPS fixups if necessary
+				for (let i = 0; i < filteredNalUnits.length; i++) {
+					const nalUnit = filteredNalUnits[i]!;
+					if (extractNalUnitTypeForAvc(nalUnit[0]!) !== AvcNalUnitType.SPS) {
+						continue;
+					}
+
+					const sps = parseAvcSps(nalUnit);
+					if (sps && sps.maxDecFrameBuffering !== 0 && sps.bitstreamRestrictionFlag !== 1) {
+						filteredNalUnits[i] = addAvcBitstreamRestriction(sps);
+					}
+				}
+			}
+
+			return concatAvcNalUnits(filteredNalUnits, this.decoderConfig);
+		} else if (this.codec === 'hevc') {
+			// Workaround for https://issues.chromium.org/issues/507611247
+			return sanitizeHevcPacketForChromium(data, this.decoderConfig);
+		} else {
+			return null;
 		}
 	}
 
@@ -572,6 +601,12 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 		} catch (error) {
 			removeItem(this.finalFrames, result);
 			finalFrameRemoved = true;
+
+			// Frames that finished merging after this one were waiting on it and would be stuck forever otherwise
+			while (this.finalFrames.length > 0 && this.finalFrames[0]!.frame !== null) {
+				this.finalFrames.shift()!.frame!.close();
+			}
+
 			this.onError(error);
 		} finally {
 			removeItem(this.mergeAlphaPromises, resolver.promise);
@@ -655,6 +690,8 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 			}
 			await Promise.all(this.mergeAlphaPromises);
 
+			this.inputTimestamps.length = 0;
+
 			this.colorQueue.forEach(x => x.close());
 			this.colorQueue.length = 0;
 			this.alphaQueue.forEach(x => x?.close());
@@ -730,7 +767,7 @@ export class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 let mergerWorkerUrl: string | null = null;
 
 /** Utility class that merges together color and alpha information on the CPU in a pool of workers. */
-class ColorAlphaMerger {
+export class ColorAlphaMerger {
 	private workers: Worker[] = [];
 	private nextWorkerIndex = 0;
 	private pendingRequests = new Map<number, ReturnType<typeof promiseWithResolvers<VideoFrame>>>();
@@ -754,6 +791,10 @@ class ColorAlphaMerger {
 					const data = event.data;
 					const pending = this.pendingRequests.get(data.id);
 					if (!pending) {
+						if ('frame' in data) {
+							data.frame.close(); // So it's still closed
+						}
+
 						return;
 					}
 					this.pendingRequests.delete(data.id);
@@ -896,6 +937,9 @@ const colorAlphaMergerWorkerCode = () => {
 			format: outputFormat,
 			codedWidth: width,
 			codedHeight: height,
+			displayWidth: color.displayWidth,
+			displayHeight: color.displayHeight,
+			colorSpace: color.colorSpace.toJSON(),
 			timestamp: color.timestamp,
 			duration: color.duration ?? undefined,
 			transfer: [output.buffer],
@@ -954,6 +998,9 @@ const colorAlphaMergerWorkerCode = () => {
 			format: outputFormat,
 			codedWidth: width,
 			codedHeight: height,
+			displayWidth: color.displayWidth,
+			displayHeight: color.displayHeight,
+			colorSpace: color.colorSpace.toJSON(),
 			timestamp: color.timestamp,
 			duration: color.duration ?? undefined,
 			transfer: [output.buffer],
@@ -1001,6 +1048,9 @@ const colorAlphaMergerWorkerCode = () => {
 			format: 'I420A',
 			codedWidth: width,
 			codedHeight: height,
+			displayWidth: color.displayWidth,
+			displayHeight: color.displayHeight,
+			colorSpace: color.colorSpace.toJSON(),
 			timestamp: color.timestamp,
 			duration: color.duration ?? undefined,
 			transfer: [output.buffer],
@@ -1388,6 +1438,10 @@ export class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		const numberOfFrames = Math.floor(
 			packet.byteLength / this.decoderConfig.numberOfChannels / this.inputSampleSize,
 		);
+		if (numberOfFrames === 0) {
+			// Skip empty samples, just like the regular decoder does
+			return;
+		}
 
 		const outputBufferSize = numberOfFrames * this.decoderConfig.numberOfChannels * this.outputSampleSize;
 		const outputBuffer = new ArrayBuffer(outputBufferSize);
@@ -1410,20 +1464,22 @@ export class PcmAudioDecoderWrapper extends DecoderWrapper<AudioSample> {
 		const preciseTimestamp = this.currentTimestamp;
 		this.currentTimestamp += preciseDuration;
 
+		const sampleRate = this.decoderConfig.sampleRate;
 		const audioSample = new AudioSample({
 			format: this.outputFormat,
 			data: outputBuffer,
 			numberOfChannels: this.decoderConfig.numberOfChannels,
-			sampleRate: this.decoderConfig.sampleRate,
+			sampleRate,
 			numberOfFrames,
-			timestamp: preciseTimestamp,
+			timestamp: roundToDivisor(preciseTimestamp, sampleRate),
+			_doNotCopy: true,
 		});
 
 		this.onSample(audioSample);
 	}
 
 	async flush() {
-		// Do nothing
+		this.currentTimestamp = null;
 	}
 
 	close() {
@@ -1524,7 +1580,7 @@ const validateAudioDecodingConfig = (
  * @group Decoding
  * @public
  */
-export const canDecode = (codec: MediaCodec) => {
+export const canDecode = async (codec: MediaCodec) => {
 	if ((VIDEO_CODECS as readonly string[]).includes(codec)) {
 		return canDecodeVideo(codec as VideoCodec);
 	} else if ((AUDIO_CODECS as readonly string[]).includes(codec)) {
@@ -1549,15 +1605,17 @@ export const canDecodeVideo = async (
 
 	validateVideoDecodingConfig(codec, options);
 
+	const codedWidth = options.codedWidth ?? 1280;
+	const codedHeight = options.codedHeight ?? 720;
 	const resolvedOptions: VideoDecoderConfig = {
 		...options,
-		codedWidth: options.codedWidth ?? 1280,
-		codedHeight: options.codedHeight ?? 720,
-		codec: options.codec ?? buildVideoCodecString(codec, 1280, 720, 1e6, false),
+		codedWidth,
+		codedHeight,
+		codec: options.codec ?? buildVideoCodecString(codec, codedWidth, codedHeight, 1e6, false),
 	};
 	resolvedOptions.description ??= guessDescriptionForVideo(resolvedOptions);
 
-	const key = JSON.stringify(resolvedOptions);
+	const key = getDecoderConfigMemoKey(resolvedOptions);
 	const memoized = canDecodeVideoMemo.get(key);
 	if (memoized) {
 		return memoized;
@@ -1598,7 +1656,7 @@ export const canDecodeAudio = async (
 		...options,
 		numberOfChannels: options.numberOfChannels ?? 2,
 		sampleRate: options.sampleRate ?? 48000,
-		codec: options.codec ?? buildAudioCodecString(codec, 2, 48000),
+		codec: options.codec ?? buildAudioCodecString(codec),
 	};
 
 	if (resolvedOptions.description === undefined) {
@@ -1610,7 +1668,7 @@ export const canDecodeAudio = async (
 		resolvedOptions.description = generatedDescription;
 	}
 
-	const key = JSON.stringify(resolvedOptions);
+	const key = getDecoderConfigMemoKey(resolvedOptions);
 	const memoized = canDecodeAudioMemo.get(key);
 	if (memoized) {
 		return memoized;
@@ -1634,6 +1692,11 @@ export const canDecodeAudio = async (
 
 	return promise;
 };
+
+const getDecoderConfigMemoKey = (config: VideoDecoderConfig | AudioDecoderConfig) => JSON.stringify({
+	...config,
+	description: config.description && [...toUint8Array(config.description)], // So it gets serialized properly
+});
 
 /**
  * Returns the list of all media codecs that can be decoded by the browser.

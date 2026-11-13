@@ -213,6 +213,7 @@ test('MP4 chapter track references are written as tref/chap', async () => {
 				objectType: 2,
 				outputSampleRate: 24000,
 				outputNumberOfChannels: 1,
+				programConfigElement: null,
 			}),
 		},
 	});
@@ -276,6 +277,7 @@ test('MP4 can optionally write a udta/chpl chapter list for compatibility', asyn
 				objectType: 2,
 				outputSampleRate: 24000,
 				outputNumberOfChannels: 1,
+				programConfigElement: null,
 			}),
 		},
 	});
@@ -333,6 +335,7 @@ test('MP4 chapter format defaults to tref-only (no udta/chpl)', async () => {
 				objectType: 2,
 				outputSampleRate: 24000,
 				outputNumberOfChannels: 1,
+				programConfigElement: null,
 			}),
 		},
 	});
@@ -372,6 +375,7 @@ test('non-chapter WebVTT subtitle tracks stay as wvtt', async () => {
 				objectType: 2,
 				outputSampleRate: 24000,
 				outputNumberOfChannels: 1,
+				programConfigElement: null,
 			}),
 		},
 	});

@@ -17,6 +17,7 @@ const getCodecString = (codecDescription: Uint8Array) => extractVideoCodecString
 	colorSpace: null,
 	avcType: 1,
 	avcCodecInfo: null,
+	hevcType: null,
 	hevcCodecInfo: null,
 	vp9CodecInfo: null,
 	av1CodecInfo: null,

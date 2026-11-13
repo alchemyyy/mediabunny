@@ -26,6 +26,7 @@ import {
 	IDENTITY_MATRIX,
 	MaybeRelevantPromise,
 	ResultValue,
+	roundIfAlmostInteger,
 	TransformationMatrix,
 	UNDETERMINED_LANGUAGE,
 } from '../misc';
@@ -216,7 +217,8 @@ abstract class AsfTrackBacking implements InputTrackBacking {
 	/** The duration of a media object, in seconds. */
 	abstract getObjectDuration(object: MediaObject): Promise<number>;
 
-	getId(): number {
+	/** The ASF stream number. */
+	getContainerTrackId(): number {
 		return this.streamInfo.number;
 	}
 
@@ -492,6 +494,7 @@ class AsfVideoTrackBacking extends AsfTrackBacking implements InputVideoTrackBac
 				hevcCodecInfo: codec === 'hevc' && firstPacket
 					? extractHevcDecoderConfigurationRecord(firstPacket.data)
 					: null,
+				hevcType: 'hev1' as const, // ASF doesn't promise that parameter sets stay out of the payloads
 				vp9CodecInfo: null,
 				av1CodecInfo: null,
 				proresCodecInfo: null,
@@ -1309,7 +1312,7 @@ export class AsfDemuxer extends Demuxer {
 	 * by the time: the search bisects the data packets by send time, then reads back from there in growing windows.
 	 */
 	async findLastObject(stream: StreamInfo, timestamp: number, keyOnly: boolean): Promise<MediaObject | null> {
-		const target = timestamp * 1000 + this.preroll;
+		const target = roundIfAlmostInteger(timestamp * 1000) + this.preroll;
 
 		if (keyOnly) {
 			await (this.indexPromise ??= this.readIndexes());

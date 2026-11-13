@@ -1,17 +1,20 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
 import { assert } from '../../src/misc.js';
-import { AudioSampleCursor, VideoSampleCursor } from '../../src/cursors.js';
-import { PacketReader } from '../../src/packet.js';
+import { AudioSampleCursor, PacketCursor, VideoSampleCursor } from '../../src/cursors.js';
+import { EncodedPacket, PacketReader } from '../../src/packet.js';
+import { ColorAlphaMerger } from '../../src/decode.js';
 import { Output } from '../../src/output.js';
-import { MpegTsOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, MpegTsOutputFormat, WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
 import { Conversion } from '../../src/conversion.js';
-import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
+import { AudioSample, AudioSampleCopyToOptions, VideoSample } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
-import { InputAudioTrack } from '../../src/input-track.js';
+import { InputAudioTrack, InputVideoTrack } from '../../src/input-track.js';
+import { EncodedVideoPacketSource, VideoSampleSource } from '../../src/media-source.js';
+import { Quality } from '../../src/encode.js';
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {
@@ -268,4 +271,376 @@ test('Consecutive seeks resolve while later timestamps are still unknown', async
 	}
 
 	expect(sampleTimestamps).toEqual([firstPacket.timestamp, secondPacket.timestamp]);
+});
+
+test('AVC alpha side data is decoded', async () => {
+	const output = new Output({
+		format: new MkvOutputFormat(),
+		target: new BufferTarget(),
+	});
+
+	const source = new VideoSampleSource({
+		codec: 'avc',
+		quality: new Quality('high'),
+		alpha: 'keep',
+	});
+	output.addVideoTrack(source);
+	await output.start();
+
+	const data = new Uint8Array(4 * 320 * 240);
+	for (let i = 0; i < data.length; i += 4) {
+		data[i] = 255;
+		data[i + 3] = 128;
+	}
+
+	for (let i = 0; i < 3; i++) {
+		using sample = new VideoSample(data, {
+			format: 'RGBA',
+			codedWidth: 320,
+			codedHeight: 240,
+			timestamp: i,
+			duration: 1,
+		});
+		await source.add(sample);
+	}
+
+	await output.finalize();
+
+	using input = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	await using cursor = new VideoSampleCursor(track);
+	let count = 0;
+	for await (const sample of cursor) {
+		expect(sample.hasAlpha).toBe(true);
+		count++;
+	}
+
+	expect(count).toBe(3);
+});
+
+test('Alpha merging is subject to backpressure', async () => {
+	using input = new Input({
+		source: new UrlSource('/transparency.webm'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// eslint-disable-next-line @typescript-eslint/unbound-method
+	const originalMerge = ColorAlphaMerger.prototype.merge;
+	let mergesInFlight = 0;
+	let maxMergesInFlight = 0;
+	ColorAlphaMerger.prototype.merge = async function (color, alpha) {
+		mergesInFlight++;
+		maxMergesInFlight = Math.max(maxMergesInFlight, mergesInFlight);
+
+		try {
+			return await originalMerge.call(this, color, alpha);
+		} finally {
+			mergesInFlight--;
+		}
+	};
+
+	let count = 0;
+	try {
+		await using cursor = new VideoSampleCursor(track);
+		// eslint-disable-next-line @typescript-eslint/no-unused-vars
+		for await (const sample of cursor) {
+			count++;
+		}
+	} finally {
+		ColorAlphaMerger.prototype.merge = originalMerge;
+	}
+
+	expect(count).toBe(541);
+	// Without backpressure, the merging falls behind the decoding and nearly the entire video piles up in memory
+	expect(maxMergesInFlight).toBeLessThan(32);
+});
+
+test('Samples merged behind a failed alpha merge are closed', async () => {
+	using input = new Input({
+		source: new UrlSource('/transparency.webm'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// Fail the first merge only once a later merge is done, so that its sample is stuck waiting behind it
+	// eslint-disable-next-line @typescript-eslint/unbound-method
+	const originalMerge = ColorAlphaMerger.prototype.merge;
+	const mergedFrames: VideoFrame[] = [];
+	let mergeCount = 0;
+	ColorAlphaMerger.prototype.merge = async function (color, alpha) {
+		if (mergeCount++ === 0) {
+			color.close();
+			alpha.close();
+
+			while (mergedFrames.length === 0) {
+				await new Promise(resolve => setTimeout(resolve, 10));
+			}
+
+			throw new Error('Merge failed');
+		}
+
+		const frame = await originalMerge.call(this, color, alpha);
+		mergedFrames.push(frame);
+		return frame;
+	};
+
+	try {
+		await using cursor = new VideoSampleCursor(track);
+		await expect((async () => cursor.next())()).rejects.toThrow('Merge failed');
+	} finally {
+		ColorAlphaMerger.prototype.merge = originalMerge;
+	}
+
+	// A closed frame has a null format
+	await vi.waitFor(() => expect(mergedFrames.filter(frame => frame.format !== null)).toEqual([]));
+});
+
+test('Anamorphic BT.601 video with alpha', async () => {
+	using input = new Input({
+		source: new UrlSource('/transparency.webm'),
+		formats: ALL_FORMATS,
+	});
+
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	using opaqueSample = await getAnamorphicBt601Sample(track, false);
+	using transparentSample = await getAnamorphicBt601Sample(track, true);
+
+	expect(opaqueSample.hasAlpha).toBe(false);
+	expect(transparentSample.hasAlpha).toBe(true);
+
+	expect(opaqueSample.squarePixelWidth).toBe(2560);
+	expect(transparentSample.squarePixelWidth).toBe(2560);
+	expect(transparentSample.colorSpace.toJSON()).toEqual(opaqueSample.colorSpace.toJSON());
+});
+
+const getAnamorphicBt601Sample = async (track: InputVideoTrack, keepAlpha: boolean) => {
+	const decoderConfig = await track.getDecoderConfig();
+	assert(decoderConfig);
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource('vp9');
+	output.addVideoTrack(source);
+	await output.start();
+
+	let meta: EncodedVideoChunkMetadata | undefined = {
+		decoderConfig: {
+			...decoderConfig,
+			colorSpace: {
+				primaries: 'smpte170m',
+				transfer: 'smpte170m',
+				matrix: 'smpte170m',
+				fullRange: true,
+			},
+			displayAspectWidth: 2 * decoderConfig.codedWidth!,
+			displayAspectHeight: decoderConfig.codedHeight!,
+		},
+	};
+	for await (const packet of new PacketCursor(track)) {
+		await source.add(keepAlpha ? packet : packet.clone({ sideData: {} }), meta);
+		meta = undefined;
+	}
+	await output.finalize();
+
+	using remuxedInput = new Input({
+		source: new BufferSource(output.target.buffer!),
+		formats: ALL_FORMATS,
+	});
+	const remuxedTrack = await remuxedInput.getPrimaryVideoTrack();
+	assert(remuxedTrack);
+
+	// The sample must outlive the cursor, so the cursor hands out a clone it doesn't close
+	await using cursor = new VideoSampleCursor(remuxedTrack, { closeSamples: false });
+	const sample = await cursor.seekTo(0.5);
+	assert(sample);
+
+	return sample;
+};
+
+test('Decoder error while alpha merges are in flight', async () => {
+	using input = new Input({
+		source: new BufferSource(await createBrokenSemiTransparentVideo()),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const decodedFrames: VideoFrame[] = [];
+	const OriginalVideoDecoder = VideoDecoder;
+	globalThis.VideoDecoder = class extends OriginalVideoDecoder {
+		constructor(init: VideoDecoderInit) {
+			super({
+				...init,
+				output: (frame) => {
+					decodedFrames.push(frame);
+					init.output(frame);
+				},
+			});
+		}
+	};
+
+	try {
+		// The opaque frames queue up behind the transparent ones still being merged when the decoder errors out
+		await expect(async () => {
+			await using cursor = new VideoSampleCursor(track);
+			for await (const sample of cursor) {
+				void sample;
+			}
+		}).rejects.toThrow('Decoding error');
+	} finally {
+		globalThis.VideoDecoder = OriginalVideoDecoder;
+	}
+
+	await new Promise(resolve => setTimeout(resolve, 500));
+	expect(decodedFrames.filter(x => x.format !== null).map(x => x.timestamp)).toEqual([]);
+});
+
+const createBrokenSemiTransparentVideo = async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new VideoSampleSource({
+		codec: 'vp9',
+		quality: new Quality('high'),
+		alpha: 'keep',
+	});
+	output.addVideoTrack(source);
+	await output.start();
+
+	for (let i = 0; i < 16; i++) {
+		using sample = new VideoSample(new Uint8Array(64 * 64 * 4).fill(128), {
+			format: i % 2 === 0 ? 'RGBA' : 'RGBX',
+			codedWidth: 64,
+			codedHeight: 64,
+			timestamp: i,
+			duration: 1,
+		});
+		await source.add(sample);
+	}
+	await output.finalize();
+
+	return replacePacket(output.target.buffer!, 10, packet => packet.clone({ data: new Uint8Array(64).fill(0xff) }));
+};
+
+test('Invisible VP8 frame followed by a seek', async () => {
+	using input = new Input({
+		source: new BufferSource(await createVp8VideoWithInvisibleFrame()),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	// Each timestamp lies in a different key frame interval. The frame at 0.3 is never shown; a v2 cursor seek
+	// resolves to the first sample at or after the target packet's timestamp (main's sink returned 0.2 instead).
+	await using cursor = new VideoSampleCursor(track);
+	const timestamps: (number | null)[] = [];
+	for (const timestamp of [0.3, 1.5, 2.5]) {
+		const sample = await cursor.seekTo(timestamp);
+		timestamps.push(sample?.timestamp ?? null);
+	}
+
+	expect(timestamps).toEqual([0.4, 1.5, 2.5]);
+});
+
+const createVp8VideoWithInvisibleFrame = async () => {
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new VideoSampleSource({
+		codec: 'vp8',
+		quality: new Quality('high'),
+		keyFrameInterval: 1,
+	});
+	output.addVideoTrack(source);
+	await output.start();
+
+	for (let i = 0; i < 30; i++) {
+		using sample = new VideoSample(new Uint8Array(64 * 64 * 4).fill(8 * i), {
+			format: 'RGBX',
+			codedWidth: 64,
+			codedHeight: 64,
+			timestamp: i / 10,
+			duration: 1 / 10,
+		});
+		await source.add(sample);
+	}
+	await output.finalize();
+
+	// Clearing the show_frame bit makes the decoder decode the frame without ever outputting it
+	return replacePacket(output.target.buffer!, 3, (packet) => {
+		const data = packet.data.slice();
+		data[0] = data[0]! & ~0x10;
+		return packet.clone({ data });
+	});
+};
+
+const replacePacket = async (
+	buffer: ArrayBuffer,
+	index: number,
+	replace: (packet: EncodedPacket) => EncodedPacket,
+) => {
+	using input = new Input({
+		source: new BufferSource(buffer),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	const codec = await track.getCodec();
+	assert(codec);
+
+	const output = new Output({
+		format: new WebMOutputFormat(),
+		target: new BufferTarget(),
+	});
+	const source = new EncodedVideoPacketSource(codec);
+	output.addVideoTrack(source);
+	await output.start();
+
+	let meta: EncodedVideoChunkMetadata | undefined = { decoderConfig: (await track.getDecoderConfig())! };
+	let packetIndex = 0;
+	for await (const packet of new PacketCursor(track)) {
+		await source.add(packetIndex === index ? replace(packet) : packet, meta);
+		meta = undefined;
+		packetIndex++;
+	}
+	await output.finalize();
+
+	return output.target.buffer!;
+};
+
+test('VP9 hidden frames stored as separate packets', async () => {
+	using input = new Input({
+		source: new UrlSource('/vp9-hidden-frames.mkv'),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryVideoTrack();
+	assert(track);
+
+	await using cursor = new VideoSampleCursor(track);
+	const timestamps: number[] = [];
+	for await (const sample of cursor) {
+		timestamps.push(sample.timestamp);
+	}
+
+	// Hidden-frame packets don't mess with the timestamps:
+	expect(timestamps).toHaveLength(60);
+	expect(timestamps.at(-1)).toBeCloseTo(1.969, 3);
 });

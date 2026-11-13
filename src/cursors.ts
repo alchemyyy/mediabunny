@@ -1777,16 +1777,19 @@ export const canvasTransformer = (
 		}) as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 		assert(context);
 
-		sample._drawWithFitAndMipmapping(canvas, context, {
-			fit,
-			rotation,
-			flip,
-			crop,
-			targetIsFresh: canvasIsNew,
-			fillBlack: !alpha && isFirefox(),
-		});
-		sample.close();
+		try {
+			sample._drawWithFitAndMipmapping(canvas, context, {
+				fit,
+				rotation,
+				flip,
+				crop,
+				targetIsFresh: canvasIsNew,
+				fillBlack: !alpha && isFirefox(),
+			});
 
-		return new WrappedCanvas(canvas, sample.timestamp, sample.duration);
+			return new WrappedCanvas(canvas, sample.timestamp, sample.duration);
+		} finally {
+			sample.close();
+		}
 	};
 };

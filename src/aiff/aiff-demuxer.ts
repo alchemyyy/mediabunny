@@ -11,7 +11,15 @@ import { Demuxer } from '../demuxer';
 import { Input } from '../input';
 import { InputAudioTrackBacking } from '../input-track';
 import { DEFAULT_TRACK_DISPOSITION, MetadataTags } from '../metadata';
-import { assert, MaybeRelevantPromise, ResultValue, UNDETERMINED_LANGUAGE } from '../misc';
+import {
+	assert,
+	floorToMultiple,
+	MaybeRelevantPromise,
+	ResultValue,
+	roundIfAlmostInteger,
+	strictTextDecoder,
+	UNDETERMINED_LANGUAGE,
+} from '../misc';
 import { EncodedPacket, PacketRetrievalOptions, PacketRetrievalResult, PLACEHOLDER_DATA } from '../packet';
 import { readAscii, readBytes, Reader, readU16Be, readU32Be } from '../reader';
 import { ID3_V2_HEADER_SIZE, parseId3V2Tag, readId3V2Header } from '../id3';
@@ -109,6 +117,8 @@ export class AiffDemuxer extends Demuxer {
 	metadataPromise: Promise<void> | null = null;
 	dataStart = -1;
 	dataSize = -1;
+	dataSizeCapped = false;
+	dataSizeIsPlaceholder = false;
 	numSampleFrames = 0;
 	audioInfo: {
 		codec: AudioCodec | null;
@@ -120,7 +130,6 @@ export class AiffDemuxer extends Demuxer {
 	} | null = null;
 
 	trackBackings: AiffAudioTrackBacking[] = [];
-	lastKnownPacketIndex = 0;
 	metadataTags: MetadataTags = {};
 
 	constructor(input: Input) {
@@ -139,10 +148,15 @@ export class AiffDemuxer extends Demuxer {
 			const formType = readAscii(header, 4); // 'AIFF' or 'AIFC'
 			const isAifc = formType === 'AIFC';
 
-			const totalFileSize = Math.min(outerChunkSize + 8, this.reader.fileSize ?? Infinity);
+			// A FORM size of 0 means the file was probably never finalized
+			const sizesUnfinalized = outerChunkSize === 0;
+
+			const totalFileSize = sizesUnfinalized || outerChunkSize === 0xffffffff
+				? this.reader.fileSize
+				: Math.min(outerChunkSize + 8, this.reader.fileSize ?? Infinity);
 			let currentPos = header.filePos;
 
-			while (currentPos < totalFileSize) {
+			while (totalFileSize === null || currentPos < totalFileSize) {
 				let slice = this.reader.requestSlice(currentPos, 8);
 				if (slice instanceof Promise) slice = await slice;
 				if (!slice) {
@@ -150,12 +164,18 @@ export class AiffDemuxer extends Demuxer {
 				}
 
 				const chunkId = readAscii(slice, 4);
-				const chunkSize = readU32Be(slice);
+				let chunkSize = readU32Be(slice);
 				const dataStart = slice.filePos;
 
 				if (chunkId === 'COMM') {
 					await this.parseCommChunk(dataStart, chunkSize, isAifc);
 				} else if (chunkId === 'SSND') {
+					if ((sizesUnfinalized && chunkSize === 0) || chunkSize === 0xffffffff) {
+						// The data goes until the end of the file
+						chunkSize = Number.MAX_SAFE_INTEGER;
+						this.dataSizeIsPlaceholder = true;
+					}
+
 					await this.parseSsndChunk(dataStart, chunkSize);
 				} else if (chunkId === 'ID3 ' || chunkId === 'id3 ') {
 					await this.parseId3Chunk(dataStart, chunkSize);
@@ -178,6 +198,11 @@ export class AiffDemuxer extends Demuxer {
 			const framesByData = Math.floor(this.dataSize / blockSize);
 			const frames = this.numSampleFrames > 0 ? Math.min(framesByData, this.numSampleFrames) : framesByData;
 			this.dataSize = frames * blockSize;
+			if (this.numSampleFrames > 0) {
+				// The COMM frame count bounds the data even when the SSND size is a placeholder
+				this.dataSizeIsPlaceholder = false;
+			}
+			this.maybeCapDataSize();
 
 			this.trackBackings.push(new AiffAudioTrackBacking(this));
 		})();
@@ -223,7 +248,10 @@ export class AiffDemuxer extends Demuxer {
 		readU32Be(slice); // blockSize (alignment hint, unused)
 
 		this.dataStart = startPos + 8 + offset;
-		this.dataSize = Math.min(size - 8 - offset, (this.reader.fileSize ?? Infinity) - this.dataStart);
+		this.dataSize = Math.max(
+			Math.min(size - 8 - offset, (this.reader.fileSize ?? Infinity) - this.dataStart),
+			0,
+		);
 	}
 
 	async parseTextChunk(chunkId: string, startPos: number, size: number) {
@@ -234,12 +262,23 @@ export class AiffDemuxer extends Demuxer {
 		}
 
 		const bytes = readBytes(slice, size);
-		// AIFF text chunks are ISO 8859-1; trim any trailing null padding.
+		// AIFF text chunks are ASCII, but many writers (like FFmpeg) put UTF-8 in here. Latin-1 text with non-ASCII
+		// characters is virtually never valid UTF-8, so try that first. Trailing null padding is trimmed.
 		let length = bytes.length;
 		while (length > 0 && bytes[length - 1] === 0) {
 			length--;
 		}
-		const value = String.fromCharCode(...bytes.subarray(0, length));
+		const stringBytes = bytes.subarray(0, length);
+
+		let value: string;
+		try {
+			value = strictTextDecoder.decode(stringBytes);
+		} catch {
+			value = '';
+			for (const byte of stringBytes) {
+				value += String.fromCharCode(byte);
+			}
+		}
 
 		this.metadataTags.raw ??= {};
 		this.metadataTags.raw[chunkId] = value;
@@ -281,6 +320,25 @@ export class AiffDemuxer extends Demuxer {
 		return this.audioInfo.codec;
 	}
 
+	maybeCapDataSize() {
+		assert(this.audioInfo);
+
+		if (this.dataSizeCapped) {
+			return;
+		}
+
+		// With unsized sources, we may only get to know the file size after the init logic, so this may only happen
+		// later on
+		const fileSize = this.reader.fileSize;
+		if (fileSize !== null) {
+			this.dataSize = Math.min(
+				this.dataSize,
+				floorToMultiple(fileSize - this.dataStart, this.audioInfo.blockSizeInBytes),
+			);
+			this.dataSizeCapped = true;
+		}
+	}
+
 	async getMimeType() {
 		return 'audio/aiff';
 	}
@@ -301,10 +359,6 @@ class AiffAudioTrackBacking implements InputAudioTrackBacking {
 
 	getType() {
 		return 'audio' as const;
-	}
-
-	getId() {
-		return 1;
 	}
 
 	getNumber() {
@@ -372,6 +426,11 @@ class AiffAudioTrackBacking implements InputAudioTrackBacking {
 	async getDurationFromMetadata() {
 		assert(this.demuxer.dataSize !== -1);
 
+		this.demuxer.maybeCapDataSize();
+		if (this.demuxer.dataSizeIsPlaceholder && !this.demuxer.dataSizeCapped) {
+			return null;
+		}
+
 		return this.demuxer.dataSize / this.demuxer.audioInfo!.blockSizeInBytes / this.demuxer.audioInfo!.sampleRate;
 	}
 
@@ -401,17 +460,19 @@ class AiffAudioTrackBacking implements InputAudioTrackBacking {
 		assert(packetIndex >= 0);
 
 		assert(this.demuxer.audioInfo);
-		const startOffset = packetIndex * PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes;
+		const blockSize = this.demuxer.audioInfo.blockSizeInBytes;
+
+		this.demuxer.maybeCapDataSize();
+		const fileSize = this.demuxer.reader.fileSize;
+
+		const startOffset = packetIndex * PACKET_SIZE_IN_FRAMES * blockSize;
 		if (startOffset >= this.demuxer.dataSize) {
 			return res.set(new PacketRetrievalResult(null));
 		}
 
-		const sizeInBytes = Math.min(
-			PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes,
-			this.demuxer.dataSize - startOffset,
-		);
+		const sizeInBytes = Math.min(PACKET_SIZE_IN_FRAMES * blockSize, this.demuxer.dataSize - startOffset);
 
-		if (this.demuxer.reader.fileSize === null) {
+		if (fileSize === null) {
 			// If the file size is unknown, we weren't able to cap the dataSize in the init logic and we instead have to
 			// rely on the headers telling us how large the file is. But, these might be wrong, so let's check if the
 			// requested slice actually exists.
@@ -420,7 +481,9 @@ class AiffAudioTrackBacking implements InputAudioTrackBacking {
 			if (slice instanceof Promise) slice = await slice;
 
 			if (!slice) {
-				return res.set(new PacketRetrievalResult(null));
+				// It doesn't, but the failed read has told us the file size, so let's try again with a capped dataSize
+				assert(this.demuxer.reader.fileSize !== null);
+				return this.getPacketAtIndex(res, packetIndex, options);
 			}
 		}
 
@@ -436,12 +499,7 @@ class AiffAudioTrackBacking implements InputAudioTrackBacking {
 		}
 
 		const timestamp = packetIndex * PACKET_SIZE_IN_FRAMES / this.demuxer.audioInfo.sampleRate;
-		const duration = sizeInBytes / this.demuxer.audioInfo.blockSizeInBytes / this.demuxer.audioInfo.sampleRate;
-
-		this.demuxer.lastKnownPacketIndex = Math.max(
-			packetIndex,
-			this.demuxer.lastKnownPacketIndex,
-		);
+		const duration = sizeInBytes / blockSize / this.demuxer.audioInfo.sampleRate;
 
 		return res.set(new PacketRetrievalResult(new EncodedPacket(
 			data,
@@ -465,7 +523,7 @@ class AiffAudioTrackBacking implements InputAudioTrackBacking {
 		assert(this.demuxer.audioInfo);
 
 		const packetIndex = Math.floor(Math.min(
-			timestamp * this.demuxer.audioInfo.sampleRate / PACKET_SIZE_IN_FRAMES,
+			roundIfAlmostInteger(timestamp * this.demuxer.audioInfo.sampleRate) / PACKET_SIZE_IN_FRAMES,
 			(this.demuxer.dataSize - 1) / (PACKET_SIZE_IN_FRAMES * this.demuxer.audioInfo.blockSizeInBytes),
 		));
 		if (packetIndex < 0) {
@@ -473,40 +531,16 @@ class AiffAudioTrackBacking implements InputAudioTrackBacking {
 		}
 
 		const result = new ResultValue<PacketRetrievalResult>();
-		let promise = this.getPacketAtIndex(result, packetIndex, options);
+		const promise = this.getPacketAtIndex(result, packetIndex, options);
 		if (result.pending) await promise;
 
 		if (result.value.packet) {
 			return res.set(result.value);
 		}
 
-		if (packetIndex === 0) {
-			return res.set(new PacketRetrievalResult(null)); // Empty data chunk
-		}
-
-		assert(this.demuxer.reader.fileSize === null);
-
-		// The file is shorter than we thought, meaning the packet we were looking for doesn't exist. So, let's find
-		// the last packet by doing a sequential scan, instead.
-		result.reset();
-		promise = this.getPacketAtIndex(result, this.demuxer.lastKnownPacketIndex, options);
-		if (result.pending) await promise;
-
-		let currentPacket = result.value.packet;
-		while (currentPacket) {
-			result.reset();
-			promise = this.getNextPacket(result, currentPacket, options);
-			if (result.pending) await promise;
-
-			const nextPacket = result.value.packet;
-			if (!nextPacket) {
-				break;
-			}
-
-			currentPacket = nextPacket;
-		}
-
-		return res.set(new PacketRetrievalResult(currentPacket));
+		// The file is shorter than we thought, meaning the packet we were looking for doesn't exist. But by now, the
+		// dataSize has been capped to the actual data, so let's try again.
+		return this.getPacket(res, timestamp, options);
 	}
 
 	getNextPacket(

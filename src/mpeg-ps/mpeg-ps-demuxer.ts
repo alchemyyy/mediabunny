@@ -34,9 +34,8 @@ import {
 	PacketBuffer,
 	PacketReadingContext,
 	PacketWithDuration,
-	PesPacket,
+	PesPacketHeader,
 	SuppliedPacket,
-	TimestampedPesPacket,
 } from '../mpeg-ts/mpeg-ts-demuxer';
 import {
 	createTimestampWrapInfo,
@@ -110,7 +109,7 @@ type MpegVideoTiming = {
 
 type MpegPsElementaryStream = ElementaryStream<MpegPsDemuxer> & {
 	/** The stream's first PES packet with a PTS, where its packets begin. */
-	firstPesPacket: TimestampedPesPacket | null;
+	firstPesPacket: TimestampedProgramStreamPesPacket | null;
 	/** The PTS of the stream's first PES packet less the SCR of its pack, which a search by SCR allows for. */
 	scrToPtsOffset: number;
 	/** An LPCM substream's sample format byte, from the header of its first packet. */
@@ -132,11 +131,18 @@ type ProgramStreamUnit = {
 	scr: number | null;
 };
 
-type ProgramStreamPesPacket = PesPacket & {
+/** A PES packet read whole, up to where it ends in the file. */
+type ProgramStreamPesPacket = PesPacketHeader & {
+	sectionEndPos: number;
+	data: Uint8Array;
 	/** 0x100 plus the stream ID, or the substream ID of a private stream 1 packet, as FFmpeg identifies streams. */
 	streamKey: number;
 	/** An LPCM substream packet's sample format byte: its quantization, sampling frequency, and channel count. */
 	lpcmFormat: number | null;
+};
+
+type TimestampedProgramStreamPesPacket = ProgramStreamPesPacket & {
+	pts: number;
 };
 
 type EncodedPacketMetadata = {
@@ -353,7 +359,7 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 
 	videoTiming: MpegVideoTiming;
 	/** PES packets whose PTS a picture took. */
-	timestampedPesPackets = new WeakSet<PesPacket>();
+	timestampedPesPackets = new WeakSet<PesPacketHeader>();
 	/** Pictures split from the stream, in decode order, that haven't been supplied. */
 	pendingPictures: PendingPicture[] = [];
 	/** Where the next picture in display order begins, when known. */
@@ -361,7 +367,8 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 	/** The I or P picture whose display waits on the B pictures after it, and those B pictures. */
 	segmentAnchor: PendingPicture | null = null;
 	segmentBPictures: PendingPicture[] = [];
-	reachedEnd = false;
+	/** Whether no more pictures can be split off. */
+	picturesEnded = false;
 	/** Whether the last supplied packet is a B picture. */
 	suppliedBPicture = false;
 	/** How long each supplied packet is displayed for, in 90 kHz units. */
@@ -369,10 +376,33 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 	/** Whether a frame was split off since the flag was cleared. */
 	splitFrame = false;
 
-	constructor(elementaryStream: MpegPsElementaryStream, startingPesPacket: TimestampedPesPacket) {
-		super(elementaryStream, startingPesPacket);
+	/** The PES packet the context starts at, until it's fed, and where the stream's next PES packet is looked for. */
+	startingPesPacket: ProgramStreamPesPacket | null;
+	nextPesPacketPos: number;
+
+	constructor(elementaryStream: MpegPsElementaryStream, startingPesPacket: TimestampedProgramStreamPesPacket) {
+		super(elementaryStream);
 
 		this.videoTiming = { ...elementaryStream.videoTiming };
+		this.startingPesPacket = startingPesPacket;
+		this.nextPesPacketPos = startingPesPacket.sectionEndPos;
+	}
+
+	/** Feeds the context the stream's PES packets whole. */
+	async bufferNextData(res: ResultValue<void>): MaybeRelevantPromise {
+		let pesPacket = this.startingPesPacket;
+		this.startingPesPacket = null;
+		pesPacket ??= await this.elementaryStream.demuxer.findPesPacket(this.pid, this.nextPesPacketPos, false);
+
+		if (!pesPacket) {
+			this.reachedEnd = true;
+			return res.set();
+		}
+
+		this.nextPesPacketPos = pesPacket.sectionEndPos;
+		this.startPesPacket(pesPacket);
+		this.appendData(pesPacket.data);
+		return res.set();
 	}
 
 	override async markNextPacket(res: ResultValue<void>): MaybeRelevantPromise {
@@ -393,7 +423,7 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 			return;
 		}
 
-		const currentPesPacket = this.getCurrentPesPacket();
+		const currentPesPacket = this.getPesPacketAt(this.currentPos);
 		const isFrameStartWithoutPts = currentPesPacket.pts === null && this.lastSuppliedPesPacket !== currentPesPacket;
 		if (timestampOverride === null && isFrameStartWithoutPts) {
 			// The frame begins in a PES packet without a PTS, so it follows on from the frame before it
@@ -402,14 +432,16 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 
 		super.supplyPacket(packetLength, intrinsicDuration, timestampOverride);
 		if (this.suppliedPacket) {
-			this.displayDurations.set(this.suppliedPacket, intrinsicDuration);
+			this.displayDurations.set(this.suppliedPacket, this.suppliedPacket.intrinsicDuration);
 		}
 	}
 
 	/** Splits off the frame at the current position and queues its picture for timing. */
 	supplyPicture(packetLength: number) {
-		const pesPackets = this.pesPackets.slice(this.currentPesPacketIndex);
-		const startOffset = this.currentPos - this.currentPesPacketPos;
+		const startPos = this.currentPos;
+		const startIndex = this.getPesPacketIndexAt(startPos);
+		const pesPackets = this.pesPackets.slice(startIndex);
+		const pesPacketDataStartPositions = this.pesPacketDataStartPositions.slice(startIndex);
 
 		// The timestamp is worked out when the picture is timed
 		super.supplyPacket(packetLength, 0, 0);
@@ -426,16 +458,12 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 		// The PTS of the PES packet the picture's start code begins in, or else of an earlier PES packet the frame
 		// begins in, whose PTS a muxer may give the frame its header begins
 		let ownPts: number | null = null;
-		let remaining = startOffset + picture.pictureOffset;
-		for (const pesPacket of pesPackets) {
+		const pictureStartPos = startPos + picture.pictureOffset;
+		for (let i = 0; i < pesPackets.length && pesPacketDataStartPositions[i]! <= pictureStartPos; i++) {
+			const pesPacket = pesPackets[i]!;
 			if (pesPacket.pts !== null && !this.timestampedPesPackets.has(pesPacket)) {
 				ownPts = pesPacket.pts;
 				this.timestampedPesPackets.add(pesPacket);
-			}
-
-			remaining -= pesPacket.data.byteLength;
-			if (remaining < 0) {
-				break;
 			}
 		}
 
@@ -525,7 +553,7 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 				return res.set();
 			}
 
-			if (this.reachedEnd) {
+			if (this.picturesEnded) {
 				assert(this.pendingPictures.length === 0);
 				return res.set();
 			}
@@ -537,7 +565,7 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 
 			if (!this.splitFrame) {
 				// Nothing more could be split off
-				this.reachedEnd = true;
+				this.picturesEnded = true;
 				this.closeSegment();
 				this.segmentAnchor = null;
 				this.segmentBPictures = [];
@@ -566,13 +594,12 @@ class MpegPsPacketReadingContext extends PacketReadingContext {
 			return res.set();
 		}
 
-		while (this.currentPos >= this.currentPesPacketPos + this.getCurrentPesPacket().data.byteLength) {
-			this.advanceCurrentPacket();
-		}
-
-		const pesPacket = this.getCurrentPesPacket();
-		const offset = this.currentPos - this.currentPesPacketPos;
-		const length = Math.ceil((pesPacket.data.byteLength - offset) / blockAlign) * blockAlign;
+		const pesPacketIndex = this.getPesPacketIndexAt(this.currentPos);
+		const pesPacket = this.pesPackets[pesPacketIndex]!;
+		const offset = this.currentPos - this.pesPacketDataStartPositions[pesPacketIndex]!;
+		// PES packets are fed whole, so a PES packet's data ends where the next one's begins or where the data ends
+		const pesPacketEndPos = this.pesPacketDataStartPositions[pesPacketIndex + 1] ?? this.endPos;
+		const length = Math.ceil((pesPacketEndPos - this.currentPos) / blockAlign) * blockAlign;
 
 		bufferedResult.reset();
 		const lengthPromise = this.ensureBuffered(bufferedResult, length);
@@ -720,7 +747,7 @@ export class MpegPsDemuxer extends Demuxer {
 				}
 
 				if (!stream.firstPesPacket) {
-					stream.firstPesPacket = pesPacket as TimestampedPesPacket;
+					stream.firstPesPacket = pesPacket as TimestampedProgramStreamPesPacket;
 					stream.scrToPtsOffset = lastScr !== null ? pesPacket.pts - lastScr : 0;
 				}
 
@@ -1009,15 +1036,6 @@ export class MpegPsDemuxer extends Demuxer {
 		return null;
 	}
 
-	async readNextPesPacket(
-		res: ResultValue<PesPacket | null>,
-		pid: number,
-		pesPacket: PesPacket,
-	): MaybeRelevantPromise {
-		assert(pesPacket.sectionEndPos !== null);
-		return res.set(await this.findPesPacket(pid, pesPacket.sectionEndPos, false));
-	}
-
 	/**
 	 * Bisects the packs by their SCRs for the last one whose SCR is at most a time, as SCRs rise through the file,
 	 * from a position on. Returns that position when no later pack qualifies, or the file's size is unknown.
@@ -1061,7 +1079,8 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 	abstract allPacketsAreKeyPackets(): boolean;
 	abstract getReorderSize(): number;
 
-	getId() {
+	/** The stream's ID, as FFmpeg gives it: 0x100 plus its stream ID, or its private stream 1 substream ID. */
+	getContainerTrackId() {
 		return this.elementaryStream.pid;
 	}
 
@@ -1170,7 +1189,7 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 	/** Reads the stream from a PES packet on, through a packet buffer, until a packet passes a test. */
 	async readPacketFrom(
 		res: ResultValue<PacketRetrievalResult>,
-		startPesPacket: TimestampedPesPacket,
+		startPesPacket: TimestampedProgramStreamPesPacket,
 		isTarget: (packet: SuppliedPacket) => boolean,
 		options: PacketRetrievalOptions,
 	): MaybeRelevantPromise {
@@ -1257,7 +1276,7 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 				)
 				: null;
 			if (startPesPacket) {
-				return this.readPacketFrom(res, startPesPacket as TimestampedPesPacket, isTarget, options);
+				return this.readPacketFrom(res, startPesPacket as TimestampedProgramStreamPesPacket, isTarget, options);
 			}
 
 			window *= 2;
@@ -1328,12 +1347,12 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 		let searchedPos = Infinity;
 
 		while (true) {
-			let startPesPacket: TimestampedPesPacket | null = firstPesPacket;
+			let startPesPacket: TimestampedProgramStreamPesPacket | null = firstPesPacket;
 			if (startPos > firstPesPacket.sectionStartPos) {
 				const packHeaderPos = await demuxer.findPackHeader(startPos);
 				startPesPacket = packHeaderPos !== null && packHeaderPos < searchedPos
 					? await demuxer.findPesPacket(stream.pid, packHeaderPos, true, searchedPos) as
-						TimestampedPesPacket | null
+						TimestampedProgramStreamPesPacket | null
 					: null;
 				searchedPos = Math.min(searchedPos, packHeaderPos ?? Infinity);
 			}
@@ -1365,7 +1384,7 @@ abstract class MpegPsTrackBacking implements InputTrackBacking {
 	 * packet past the time, or the second I or P picture past it, since a B picture is shown before the I or P picture
 	 * it follows.
 	 */
-	async findPacketFrom(startPesPacket: TimestampedPesPacket, searchPts: number, keyOnly: boolean) {
+	async findPacketFrom(startPesPacket: TimestampedProgramStreamPesPacket, searchPts: number, keyOnly: boolean) {
 		const context = new MpegPsPacketReadingContext(this.elementaryStream, startPesPacket);
 		const markResult = new ResultValue<void>();
 		const isVideo = this.elementaryStream.info.type === 'video';

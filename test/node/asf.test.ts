@@ -439,7 +439,9 @@ describe('Crafted ASF files', () => {
 			64,
 		);
 		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
-		expect((await input.getAudioTracks()).map(track => track.id)).toEqual([2, 3, 1]);
+		const tracks = await input.getAudioTracks();
+		expect(tracks.map(track => track.containerTrackId)).toEqual([2, 3, 1]);
+		expect(tracks.map(track => track.id)).toEqual([1, 2, 3]);
 	});
 
 	/** Reads the sizes of the packets of a crafted file of objects of one stream, cut within its last packet so its

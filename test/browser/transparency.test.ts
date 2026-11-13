@@ -5,7 +5,7 @@ import { ALL_FORMATS } from '../../src/input-format.js';
 import { Output } from '../../src/output.js';
 import { WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
-import { CanvasSource, VideoSampleSource } from '../../src/media-source.js';
+import { CanvasSource, ColorAlphaSplitter, VideoSampleSource } from '../../src/media-source.js';
 import { canEncodeVideo, Quality } from '../../src/encode.js';
 import { VideoSample } from '../../src/sample.js';
 import { Conversion } from '../../src/conversion.js';
@@ -391,4 +391,35 @@ test('Can reencode transparent video, keeping alpha', async () => {
 	using sample = (await cursor.seekToFirst())!;
 	expect(sample.format).toContain('A');
 	expect(sample.hasAlpha).toBe(true);
+});
+
+test('Color/alpha splitting of a planar frame keeps its color space', async () => {
+	const width = 16;
+	const height = 16;
+	const sourceFrame = new VideoFrame(new Uint8Array(2.5 * width * height), {
+		format: 'I420A',
+		codedWidth: width,
+		codedHeight: height,
+		timestamp: 0,
+		colorSpace: {
+			primaries: 'smpte170m',
+			transfer: 'smpte170m',
+			matrix: 'smpte170m',
+			fullRange: true,
+		},
+	});
+
+	const splitter = new ColorAlphaSplitter();
+	const { colorFrame, alphaFrame } = await splitter.split(sourceFrame);
+	splitter.close();
+
+	expect(colorFrame.colorSpace.toJSON()).toEqual({
+		primaries: 'smpte170m',
+		transfer: 'smpte170m',
+		matrix: 'smpte170m',
+		fullRange: true,
+	});
+
+	colorFrame.close();
+	alphaFrame.close();
 });

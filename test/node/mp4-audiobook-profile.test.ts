@@ -162,6 +162,7 @@ const writeSinglePacketMp4 = async (format: Mp4OutputFormat) => {
 				objectType: 2,
 				outputSampleRate: 24000,
 				outputNumberOfChannels: 1,
+				programConfigElement: null,
 			}),
 		},
 	});
